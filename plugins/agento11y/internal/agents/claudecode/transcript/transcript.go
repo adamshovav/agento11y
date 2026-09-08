@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -168,7 +169,7 @@ func Read(path string, offset int64) ([]Line, int64, error) {
 
 	for {
 		data, consumed, tooLong, err := readLine(r, maxLineBytes)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -217,10 +218,10 @@ func readLine(r *bufio.Reader, max int) (line []byte, consumed int64, tooLong bo
 		if rerr == nil {
 			break
 		}
-		if rerr == bufio.ErrBufferFull {
+		if errors.Is(rerr, bufio.ErrBufferFull) {
 			continue
 		}
-		if rerr == io.EOF {
+		if errors.Is(rerr, io.EOF) {
 			if consumed == 0 {
 				return nil, 0, false, io.EOF
 			}

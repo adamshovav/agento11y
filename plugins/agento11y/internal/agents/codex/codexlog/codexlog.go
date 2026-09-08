@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -140,7 +141,7 @@ func ScanRecords(path string, opts ScanOptions, visit func(Record) (bool, error)
 	lineNo := 0
 	for {
 		line, consumed, tooLong, err := readLine(r, maxLine)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -200,10 +201,10 @@ func readLine(r *bufio.Reader, max int) (line []byte, consumed int64, tooLong bo
 		if rerr == nil {
 			break
 		}
-		if rerr == bufio.ErrBufferFull {
+		if errors.Is(rerr, bufio.ErrBufferFull) {
 			continue
 		}
-		if rerr == io.EOF {
+		if errors.Is(rerr, io.EOF) {
 			if consumed == 0 {
 				return nil, 0, false, io.EOF
 			}
