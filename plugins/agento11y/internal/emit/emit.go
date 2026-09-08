@@ -44,8 +44,8 @@ func ExportEndpoint() string {
 // matching the OpenCode and Pi plugins.
 func ExportEndpointFor(endpoint string) string {
 	base := strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	if strings.HasSuffix(base, wire.GenerationExportHTTPPath) {
-		base = strings.TrimRight(strings.TrimSuffix(base, wire.GenerationExportHTTPPath), "/")
+	if withoutPath, ok := strings.CutSuffix(base, wire.GenerationExportHTTPPath); ok {
+		base = strings.TrimRight(withoutPath, "/")
 	}
 	return base + wire.GenerationExportHTTPPath
 }
