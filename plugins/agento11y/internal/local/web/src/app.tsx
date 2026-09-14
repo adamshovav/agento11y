@@ -697,7 +697,6 @@ export function App() {
         tokenParams.set('since', new Date(currentStart).toISOString());
         tokenParams.set('interval', String(Math.round(chartBucketMs(range.ms) / 1000)));
       }
-      const facetParams = new URLSearchParams(currentParams);
       if (analyticsWorkspace != null) {
         currentParams.set('workspace', analyticsWorkspace);
         previousParams.set('workspace', analyticsWorkspace);
@@ -708,6 +707,12 @@ export function App() {
         previousParams.set('agent', analyticsAgent);
         tokenParams.set('agent', analyticsAgent);
       }
+      // The workspace facet lists every workspace under the current agent, so
+      // it carries the agent filter and drops only the workspace one, as the
+      // Sessions page does. Copying the params before the agent was set left
+      // the dropdown counting all agents while the KPIs beside it did not.
+      const facetParams = new URLSearchParams(currentParams);
+      facetParams.delete('workspace');
       const facetActive = analyticsWorkspace != null || analyticsAgent !== 'all';
 
       const currentRequest = fetch(`/api/v1/metrics/conversations?${currentParams}`).then((response) =>

@@ -1873,7 +1873,10 @@ function AnalyticsContent(props: ResolvedAnalyticsViewProps) {
             fontSize: 13,
             fontFamily: 'var(--fontFamily)',
           }}
-          options={[{ value: 'all', label: 'All agents' }, ...agentOptions.map((host) => ({ value: host, label: host }))]}
+          options={[
+            { value: 'all', label: 'All agents' },
+            ...agentOptions.map((host) => ({ value: host, label: host })),
+          ]}
         />
         <WorkspaceFacet
           workspaces={facetWorkspaces}
