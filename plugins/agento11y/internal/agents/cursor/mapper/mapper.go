@@ -123,6 +123,10 @@ func MapFragment(in Inputs) Mapped {
 	title := conversationTitle(in.Session, frag, red)
 
 	tagMap := tags.Build(tags.BuiltinInputs{
+		// The hook payload carries no CLI-versus-IDE marker, so the product
+		// name is the entrypoint, as Codex hardcodes "codex". Background
+		// agents are already their own tag.
+		Entrypoint:        "cursor",
 		WorkspaceRoot:     workspaceRoot,
 		Cwd:               firstToolCwd(frag.Tools),
 		GitBranch:         gitbranch.Resolve(workspaceRoot),
