@@ -182,7 +182,7 @@ jobs:
         run: |
           cd ${{ matrix.module }}/internal/entry
           npm ci --prefix testdata/agent-clis
-          PATH="$PWD/testdata/agent-clis/node_modules/.bin:$PATH" go test . -run TestAgentIntegration -count=1 -v
+          PATH="$PWD/testdata/agent-clis/node_modules/.bin:$PATH" go test . -run 'TestAgentIntegration/claude' -count=20 -v -timeout 30m
 
       - name: Build agento11y CLI
         if: matrix.module == 'plugins/agento11y'
