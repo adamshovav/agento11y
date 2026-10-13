@@ -343,6 +343,7 @@ class Client:
         self._pending_workflow_steps: list[WorkflowStep] = []
         self._pending_lock = threading.Lock()
         self._flush_lock = threading.Lock()
+        self._unreported_export_error: Exception | None = None
         self._flush_thread_lock = threading.Lock()
         self._flush_thread: threading.Thread | None = None
 
@@ -879,7 +880,15 @@ class Client:
         )
 
     def flush(self) -> None:
-        """Flushes queued generations with native export.
+        """Flushes queued generations and raises export failures since the last flush.
+
+        With native export, a rejected generation or failed export raises
+        ``ExportFlushError`` (or the exporter's error). A generation the server
+        already stored, for example after a retry, is not a failure; rejected
+        workflow steps are logged without failing the flush. A failure
+        from a background flush is raised once by the next explicit flush as an
+        ``ExportFlushError`` that says so, even though that batch already left
+        the queue; a later successful flush does not restore lost records.
 
         OTel requires an explicit tracer_provider with force_flush() and flushes
         traces only. Success confirms local processor completion, not backend acceptance.
@@ -887,7 +896,7 @@ class Client:
 
         if self._shutting_down:
             raise ClientShutdownError("agento11y: client is shutting down")
-        self._flush_internal()
+        self._flush_internal(report_background_errors=True)
 
     def shutdown(self) -> None:
         """Flushes pending data and shuts down exporters with native export.
@@ -1142,7 +1151,7 @@ class Client:
             raise ValueError("generation sanitizer must return a generation")
         return copy.deepcopy(sanitized)
 
-    def _flush_internal(self) -> None:
+    def _flush_internal(self, *, report_background_errors: bool = False) -> None:
         if self._otel_handler is not None:
             provider = self._config.tracer_provider
             force_flush = getattr(provider, "force_flush", None)
@@ -1154,7 +1163,11 @@ class Client:
                 raise ExportFlushError("agento11y: OTel tracer provider did not complete force_flush")
             return
         first_error: Exception | None = None
+        prior_error: Exception | None = None
         with self._flush_lock:
+            if report_background_errors:
+                prior_error = self._unreported_export_error
+                self._unreported_export_error = None
             while True:
                 with self._pending_lock:
                     has_gens = bool(self._pending_generations)
@@ -1180,10 +1193,12 @@ class Client:
                             lambda req=gen_request: self._generation_exporter.export_generations(req)
                         )
                         for result in response.results:
-                            if not result.accepted:
-                                self._log_warn(
+                            if not result.accepted and not _is_duplicate_generation_result(result):
+                                message = (
                                     f"agento11y generation rejected id={result.generation_id} error={result.error}"
                                 )
+                                self._log_warn(message)
+                                first_error = first_error or ExportFlushError(message)
                     except Exception as exc:  # noqa: BLE001
                         self._log_warn("agento11y generation export failed", exc)
                         first_error = first_error or exc
@@ -1196,6 +1211,8 @@ class Client:
                         )
                         for result in wf_response.results:
                             if not result.accepted:
+                                # Logged only: grading doesn't read workflow steps, and the server reports
+                                # a retried step that already landed as an opaque internal error.
                                 self._log_warn(
                                     f"agento11y workflow step rejected id={result.step_id} error={result.error}"
                                 )
@@ -1205,9 +1222,18 @@ class Client:
 
                 if first_error is not None:
                     break
+            if first_error is not None and not report_background_errors:
+                self._unreported_export_error = self._unreported_export_error or first_error
 
+        if prior_error is not None:
+            prior_error = _earlier_background_flush_error(prior_error)
         if first_error is not None:
+            if prior_error is not None:
+                # Chain it so the earlier loss is shown with this failure instead of dropped.
+                first_error.__context__ = prior_error
             raise first_error
+        if prior_error is not None:
+            raise prior_error
 
     def _export_with_retry(self, send: Callable[[], Any]):
         """Run an export call with the configured exponential backoff retry.
@@ -2183,6 +2209,22 @@ class NoopToolExecutionRecorder:
 
     def err(self) -> Exception | None:
         return None
+
+
+def _is_duplicate_generation_result(result: Any) -> bool:
+    """An idempotent re-export of a stored generation (for example, after a retry) is not a loss."""
+
+    error = (result.error or "").strip().lower()
+    return "generation already exists" in error or "duplicate entry" in error
+
+
+def _earlier_background_flush_error(error: Exception) -> ExportFlushError:
+    wrapped = ExportFlushError(
+        f"agento11y: an earlier background flush failed and its records were not exported: "
+        f"{type(error).__name__}: {error}"
+    )
+    wrapped.__cause__ = error
+    return wrapped
 
 
 def _apply_trace_context_from_span(span: Span, generation: Generation) -> None:
