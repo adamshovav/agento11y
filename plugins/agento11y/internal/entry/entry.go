@@ -12,6 +12,8 @@
 //	agento11y vibe     [--local|--no-local] [--tag k=v] [-- args...]  — exec vibe after installing the sigil hook in vibe's hooks.toml
 //	agento11y cursor   install|uninstall                              — wire (or remove) the Cursor hook in ~/.cursor/hooks.json
 //	agento11y claude   install [--json]                               — register the Claude Code plugin without launching or prompting
+//	agento11y harbor   [run] -- <harbor run arguments>                — run Harbor with live experiment publishing
+//	agento11y harbor   export <job-directory> [flags]                 — publish a completed Harbor job
 //	agento11y agents   reconcile --agents all|name[,name...] --json   — reconcile registered noninteractive installers
 //	agento11y local start|open|status [--json]|stop|restart           — manage the local capture daemon
 //	agento11y history import <agent> [flags]                          — backfill an agent's existing local sessions
@@ -274,6 +276,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) {
 	// dispatch, so an agent named `skills` cannot shadow it.
 	if args[0] == skills.Command {
 		runSkillsCommand(args[1:], stdout, stderr)
+		return
+	}
+
+	if args[0] == "harbor" {
+		runHarborCommand(args[1:], stderr)
 		return
 	}
 
