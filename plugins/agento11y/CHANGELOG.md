@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.51.0] - 2026-10-16
+
+### Features
+
+- **plugins**: wire anonymous CLI usage statistics (#877)
+
 ## [0.50.0] - 2026-10-15
 
 ### Features
