@@ -73,6 +73,8 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/local"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/login"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/skills"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/usagestats"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/usagestats/capture"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/useragent"
 )
 
@@ -90,6 +92,14 @@ func renderLocalBanner(w io.Writer, uiURL string, posture local.ForwardPosture, 
 	lines = append(lines, title)
 	for _, line := range privacy {
 		lines = append(lines, renderer.Detail(line))
+	}
+	switch usagestats.ResolveMode(usageStatsShell, usageStatsConfigValue) {
+	case usagestats.ModeEnabled:
+		lines = append(lines, renderer.Detail("The CLI sends anonymous usage statistics to Grafana separately, even in local mode."))
+	case usagestats.ModeLog:
+		lines = append(lines, renderer.Detail("CLI usage statistics are logged locally and not sent."))
+	case usagestats.ModeDisabled:
+		lines = append(lines, renderer.Detail("CLI usage statistics are disabled."))
 	}
 	lines = append(lines, "", renderer.Detail("View ")+uiURL)
 	return strings.Join(lines, "\n") + "\n\n"
@@ -179,7 +189,7 @@ var launchers = map[string]agentLauncher{
 }
 
 // exit is a package var so tests can intercept termination.
-var exit = os.Exit
+var exit = usageExit
 
 // exitAfterLaunchError exits with the agent's own code when the agent ran and
 // failed. The agent has already reported that failure itself, so only an error
@@ -222,6 +232,21 @@ var (
 // ldflags; unstamped builds get their version from Go build metadata.
 func Main(buildVersion string) {
 	version = buildversion.Resolve(buildVersion)
+	// Usage reporting is resolved once per CLI process, including help and errors.
+	startUsage(os.Args[1:])
+	showUsageNotice(os.Stderr)
+	launcherpkg.BeforeExec = func() {
+		capture.SetLaunched()
+		emitUsageOnce()
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			emitUsageOnce()
+			panic(r)
+		}
+		capture.SetCompleted()
+		emitUsageOnce()
+	}()
 	run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 }
 
@@ -1017,10 +1042,11 @@ func runDoctorCommand(args []string, stdout, stderr io.Writer) {
 	osEnv := doctor.SnapshotEnv()
 	dotenv.ApplyEnv(nil)
 	code := doctor.Run(context.Background(), args, doctor.Params{
-		Version: version,
-		OSEnv:   osEnv,
-		Stdout:  stdout,
-		Stderr:  stderr,
+		Version:        version,
+		OSEnv:          osEnv,
+		Stdout:         stdout,
+		Stderr:         stderr,
+		UsageStatsMode: string(usagestats.ResolveMode(usageStatsShell, usageStatsConfigValue)),
 	})
 	if code != 0 {
 		exit(code)

@@ -39,6 +39,9 @@ func (e *ExitError) ExitCode() int { return e.Code }
 // process on Windows. Launchers keep this as a package variable for tests.
 type ExecFunc func(argv0 string, argv []string, envv []string) error
 
+// BeforeExec reports launcher handoff before control passes to the target.
+var BeforeExec = func() {}
+
 // Exec hands control to bin, prepending bin as argv[0] and forwarding args plus
 // env. name is used only for the error prefix ("exec <name>"). Callers pass
 // the env explicitly so local-mode launches can inject endpoint overrides via
@@ -46,6 +49,7 @@ type ExecFunc func(argv0 string, argv []string, envv []string) error
 // the platform handoff failed or the Windows child exited.
 func Exec(execFn ExecFunc, bin, name string, args, env []string) error {
 	argv := append([]string{bin}, args...)
+	BeforeExec()
 	if err := execFn(bin, argv, env); err != nil {
 		return fmt.Errorf("exec %s: %w", name, err)
 	}
