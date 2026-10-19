@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -345,6 +346,7 @@ func writeCodexSubagentPair(t *testing.T, root string) (parentPath, childPath, p
 		"agent_role": "explorer", "agent_nickname": "scout", "cwd": "/work/repo",
 	}) +
 		codexRecord("2026-01-10T12:00:06Z", "turn_context", map[string]any{"turn_id": "turn-c1", "model": "gpt-5.5"}) +
+		codexRecord("2026-01-10T12:00:06Z", "event_msg", map[string]any{"type": "user_message", "message": "explore files"}) +
 		codexRecord("2026-01-10T12:00:07Z", "response_item", map[string]any{
 			"type": "message", "role": "assistant",
 			"content": []map[string]any{{"type": "output_text", "text": "explored"}},
@@ -379,6 +381,9 @@ func TestCodexSubagentTurnsLinkToTheParentTurn(t *testing.T) {
 	}
 	if child.Gen.ConversationID != parentID {
 		t.Fatalf("ConversationID = %q, want the parent session %q", child.Gen.ConversationID, parentID)
+	}
+	if child.Gen.ConversationTitle != parentTurns[0].Gen.ConversationTitle {
+		t.Fatalf("ConversationTitle = %q, want parent title %q", child.Gen.ConversationTitle, parentTurns[0].Gen.ConversationTitle)
 	}
 	if child.Gen.Metadata["codex.spawn_call_id"] != "call-spawn" {
 		t.Fatalf("metadata = %+v, want the spawn call ID", child.Gen.Metadata)
@@ -594,5 +599,31 @@ func TestCodexImportIgnoresTheAgentNameOverride(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCodexSubagentInheritsInputItemTitle(t *testing.T) {
+	root := t.TempDir()
+	parentPath, childPath, _ := writeCodexSubagentPair(t, root)
+	body, err := os.ReadFile(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPrompt := codexRecord("2026-01-10T12:00:02Z", "event_msg", map[string]any{"type": "user_message", "message": "delegate this"})
+	for _, payload := range []map[string]any{
+		{"type": "input_text", "text": "delegate this"},
+		{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "delegate this"}}},
+	} {
+		newPrompt := codexRecord("2026-01-10T12:00:02Z", "input_item", payload)
+		writeFile(t, parentPath, strings.Replace(string(body), oldPrompt, newPrompt, 1))
+		imp := codexImporterAt(root)
+		parent := collectTurns(t, imp, codexPreview(t, imp, parentPath))
+		child := collectTurns(t, imp, codexPreview(t, imp, childPath))
+		if len(parent) != 1 || len(child) != 1 {
+			t.Fatalf("got %d parent turns and %d child turns, want one each", len(parent), len(child))
+		}
+		if parent[0].Gen.ConversationTitle != "delegate this" || child[0].Gen.ConversationTitle != parent[0].Gen.ConversationTitle {
+			t.Fatalf("titles = (%q, %q), want delegate this", parent[0].Gen.ConversationTitle, child[0].Gen.ConversationTitle)
+		}
 	}
 }

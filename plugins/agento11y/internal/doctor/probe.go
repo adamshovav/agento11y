@@ -43,21 +43,18 @@ var probeClient = &http.Client{
 // from the environment; it is wrapped in the envValue the seam takes, with no
 // key, so a 401 message names the variable the value will be written to.
 func ProbeConversations(ctx context.Context, endpoint, tenant, token string, insecure bool) *ProbeResult {
-	return probeConversationsFn(ctx, endpoint, envValue{Set: tenant != "", Value: tenant}, token, insecure)
+	return probeConversationsFn(ctx, endpoint, envValue{Set: tenant != "", Value: tenant}, token, insecure, "basic")
 }
 
 // defaultProbeConversations checks the generation-export endpoint with the
-// same headers a real export sends: HTTP Basic auth (base64(tenant:token))
-// plus the X-Scope-OrgID tenant header, matching the SDK exporter's
-// ExportAuthModeBasic that every agent plugin uses. Using Bearer here would
-// draw a spurious 401 from Grafana Cloud's gateway even with a valid token. It
-// POSTs an empty body so the edge auth layer is exercised (401/403 surface
+// same headers the selected export auth mode sends. It POSTs an empty body so
+// the edge auth layer is exercised (401/403 surface
 // before the empty body is rejected) without creating a real generation.
 // Connectivity and auth failures are returned as results, never as errors that
 // abort the report. insecure mirrors SIGIL_INSECURE so a scheme-less endpoint
 // resolves to http here just as the SDK exporter does; otherwise the probe
 // would hit https and report a cleartext setup as unreachable.
-func defaultProbeConversations(ctx context.Context, endpoint string, tenant envValue, token string, insecure bool) *ProbeResult {
+func defaultProbeConversations(ctx context.Context, endpoint string, tenant envValue, token string, insecure bool, mode string) *ProbeResult {
 	target, err := generationExportProbeURL(endpoint, insecure)
 	if err != nil {
 		return &ProbeResult{Message: "invalid endpoint: " + err.Error()}
@@ -71,23 +68,41 @@ func defaultProbeConversations(ctx context.Context, endpoint string, tenant envV
 		return &ProbeResult{URL: target, Message: err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if tenant.Value != "" {
+	if tenant.Value != "" && mode != "bearer" && mode != "none" {
 		req.Header.Set("X-Scope-OrgID", tenant.Value)
 	}
-	if token != "" {
+	if mode == "bearer" {
+		bearer := strings.TrimSpace(token)
+		if strings.HasPrefix(strings.ToLower(bearer), "bearer ") {
+			bearer = strings.TrimSpace(bearer[len("bearer "):])
+		}
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	} else if mode != "tenant" && mode != "none" && token != "" {
 		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(tenant.Value+":"+token)))
 	}
 
 	res := doProbe(target, req)
 	switch {
 	case res.credentialsRejected():
-		// Sigil's tenant auth answers 401 for every auth failure on this
-		// endpoint, a missing write scope included, so name the scope here
-		// too — last, because it is the rarest cause.
-		res.Message = credentialsRejectedMessage(tenant) +
-			". A token without the sigil:write scope is rejected the same way"
+		if mode == "tenant" {
+			res.Message = "tenant-only credentials rejected: check the tenant id and endpoint"
+		} else if mode == "none" {
+			res.Message = "the endpoint rejected unauthenticated export"
+		} else {
+			// Sigil's tenant auth answers 401 for every auth failure on this
+			// endpoint, a missing write scope included, so name the scope here
+			// too — last, because it is the rarest cause.
+			res.Message = credentialsRejectedMessage(tenant) +
+				". A token without the sigil:write scope is rejected the same way"
+		}
 	case res.scopeDenied():
-		res.Message = "the token is likely missing the sigil:write scope"
+		if mode == "tenant" {
+			res.Message = "tenant-only export denied by the endpoint"
+		} else if mode == "none" {
+			res.Message = "the endpoint denied unauthenticated export"
+		} else {
+			res.Message = "the token is likely missing the sigil:write scope"
+		}
 	}
 	return res
 }

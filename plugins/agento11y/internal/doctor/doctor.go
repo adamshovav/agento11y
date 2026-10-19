@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/grafana/agento11y/go/proto/agento11y/wire"
+	codexconfig "github.com/grafana/agento11y/plugins/agento11y/internal/agents/codex/config"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/autotag"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/clihelp"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/dotenv"
@@ -71,6 +72,7 @@ const agentUserPlaceholder = "<depends on the agent>"
 var trackedSuffixes = []string{
 	"ENDPOINT",
 	"INSECURE",
+	"AUTH_MODE",
 	"AUTH_TENANT_ID",
 	"AUTH_TOKEN",
 	"OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -298,7 +300,7 @@ type ConversationsSection struct {
 }
 
 func (s ConversationsSection) configured() bool {
-	return s.Endpoint.Set && s.TenantID.Set && s.Token.Set
+	return s.Endpoint.Set && s.TenantID.Set
 }
 
 // AnalyticsSection reports the OTLP metrics + traces pipeline.
@@ -582,6 +584,31 @@ func Collect(ctx context.Context, opts Options, p Params) *Report {
 	r.AutoUpdateDisabled = updatecheck.Disabled()
 
 	runProbes(ctx, r, osEnv, fileEnv)
+	if r.Conversations.configured() && !r.Conversations.Token.Set {
+		var needsToken []string
+		tenantOnlyAgent := false
+		unknownAgent := false
+		for _, agent := range r.Agents {
+			if agent.Install == InstallStateInstalled {
+				if agent.Name == "codex" || agent.Name == "opencode" {
+					tenantOnlyAgent = true
+				} else {
+					needsToken = append(needsToken, agent.Name)
+				}
+			} else if agent.Install == InstallStateUnknown && agent.Health != HealthSkipped {
+				unknownAgent = true
+			}
+		}
+		if len(needsToken) > 0 {
+			r.Conversations.Health = HealthError
+			r.Conversations.Messages = append(r.Conversations.Messages,
+				"AGENTO11Y_AUTH_TOKEN is required by installed agents: "+strings.Join(needsToken, ", "))
+		} else if (!tenantOnlyAgent || unknownAgent) && r.Conversations.Health == HealthOK {
+			r.Conversations.Health = HealthWarn
+			r.Conversations.Messages = append(r.Conversations.Messages,
+				"AGENTO11Y_AUTH_TOKEN is unset; agent compatibility could not be verified (Codex and OpenCode support token-less export)")
+		}
+	}
 	return r
 }
 
@@ -686,19 +713,25 @@ func collectConversations(osEnv, fileEnv map[string]string) ConversationsSection
 	endpoint := resolveFamily("ENDPOINT", osEnv, fileEnv)
 	tenant := resolveFamily("AUTH_TENANT_ID", osEnv, fileEnv)
 	token := resolveFamily("AUTH_TOKEN", osEnv, fileEnv)
+	authMode := resolveFamily("AUTH_MODE", osEnv, fileEnv)
 
 	sec := ConversationsSection{
 		Endpoint: endpoint.envValue(),
 		TenantID: tenant.envValue(),
 		Token:    token.tokenValue(),
 	}
-	switch boolToInt(endpoint.set) + boolToInt(tenant.set) + boolToInt(token.set) {
-	case 3:
+	switch {
+	case endpoint.set && tenant.set && !token.set && !codexconfig.AllowsTenantOnlyAuthMode(authMode.value):
+		sec.Health = HealthError
+		sec.Messages = append(sec.Messages, fmt.Sprintf(
+			"tenant-only Codex export is incompatible with %s=%s; set AGENTO11Y_AUTH_TOKEN or use AUTH_MODE=tenant",
+			authMode.key, authMode.value))
+	case endpoint.set && tenant.set:
 		sec.Health = HealthOK
-	case 0:
+	case !endpoint.set && !tenant.set && !token.set:
 		sec.Health = HealthWarn
 		sec.Messages = append(sec.Messages,
-			"not configured — run `agento11y login` or set AGENTO11Y_ENDPOINT, AGENTO11Y_AUTH_TENANT_ID and AGENTO11Y_AUTH_TOKEN")
+			"not configured — run `agento11y login` or set AGENTO11Y_ENDPOINT and AGENTO11Y_AUTH_TENANT_ID (and AGENTO11Y_AUTH_TOKEN for agents that require it)")
 	default:
 		sec.Health = HealthError
 		var missing []string
@@ -707,9 +740,6 @@ func collectConversations(osEnv, fileEnv map[string]string) ConversationsSection
 		}
 		if !tenant.set {
 			missing = append(missing, "AGENTO11Y_AUTH_TENANT_ID")
-		}
-		if !token.set {
-			missing = append(missing, "AGENTO11Y_AUTH_TOKEN")
 		}
 		sec.Messages = append(sec.Messages, "incomplete credentials; missing "+strings.Join(missing, ", "))
 	}
@@ -1210,7 +1240,32 @@ func runProbes(ctx context.Context, r *Report, osEnv, fileEnv map[string]string)
 	// and probing would report that fault again.
 	if r.Conversations.configured() && r.Conversations.Health != HealthError {
 		token := resolveFamily("AUTH_TOKEN", osEnv, fileEnv).value
-		res := probeConversationsFn(ctx, r.Conversations.Endpoint.Value, r.Conversations.TenantID, token, resolveInsecure(osEnv, fileEnv))
+		configuredMode := strings.ToLower(resolveFamily("AUTH_MODE", osEnv, fileEnv).value)
+		mode := "basic"
+		mixedAgents := false
+		if token == "" {
+			mode = "tenant"
+			if configuredMode == "none" {
+				mode = "none"
+			}
+		} else {
+			codexInstalled := false
+			otherInstalled := false
+			for _, agent := range r.Agents {
+				if agent.Install == InstallStateInstalled {
+					if agent.Name == "codex" {
+						codexInstalled = true
+					} else {
+						otherInstalled = true
+					}
+				}
+			}
+			if !otherInstalled && (configuredMode == "tenant" || configuredMode == "bearer" || configuredMode == "none") {
+				mode = configuredMode
+			}
+			mixedAgents = codexInstalled && otherInstalled && (configuredMode == "tenant" || configuredMode == "bearer" || configuredMode == "none")
+		}
+		res := probeConversationsFn(ctx, r.Conversations.Endpoint.Value, r.Conversations.TenantID, token, resolveInsecure(osEnv, fileEnv), mode)
 		r.Conversations.Probe = res
 		switch {
 		case res.AuthFailure():
@@ -1243,6 +1298,10 @@ func runProbes(ctx context.Context, r *Report, osEnv, fileEnv map[string]string)
 			}
 			r.Conversations.Messages = append(r.Conversations.Messages,
 				"the conversations endpoint answered "+describeProbe(res)+" instead of HTTP 202; exports may be dropped")
+		}
+		if mixedAgents && r.Conversations.Health == HealthOK {
+			r.Conversations.Health = HealthWarn
+			r.Conversations.Messages = append(r.Conversations.Messages, "Codex uses "+configuredMode+" auth, which this Basic probe did not check")
 		}
 	}
 	if r.Analytics.Endpoint.Set {
@@ -1512,11 +1571,4 @@ func normalizeVersion(v string) string {
 		return "dev"
 	}
 	return v
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }

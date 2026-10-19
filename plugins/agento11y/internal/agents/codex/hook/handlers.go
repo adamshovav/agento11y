@@ -102,6 +102,9 @@ func capturePrompt(p Payload, cfg config.Config, logger *log.Logger) {
 		logger.Print("userPromptSubmit: missing session_id or turn_id")
 		return
 	}
+	if strings.TrimSpace(p.Prompt) != "" {
+		setConversationTitle(p.SessionID, p.Prompt, logger)
+	}
 	if err := updateCommon(p, logger, func(f *fragment.Fragment) {
 		if cfg.ContentCapture != agento11y.ContentCaptureModeMetadataOnly {
 			f.Prompt = p.Prompt
@@ -207,7 +210,7 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 	}
 	envconfig.ApplyLocalAuthPlaceholders()
 	if !config.HasCredentials() {
-		logger.Print("stop: missing SIGIL_ENDPOINT/SIGIL_AUTH_TENANT_ID/SIGIL_AUTH_TOKEN; discarding fragment")
+		logger.Print("stop: missing AGENTO11Y_ENDPOINT/AGENTO11Y_AUTH_TENANT_ID; discarding fragment")
 		if err := fragment.Delete(p.SessionID, p.TurnID); err != nil {
 			logger.Printf("stop: delete fragment: %v", err)
 		}
@@ -234,7 +237,16 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 	client := buildClient(cfg, frag.Cwd, userID, providers, logger)
 	defer func() { _ = client.Shutdown(ctx) }()
 
-	mapped := mapper.Map(mapper.Inputs{Fragment: frag, SubagentLink: subagentLink, TokenSnapshot: tokenSnapshot, ContentCapture: cfg.ContentCapture, AgentName: cfg.Agent(), SkipPromptRedaction: cfg.SkipPromptRedaction, UserID: userID})
+	mapped := mapper.Map(mapper.Inputs{
+		Fragment:            frag,
+		SubagentLink:        subagentLink,
+		ParentTitle:         parentTitleForLink(subagentLink, logger),
+		TokenSnapshot:       tokenSnapshot,
+		ContentCapture:      cfg.ContentCapture,
+		AgentName:           cfg.Agent(),
+		SkipPromptRedaction: cfg.SkipPromptRedaction,
+		UserID:              userID,
+	})
 	logger.Printf("stop: export id=%s conversation=%s agent=%s model=%s", mapped.Generation.ID, mapped.Generation.ConversationID, mapped.Generation.AgentName, mapped.Generation.Model.Name)
 	if err := emitGeneration(ctx, client, frag, mapped, cfg.ContentCapture, logger); err != nil {
 		logger.Printf("stop: emit: %v", err)
@@ -322,6 +334,7 @@ func sweepPendingRetries(ctx context.Context, client *agento11y.Client, cfg conf
 		mapped := mapper.Map(mapper.Inputs{
 			Fragment:            f,
 			SubagentLink:        subagentLink,
+			ParentTitle:         parentTitleForLink(subagentLink, logger),
 			TokenSnapshot:       tokenSnapshot,
 			ContentCapture:      cfg.ContentCapture,
 			SkipPromptRedaction: cfg.SkipPromptRedaction,
@@ -441,6 +454,17 @@ func resolveSubagentLinkForStop(p Payload, frag *fragment.Fragment, logger *log.
 	return fragment.LoadSubagentLinkTolerant(p.SessionID, logger)
 }
 
+func parentTitleForLink(link *fragment.SubagentLink, logger *log.Logger) string {
+	if link == nil || link.ParentGenerationID == "" {
+		return ""
+	}
+	parent := fragment.LoadSessionTolerant(link.ParentSessionID, logger)
+	if parent == nil {
+		return ""
+	}
+	return parent.ConversationTitle
+}
+
 func updateCommon(p Payload, logger *log.Logger, mutate func(f *fragment.Fragment)) error {
 	return fragment.Update(p.SessionID, p.TurnID, logger, func(f *fragment.Fragment) bool {
 		applySessionDefaults(f, fragment.LoadSessionTolerant(p.SessionID, logger))
@@ -464,9 +488,25 @@ func updateCommon(p Payload, logger *log.Logger, mutate func(f *fragment.Fragmen
 	})
 }
 
+func setConversationTitle(sessionID, prompt string, logger *log.Logger) {
+	err := fragment.UpdateSession(sessionID, logger, func(s *fragment.Session) bool {
+		if s.ConversationTitle != "" {
+			return false
+		}
+		s.ConversationTitle = fragment.SessionTitle(prompt)
+		return s.ConversationTitle != ""
+	})
+	if err != nil {
+		logger.Printf("userPromptSubmit: save session title: %v", err)
+	}
+}
+
 func applySessionDefaults(f *fragment.Fragment, s *fragment.Session) {
 	if s == nil {
 		return
+	}
+	if f.ConversationTitle == "" {
+		f.ConversationTitle = s.ConversationTitle
 	}
 	if f.Cwd == "" {
 		f.Cwd = s.Cwd
@@ -482,13 +522,7 @@ func applySessionDefaults(f *fragment.Fragment, s *fragment.Session) {
 	}
 }
 
-// buildClient constructs the agento11y client with the shared HTTP/basic-auth
-// export defaults. Endpoint, tenant ID, and token come from the SDK's automatic
-// SIGIL_* env resolution, matching copilot and cursor. cwd is the turn's
-// working directory, which auto-tags resolve the repository and branch from.
-// userID is the identity Resolve already found (configured USER_ID or the
-// ChatGPT email in auth.json); auto-tags use it before falling back to the
-// OS account name.
+// buildClient configures export auth and tags for a Codex turn.
 func buildClient(cfg config.Config, cwd, userID string, providers *otel.Providers, logger *log.Logger) *agento11y.Client {
 	return emit.NewClient(emit.ClientOptions{
 		InstrumentationName: otelInstrumentationName,
@@ -497,7 +531,37 @@ func buildClient(cfg config.Config, cwd, userID string, providers *otel.Provider
 		Providers:           providers,
 		UserAgent:           useragent.For("codex"),
 		Tags:                autotag.FromEnv(autotag.Inputs{Cwd: cwd, UserID: userID}, logger),
+		Auth:                exportAuth(),
 	})
+}
+
+// exportAuth selects tenant auth when no token is configured.
+func exportAuth() agento11y.AuthConfig {
+	tenant := envconfig.Getenv("AUTH_TENANT_ID")
+	token := envconfig.Getenv("AUTH_TOKEN")
+	switch strings.ToLower(envconfig.Getenv("AUTH_MODE")) {
+	case "tenant":
+		return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeTenant, TenantID: tenant}
+	case "bearer":
+		return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeBearer, BearerToken: token}
+	case "none":
+		return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeNone}
+	}
+	if tenant != "" && token != "" {
+		return agento11y.AuthConfig{
+			Mode:          agento11y.ExportAuthModeBasic,
+			TenantID:      tenant,
+			BasicUser:     tenant,
+			BasicPassword: token,
+		}
+	}
+	if tenant != "" {
+		return agento11y.AuthConfig{
+			Mode:     agento11y.ExportAuthModeTenant,
+			TenantID: tenant,
+		}
+	}
+	return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeNone}
 }
 
 func emitGeneration(ctx context.Context, client *agento11y.Client, frag *fragment.Fragment, mapped mapper.Mapped, mode agento11y.ContentCaptureMode, logger *log.Logger) error {

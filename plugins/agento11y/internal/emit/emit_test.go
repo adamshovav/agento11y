@@ -43,13 +43,13 @@ func TestExportConfig(t *testing.T) {
 	t.Setenv("SIGIL_ENDPOINT", "http://localhost:8080")
 
 	t.Run("empty user agent leaves headers unset", func(t *testing.T) {
-		if got := exportConfig("").Headers; got != nil {
+		if got := exportConfig("", agento11y.AuthConfig{}).Headers; got != nil {
 			t.Fatalf("Headers = %v; want nil", got)
 		}
 	})
 
 	t.Run("user agent sets header", func(t *testing.T) {
-		got := exportConfig("agento11y-plugin-codex/1.2.3").Headers["User-Agent"]
+		got := exportConfig("agento11y-plugin-codex/1.2.3", agento11y.AuthConfig{}).Headers["User-Agent"]
 		if got != "agento11y-plugin-codex/1.2.3" {
 			t.Fatalf("User-Agent = %q; want %q", got, "agento11y-plugin-codex/1.2.3")
 		}
@@ -207,6 +207,52 @@ func TestToolError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := ToolError(tc.msg).Error(); got != tc.want {
 				t.Errorf("ToolError(%q) = %q; want %q", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewClientTokenlessAuth(t *testing.T) {
+	for _, mode := range []string{"", "tenant", "none"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			envconfig.PinAliasEnvBlank(t)
+			t.Setenv("AGENTO11Y_ENDPOINT", "http://localhost:8080")
+			t.Setenv("AGENTO11Y_AUTH_TENANT_ID", "tenant")
+			t.Setenv("AGENTO11Y_AUTH_MODE", mode)
+			client := NewClient(ClientOptions{})
+			if err := client.Shutdown(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestNewClientDefaultAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name, tenant, token string
+		auth                agento11y.AuthConfig
+		want                agento11y.ExportAuthMode
+	}{
+		{name: "no credentials", want: agento11y.ExportAuthModeNone},
+		{name: "token only", token: "token", want: agento11y.ExportAuthModeNone},
+		{name: "tenant only", tenant: "tenant", want: agento11y.ExportAuthModeTenant},
+		{name: "tenant and token", tenant: "tenant", token: "token", want: agento11y.ExportAuthModeBasic},
+		{name: "explicit password only", auth: agento11y.AuthConfig{BasicPassword: "password"}, want: agento11y.ExportAuthModeNone},
+		{name: "explicit user and password", auth: agento11y.AuthConfig{BasicUser: "user", BasicPassword: "password"}, want: agento11y.ExportAuthModeBasic},
+		{name: "explicit tenant and env token", token: "token", auth: agento11y.AuthConfig{TenantID: "tenant"}, want: agento11y.ExportAuthModeBasic},
+		{name: "blank explicit user", token: "token", auth: agento11y.AuthConfig{BasicUser: "  "}, want: agento11y.ExportAuthModeNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			envconfig.PinAliasEnvBlank(t)
+			t.Setenv("AGENTO11Y_ENDPOINT", "http://localhost:8080")
+			t.Setenv("AGENTO11Y_AUTH_TENANT_ID", tc.tenant)
+			t.Setenv("AGENTO11Y_AUTH_TOKEN", tc.token)
+			if got := exportConfig("", tc.auth).Auth.Mode; got != tc.want {
+				t.Fatalf("auth mode = %q, want %q", got, tc.want)
+			}
+			client := NewClient(ClientOptions{Auth: tc.auth})
+			if err := client.Shutdown(t.Context()); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

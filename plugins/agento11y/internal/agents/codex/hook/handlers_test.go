@@ -506,23 +506,160 @@ func TestStopResolvesSubagentParentGeneration(t *testing.T) {
 	}
 }
 
-func TestStopMissingCredentialsDiscardsFragment(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	t.Setenv("SIGIL_ENDPOINT", "")
-	t.Setenv("SIGIL_AUTH_TENANT_ID", "")
-	t.Setenv("SIGIL_AUTH_TOKEN", "")
+func TestTenantOnlyAuthExports(t *testing.T) {
+	envconfig.PinAliasEnvBlank(t)
 	logger := log.New(io.Discard, "", 0)
-	if err := fragment.Update("sess", "turn", logger, func(f *fragment.Fragment) bool {
-		f.Model = "gpt-5.5"
-		return true
-	}); err != nil {
-		t.Fatalf("Update: %v", err)
+	var gotAuth, gotTenant string
+	var requestCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		gotAuth = r.Header.Get("Authorization")
+		gotTenant = r.Header.Get("X-Scope-OrgID")
+		writeAcceptedGenerationResponseFromRequest(t, w, r)
+	}))
+	defer server.Close()
+	t.Setenv("SIGIL_ENDPOINT", server.URL)
+	t.Setenv("SIGIL_AUTH_TENANT_ID", "tenant-1")
+	t.Setenv("SIGIL_AUTH_TOKEN", "")
+
+	assert.True(t, config.HasCredentials())
+	frag := &fragment.Fragment{SessionID: "sess", TurnID: "turn", Model: "gpt-5.5", Prompt: "hello"}
+	cfg := config.Config{ContentCapture: agento11y.ContentCaptureModeFull}
+	client := buildClient(cfg, "", "", nil, logger)
+	defer func() { _ = client.Shutdown(context.Background()) }()
+	mapped := mapper.Map(mapper.Inputs{Fragment: frag, ContentCapture: cfg.ContentCapture})
+	require.NoError(t, emitGeneration(context.Background(), client, frag, mapped, cfg.ContentCapture, logger))
+	require.NoError(t, client.Flush(context.Background()))
+
+	assert.Equal(t, int64(1), requestCount.Load())
+	assert.Empty(t, gotAuth)
+	assert.Equal(t, "tenant-1", gotTenant)
+}
+
+func TestExplicitAuthModeExports(t *testing.T) {
+	for _, tc := range []struct {
+		mode, wantAuth, wantTenant string
+	}{
+		{mode: "tenant", wantTenant: "tenant-1"},
+		{mode: "bearer", wantAuth: "Bearer test-token"},
+		{mode: "none"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			envconfig.PinAliasEnvBlank(t)
+			var gotAuth, gotTenant string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				gotTenant = r.Header.Get("X-Scope-OrgID")
+				writeAcceptedGenerationResponseFromRequest(t, w, r)
+			}))
+			defer server.Close()
+			t.Setenv("SIGIL_ENDPOINT", server.URL)
+			t.Setenv("SIGIL_AUTH_TENANT_ID", "tenant-1")
+			t.Setenv("SIGIL_AUTH_TOKEN", "test-token")
+			t.Setenv("SIGIL_AUTH_MODE", tc.mode)
+			logger := log.New(io.Discard, "", 0)
+			cfg := config.Config{ContentCapture: agento11y.ContentCaptureModeFull}
+			frag := &fragment.Fragment{SessionID: "sess", TurnID: "turn", Model: "gpt-5.5", Prompt: "hello"}
+			client := buildClient(cfg, "", "", nil, logger)
+			defer func() { _ = client.Shutdown(context.Background()) }()
+			mapped := mapper.Map(mapper.Inputs{Fragment: frag, ContentCapture: cfg.ContentCapture})
+			require.NoError(t, emitGeneration(context.Background(), client, frag, mapped, cfg.ContentCapture, logger))
+			require.NoError(t, client.Flush(context.Background()))
+			assert.Equal(t, tc.wantAuth, gotAuth)
+			assert.Equal(t, tc.wantTenant, gotTenant)
+		})
 	}
+}
 
-	Stop(Payload{HookEventName: "Stop", SessionID: "sess", TurnID: "turn"}, config.Config{ContentCapture: agento11y.ContentCaptureModeMetadataOnly}, logger)
+func TestStopExportsConversationTitleFromFirstPrompt(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	envconfig.PinAliasEnvBlank(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	logger := log.New(io.Discard, "", 0)
+	var titles []string
+	server := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+		var request struct {
+			Generations []struct {
+				Metadata map[string]any `json:"metadata"`
+			} `json:"generations"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Errorf("decode export: %v", err)
+		}
+		for _, gen := range request.Generations {
+			title, _ := gen.Metadata["agento11y.conversation.title"].(string)
+			titles = append(titles, title)
+		}
+		writeAcceptedGenerationResponse(t, w, body)
+	}))
+	defer server.Close()
+	t.Setenv("SIGIL_ENDPOINT", server.URL)
+	t.Setenv("SIGIL_AUTH_TENANT_ID", "tenant")
+	t.Setenv("SIGIL_AUTH_TOKEN", "token")
+	cfg := config.Config{ContentCapture: agento11y.ContentCaptureModeFull}
 
-	if got := fragment.LoadTolerant("sess", "turn", logger); got != nil {
-		t.Fatalf("expected fragment discarded without credentials, got %+v", got)
+	const secret = "glc_abcdefghijklmnopqrstuvwxyz0123456789" // trufflehog:ignore
+	UserPromptSubmit(context.Background(), io.Discard, Payload{
+		HookEventName: "UserPromptSubmit",
+		SessionID:     "sess",
+		TurnID:        "turn-1",
+		Prompt:        "prefix " + secret + " suffix",
+	}, cfg, logger)
+	Stop(Payload{HookEventName: "Stop", SessionID: "sess", TurnID: "turn-1"}, cfg, logger)
+
+	UserPromptSubmit(context.Background(), io.Discard, Payload{
+		HookEventName: "UserPromptSubmit",
+		SessionID:     "sess",
+		TurnID:        "turn-2",
+		Prompt:        "a later prompt",
+	}, cfg, logger)
+	Stop(Payload{HookEventName: "Stop", SessionID: "sess", TurnID: "turn-2"}, cfg, logger)
+
+	require.Len(t, titles, 2)
+	for i, title := range titles {
+		if strings.Contains(title, secret) || !strings.Contains(title, "[REDACTED:") {
+			t.Fatalf("turn %d title = %q, want the token redacted", i+1, title)
+		}
+		if strings.Contains(title, "later prompt") {
+			t.Fatalf("turn %d title = %q, want the first prompt to win", i+1, title)
+		}
+	}
+	if titles[0] != titles[1] {
+		t.Fatalf("titles differ across turns: %q vs %q", titles[0], titles[1])
+	}
+}
+
+func TestStopMissingCredentialsDiscardsFragment(t *testing.T) {
+	for _, tc := range []struct {
+		name, endpoint, tenant, mode string
+	}{
+		{name: "missing all"},
+		{name: "basic mode without token", endpoint: "https://example.test", tenant: "tenant", mode: "basic"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			envconfig.PinAliasEnvBlank(t)
+			t.Setenv("SIGIL_ENDPOINT", tc.endpoint)
+			t.Setenv("SIGIL_AUTH_TENANT_ID", tc.tenant)
+			t.Setenv("SIGIL_AUTH_MODE", tc.mode)
+			logger := log.New(io.Discard, "", 0)
+			if err := fragment.Update("sess", "turn", logger, func(f *fragment.Fragment) bool {
+				f.Model = "gpt-5.5"
+				return true
+			}); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+			Stop(Payload{HookEventName: "Stop", SessionID: "sess", TurnID: "turn"}, config.Config{ContentCapture: agento11y.ContentCaptureModeMetadataOnly}, logger)
+			if got := fragment.LoadTolerant("sess", "turn", logger); got != nil {
+				t.Fatalf("expected fragment discarded without credentials, got %+v", got)
+			}
+		})
 	}
 }
 
@@ -709,6 +846,12 @@ func TestStopRetrySweepPreservesSubagentLinkAndTokenUsage(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed subagent link: %v", err)
 	}
+	if err := fragment.UpdateSession("parent", logger, func(s *fragment.Session) bool {
+		s.ConversationTitle = "parent task"
+		return true
+	}); err != nil {
+		t.Fatalf("seed parent title: %v", err)
+	}
 
 	// Plant a prior-turn fragment marked PendingRetry, with a transcript
 	// containing token usage for that turn. The retry sweep must pick up
@@ -735,7 +878,7 @@ func TestStopRetrySweepPreservesSubagentLinkAndTokenUsage(t *testing.T) {
 		t.Fatalf("seed new turn: %v", err)
 	}
 
-	Stop(Payload{HookEventName: "Stop", SessionID: "child", TurnID: "new-turn"}, config.Config{ContentCapture: agento11y.ContentCaptureModeMetadataOnly}, logger)
+	Stop(Payload{HookEventName: "Stop", SessionID: "child", TurnID: "new-turn"}, config.Config{ContentCapture: agento11y.ContentCaptureModeFull}, logger)
 
 	type exportedGen struct {
 		ID                  string         `json:"id"`
@@ -771,6 +914,9 @@ func TestStopRetrySweepPreservesSubagentLinkAndTokenUsage(t *testing.T) {
 	}
 	if retried.ConversationID != "parent" {
 		t.Errorf("retry ConversationID = %q, want %q", retried.ConversationID, "parent")
+	}
+	if got := retried.Metadata["agento11y.conversation.title"]; got != "parent task" {
+		t.Errorf("retry conversation title = %q, want parent task; metadata=%v", got, retried.Metadata)
 	}
 	if len(retried.ParentGenerationIDs) != 1 || retried.ParentGenerationIDs[0] != parentGenerationID {
 		t.Errorf("retry ParentGenerationIDs = %v, want [%s]", retried.ParentGenerationIDs, parentGenerationID)

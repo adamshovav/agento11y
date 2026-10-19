@@ -71,16 +71,32 @@ type ClientOptions struct {
 	// AGENTO11Y_TAGS must not appear here: the SDK lets caller tags win over
 	// env tags, and the explicit tag is the one the user asked for.
 	Tags map[string]string
+	// Auth overrides generation-export auth; an empty mode defaults to basic
+	// with a user and token, tenant with a tenant ID, otherwise none.
+	Auth agento11y.AuthConfig
 }
 
-// exportConfig builds the shared HTTP/basic-auth generation export config.
+// exportConfig builds the shared HTTP generation export config.
 // A non-empty userAgent sets the export User-Agent header (each agent passes
 // its own token via useragent.For); empty leaves the SDK default in place.
-func exportConfig(userAgent string) agento11y.GenerationExportConfig {
+func exportConfig(userAgent string, auth agento11y.AuthConfig) agento11y.GenerationExportConfig {
+	if auth.Mode == "" {
+		hasTenant := strings.TrimSpace(auth.TenantID) != "" || envconfig.Getenv("AUTH_TENANT_ID") != ""
+		hasUser := strings.TrimSpace(auth.BasicUser) != "" || hasTenant
+		hasToken := strings.TrimSpace(auth.BasicPassword) != "" || envconfig.Getenv("AUTH_TOKEN") != ""
+		switch {
+		case hasUser && hasToken:
+			auth.Mode = agento11y.ExportAuthModeBasic
+		case hasTenant:
+			auth.Mode = agento11y.ExportAuthModeTenant
+		default:
+			auth.Mode = agento11y.ExportAuthModeNone
+		}
+	}
 	export := agento11y.GenerationExportConfig{
 		Protocol: agento11y.GenerationExportProtocolHTTP,
 		Endpoint: ExportEndpoint(),
-		Auth:     agento11y.AuthConfig{Mode: agento11y.ExportAuthModeBasic},
+		Auth:     auth,
 	}
 	if userAgent != "" {
 		export.Headers = map[string]string{"User-Agent": userAgent}
@@ -88,13 +104,13 @@ func exportConfig(userAgent string) agento11y.GenerationExportConfig {
 	return export
 }
 
-// NewClient builds an agento11y client with the shared HTTP/basic-auth generation
+// NewClient builds an agento11y client with the shared HTTP generation
 // export defaults and optional OTel providers.
 func NewClient(opts ClientOptions) *agento11y.Client {
 	c := agento11y.Config{
 		ContentCapture:   opts.ContentCapture,
 		Logger:           opts.Logger,
-		GenerationExport: exportConfig(opts.UserAgent),
+		GenerationExport: exportConfig(opts.UserAgent, opts.Auth),
 		Tags:             opts.Tags,
 	}
 	if opts.Providers != nil {

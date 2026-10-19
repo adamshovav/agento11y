@@ -1597,6 +1597,47 @@ func TestRun_LauncherSkipsAutoPromptWhenCredsPresent(t *testing.T) {
 	}
 }
 
+func TestRun_CodexTenantOnlyCredentialsSkipAutoPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		agent          string
+		authMode       string
+		wantLoginCalls int
+	}{
+		{name: "Codex automatic tenant auth", agent: "codex"},
+		{name: "Codex explicit basic without token", agent: "codex", authMode: "basic", wantLoginCalls: 1},
+		{name: "Codex explicit tenant auth", agent: "codex", authMode: "tenant"},
+		{name: "Pi requires a token", agent: "pi", wantLoginCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateDotenvHome(t)
+			t.Setenv("SIGIL_ENDPOINT", "https://sigil.example.com")
+			t.Setenv("SIGIL_AUTH_TENANT_ID", "tenant")
+			t.Setenv("SIGIL_AUTH_TOKEN", "")
+			t.Setenv("SIGIL_AUTH_MODE", tc.authMode)
+
+			loginCalls := 0
+			withStubLoginRun(t, func(context.Context, login.RunOpts) (login.Result, error) {
+				loginCalls++
+				return login.Result{}, login.ErrNotInteractive
+			})
+			launcherCalls := 0
+			withStubLauncher(t, tc.agent, func(context.Context, []string, *local.LaunchEnv, io.Reader, io.Writer, io.Writer, *log.Logger, string) error {
+				launcherCalls++
+				return nil
+			})
+
+			var stdout, stderr bytes.Buffer
+			exitCode := withExit(t, func() {
+				run([]string{tc.agent, "--"}, strings.NewReader(""), &stdout, &stderr)
+			})
+			require.Nil(t, exitCode, "stderr=%q", stderr.String())
+			assert.Equal(t, tc.wantLoginCalls, loginCalls)
+			assert.Equal(t, 1, launcherCalls)
+		})
+	}
+}
+
 func TestRun_LauncherContinuesWhenLoginAborted(t *testing.T) {
 	isolateDotenvHome(t)
 	t.Setenv("SIGIL_ENDPOINT", "")
