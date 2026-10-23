@@ -19,6 +19,7 @@ import (
 
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/claudecode/mapper"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/claudecode/state"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/claudecode/subagent"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/claudecode/transcript"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/claudecode/userid"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/guard"
@@ -132,6 +133,12 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 		return nil
 	}
 
+	protocol, err := envconfig.ResolveGenerationTransport()
+	if err != nil {
+		logger.Printf("not exporting: %v", err)
+		return nil
+	}
+
 	endpoint := envconfig.Getenv("ENDPOINT")
 	tenantID := envconfig.Getenv("AUTH_TENANT_ID")
 	authToken := envconfig.Getenv("AUTH_TOKEN")
@@ -150,7 +157,7 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 			"AGENTO11Y_AUTH_TOKEN":     authToken,
 		},
 	)
-	if len(missing) > 0 {
+	if protocol == agento11y.GenerationExportProtocolHTTP && len(missing) > 0 {
 		fmt.Fprintf(os.Stderr, "agento11y claude-code: not exporting: missing %s\n", strings.Join(missing, ", "))
 		logger.Printf("not exporting: missing %s", strings.Join(missing, ", "))
 		return nil
@@ -165,41 +172,73 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 	defer cancel()
 	hookCtx = agento11y.WithUserID(hookCtx, userID)
 
-	otelProviders, err := otel.Setup(hookCtx, input.SessionID)
+	otelProviders, err := otel.SetupWithOptions(hookCtx, input.SessionID, otel.Options{GenerationProtocol: protocol})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agento11y claude-code: otel setup failed: %v\n", err)
 		logger.Printf("otel setup: %v", err)
+		if protocol == agento11y.GenerationExportProtocolOTel {
+			return nil
+		}
 	} else if otelProviders != nil {
 		logger.Printf("otel: endpoint=%s", otel.EndpointFromEnv())
 	}
-	defer func() { _ = otelProviders.Shutdown(hookCtx) }()
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = otelProviders.Shutdown(cleanupCtx)
+	}()
 
 	stop := strings.TrimSpace(input.HookEventName) == "Stop"
-	lines, safeOffset, rawCount := readTranscriptSettled(hookCtx, input.TranscriptPath, st.Offset, stop, logger)
-	if rawCount == 0 {
-		return nil
-	}
-	logger.Printf("read %d raw lines", rawCount)
-
-	if safeOffset == 0 {
+	lines, safeOffset, rawCount, titles := readTranscriptSettled(hookCtx, input.TranscriptPath, st.Offset, stop, logger)
+	parentReady := rawCount > 0 && safeOffset > 0
+	switch {
+	case parentReady:
+		logger.Printf("read %d raw lines", rawCount)
+		logger.Printf("coalesced to %d lines, safe offset=%d", len(lines), safeOffset)
+	case rawCount > 0:
+		logger.Printf("read %d raw lines", rawCount)
 		logger.Printf("no completed assistant turn yet; keeping offset=%d", st.Offset)
-		return nil
+		lines = nil
+	default:
+		// Parent already exported; background and nested subagent files may
+		// still have new turns (or SessionEnd still has a trailing turn).
+		logger.Printf("no new parent turns; checking subagent transcripts")
+		lines = nil
 	}
-	logger.Printf("coalesced to %d lines, safe offset=%d", len(lines), safeOffset)
 
 	var r *redact.Redactor
 	if contentMode != agento11y.ContentCaptureModeMetadataOnly {
 		r = redact.New()
 	}
 
-	gens, toolResultAt := mapper.Process(lines, &st, mapper.Options{
+	opts := mapper.Options{
 		SessionID:           input.SessionID,
+		Titles:              titles,
 		Logger:              logger,
 		ExtraTags:           extraTags,
 		AgentName:           resolvedAgentName,
 		AgentVersion:        envconfig.ResolveAgentVersion(""),
 		SkipPromptRedaction: skipPromptRedaction,
-	}, r)
+		TitleDropped:        contentMode == agento11y.ContentCaptureModeMetadataOnly,
+	}
+	subFiles, err := liveSubagentFiles(input.TranscriptPath, logger)
+	if err != nil {
+		logger.Printf("list subagent transcripts: %v", err)
+	}
+
+	var (
+		parentGens   []agento11y.Generation
+		toolResultAt map[string]time.Time
+	)
+	if parentReady {
+		lines = subagent.DropCoveredSidechain(lines, subFiles, input.TranscriptPath)
+		opts.SuppressSyntheticSubagentToolCallIDs = subagent.SyntheticToolCallIDs(lines, subagent.RefsForFiles(subFiles))
+		parentGens, toolResultAt = mapper.Process(lines, &st, opts, r)
+	}
+	subGens := liveSubagentGens(input, lines, parentGens, subFiles, &st, opts, r, logger)
+	gens := make([]agento11y.Generation, 0, len(parentGens)+len(subGens))
+	gens = append(gens, parentGens...)
+	gens = append(gens, subGens...)
 
 	if len(gens) == 0 {
 		logger.Printf("no generations produced; keeping offset=%d for next event", st.Offset)
@@ -221,7 +260,16 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 	}
 
 	cfg.ContentCapture = contentMode
+	if err := emit.ConfigureGenerationTransport(&cfg, otelProviders, protocol); err != nil {
+		logger.Printf("client setup: %v", err)
+		return nil
+	}
 	client := agento11y.NewClient(cfg)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = client.Shutdown(cleanupCtx)
+	}()
 	t0 := time.Now()
 
 	toolResults := buildToolResultMap(gens)
@@ -231,15 +279,16 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 			emitToolSpans(genCtx, client, gen, toolResults, toolResultAt)
 		}); err != nil {
 			logger.Printf("enqueue: %v", err)
+			if protocol == agento11y.GenerationExportProtocolOTel {
+				return nil
+			}
 		}
 	}
 
 	if err := client.Flush(hookCtx); err != nil {
 		logger.Printf("flush: %v", err)
-		_ = client.Shutdown(hookCtx)
 		return nil
 	}
-	_ = client.Shutdown(hookCtx)
 
 	if otelProviders != nil {
 		if err := otelProviders.ForceFlush(); err != nil {
@@ -247,7 +296,9 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 		}
 	}
 
-	st.Offset = safeOffset
+	if parentReady {
+		st.Offset = safeOffset
+	}
 	if err := state.Save(input.SessionID, st); err != nil {
 		logger.Printf("save state: %v", err)
 	}
@@ -324,14 +375,15 @@ func handleUserPromptSubmit(ctx context.Context, stdout io.Writer, input *hookIn
 // SessionEnd that would catch up is cancelled when -p exits.
 //
 // Returns the coalesced lines, the safe offset, and the raw line count so the
-// caller can distinguish "nothing to read" from "read but nothing complete".
-func readTranscriptSettled(ctx context.Context, path string, offset int64, stop bool, logger *log.Logger) ([]transcript.Line, int64, int) {
+// caller can distinguish "nothing to read" from "read but nothing complete",
+// and the title lines Claude Code wrote in the range.
+func readTranscriptSettled(ctx context.Context, path string, offset int64, stop bool, logger *log.Logger) ([]transcript.Line, int64, int, transcript.Titles) {
 	deadline := time.Now().Add(transcriptSettleWindow)
 	for {
-		raw, _, err := transcript.Read(path, offset)
+		raw, _, titles, err := transcript.ReadWithTitles(path, offset)
 		if err != nil && (!stop || !errors.Is(err, fs.ErrNotExist)) {
 			logger.Printf("read transcript: %v", err)
-			return nil, 0, 0
+			return nil, 0, 0, transcript.Titles{}
 		}
 
 		coalesced, safeOffset := mapper.Coalesce(raw)
@@ -347,14 +399,14 @@ func readTranscriptSettled(ctx context.Context, path string, offset int64, stop 
 			if err != nil {
 				logger.Printf("read transcript: %v", err)
 			}
-			return coalesced, safeOffset, len(raw)
+			return coalesced, safeOffset, len(raw), titles
 		}
 
 		timer := time.NewTimer(transcriptSettleInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return coalesced, safeOffset, len(raw)
+			return coalesced, safeOffset, len(raw), titles
 		case <-timer.C:
 		}
 	}

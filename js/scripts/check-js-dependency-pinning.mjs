@@ -15,7 +15,9 @@ const publishedManifests = [
 ];
 const privateManifests = [
   "package.json",
+  "examples/experiments/promptfoo/package.json",
   "plugins/agento11y/package.json",
+  "plugins/agento11y/internal/entry/testdata/agent-clis/package.json",
   "examples/experiments/typescript/package.json",
   "examples/getting-started/typescript/package.json",
   "examples/getting-started/typescript-hooks/package.json",

@@ -257,11 +257,9 @@ export function HistoryImportBanner({ history, onOpenSettings }: HistoryImportBa
       <span
         style={{
           fontSize: 12.5,
+          lineHeight: 1.4,
           color: 'var(--fg2)',
           minWidth: 0,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
         }}
       >
         {offer.display_name} wrote {offer.sessions} session
@@ -2457,6 +2455,26 @@ function SettingsLocalTab({ form, set, setTag, addTag, removeTag, onOpenSecurity
         >
           <Toggle checked={form.autoUpdate} onChange={(v) => set({ autoUpdate: v })} label="Automatic updates" />
         </SettingRow>
+        <SettingRow
+          label="Anonymous CLI usage statistics"
+          help={
+            <>
+              <Mono>agento11y</Mono> sends anonymous usage statistics about its commands, never operations performed by
+              a coding agent. To turn reporting off, set <Mono>AGENTO11Y_ANONYMOUS_USAGE_STATS=disabled</Mono> in your
+              shell or <Mono>~/.config/agento11y/config.env</Mono>. You can also set <Mono>DO_NOT_TRACK=1</Mono> in your
+              shell.{' '}
+              <a
+                href="https://grafana.com/docs/grafana-cloud/observe-and-act/agent-observability/guides/instrument-coding-agents/"
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: 'var(--fg-link)' }}
+              >
+                Learn more
+              </a>
+              .
+            </>
+          }
+        />
       </SettingsCard>
       <SettingsCard>
         <SectionLabel>Identity (optional)</SectionLabel>
@@ -2558,7 +2576,12 @@ export function SettingsHistoryTab({ history }: SettingsHistoryTabProps) {
       >
         Backfill sessions an agent recorded before agento11y was installed. The import writes to the local store on this
         machine. The daemon never relays it to Grafana Cloud, whatever{' '}
-        <b style={{ fontWeight: 500, color: 'var(--fg2)' }}>Cloud forwarding</b> on the Cloud tab is set to.
+        <b style={{ fontWeight: 500, color: 'var(--fg2)' }}>Cloud forwarding</b> on the Cloud tab is set to. To send
+        past sessions to Grafana Cloud, run{' '}
+        <code style={{ fontFamily: 'var(--fontFamilyMonospace)', color: 'var(--fg2)' }}>
+          agento11y history import {selected || '<agent>'} --no-local
+        </code>{' '}
+        in a terminal.
       </div>
       <SettingRow label="Agent" help={<>Only agents with an importer are listed.</>}>
         <Select
@@ -2693,6 +2716,20 @@ function HistoryImportStatus({ run }: HistoryImportStatusProps) {
         )}
         {run.error && <div style={{ fontSize: 12 }}>{run.error}</div>}
       </Notice>
+      {!!run.warnings?.length && (
+        <div style={{ marginTop: 8 }}>
+          <Notice kind="warning" title="Source warnings">
+            <ul
+              aria-label="Source warnings"
+              style={{ margin: 0, paddingLeft: 20, fontSize: 12, overflowWrap: 'anywhere' }}
+            >
+              {run.warnings.map((warning, index) => (
+                <li key={index}>{warning}</li>
+              ))}
+            </ul>
+          </Notice>
+        </div>
+      )}
     </div>
   );
 }

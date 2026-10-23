@@ -1,13 +1,13 @@
 [tools]
 biome = "2.4.11"
 ruff = "0.15.12"
-go = "1.25.14"
+go = "1.26.9"
 protoc = "34.1"
 "go:google.golang.org/protobuf/cmd/protoc-gen-go" = "v1.36.11"
 "go:google.golang.org/grpc/cmd/protoc-gen-go-grpc" = "v1.6.1"
 
 [env]
-PYTHON_BIN = "python3"
+PYTHON_BIN = "{{ env.PYTHON_BIN | default(value='python3') }}"
 # Pin the Python protobuf toolchain so generated stubs are reproducible across
 # machines and CI. Bumping these requires regenerating stubs via
 # `mise run generate:proto:python`.
@@ -110,7 +110,7 @@ while IFS= read -r moddir; do
   echo "==> golangci-lint ${moddir}"
   extra_args=()
   if [[ "${moddir}" == "./go/otelgenai/conformance" ]]; then
-    extra_args+=(--build-tags=conformance)
+    extra_args+=(--build-tags=conformance,tool_execution_kinds)
   fi
   (cd "${moddir}" && GOWORK=off golangci-lint run ${extra_args[@]+"${extra_args[@]}"} ./...)
 done < <(find . \\( -path './examples' -o -path './node_modules' \\) -prune -o -name go.mod -print | while IFS= read -r mod; do dirname "$mod"; done | sort)
@@ -276,8 +276,20 @@ dir = "go/otelgenai/conformance"
 tools."github:open-telemetry/weaver" = "0.25.1"
 # The GenAI semantic-convention registry has no tagged releases, so pin a commit on main.
 # renovate: datasource=git-refs depName=open-telemetry/semantic-conventions-genai packageName=https://github.com/open-telemetry/semantic-conventions-genai.git versioning=git
-env.SEMCONV_GENAI_REF = "f77b9235f2ad49fe95b61e9809ca82bb08ef9d47"
+env.SEMCONV_GENAI_REF = "1d85c963ea51e9c7d24cc330ff67057f6e90e6c5"
 run = "GOWORK=off go test -count=1 -tags conformance ./..."
+
+[tasks."test:go:tool-execution-kinds-conformance"]
+description = "Check skill-load, resource-read, and command spans against the GenAI registry"
+dir = "go/otelgenai/conformance"
+tools."github:open-telemetry/weaver" = "0.26.1"
+env.SEMCONV_GENAI_REF = "771e3210f7518694666834f7243573b8018c7a4f"
+run = "GOWORK=off go test -count=1 -tags conformance,tool_execution_kinds -run '^TestToolExecutionKindsConformance$' ./..."
+
+[tasks."test:go:otelgenai-race"]
+description = "Run the otelgenai tests with the Go race detector"
+dir = "go"
+run = "GOWORK=off go test -race -count=1 ./otelgenai"
 
 [tasks."test:ts:plugin-pi"]
 description = "Run Pi plugin tests"
@@ -360,8 +372,21 @@ run = "pnpm run test:build && node --test test/frameworks.langchain.test.mjs tes
 # --- Python SDK tests ---
 
 [tasks."test:py:sdk-core"]
-description = "Run Python SDK core parity tests"
-run = "uv run --python \"$PYTHON_BIN\" --with '.[dev]' --directory python pytest tests"
+description = "Run Python SDK core tests with and without the OTel extra"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+mise run test:py:sdk-core-base
+mise run test:py:sdk-core-otel
+"""
+
+[tasks."test:py:sdk-core-base"]
+description = "Run Python SDK core tests without the OTel extra"
+run = "uv run --locked --exact --python \"$PYTHON_BIN\" --extra dev --directory python python -c 'import importlib.util; import pytest; assert importlib.util.find_spec(\"opentelemetry.util.genai\") is None, \"base install must not include opentelemetry-util-genai\"; raise SystemExit(pytest.main([\"tests\"]))'"
+
+[tasks."test:py:sdk-core-otel"]
+description = "Run Python SDK core tests with the OTel extra"
+run = "uv run --locked --exact --python \"$PYTHON_BIN\" --extra dev --extra otel --directory python python -c 'import opentelemetry.util.genai.handler; import pytest; raise SystemExit(pytest.main([\"tests\"]))'"
 
 [tasks."test:py:sdk-conformance"]
 description = "Run Python SDK core conformance tests"
@@ -423,6 +448,10 @@ run = "uv run --python \"$PYTHON_BIN\" --with './python[dev]' --with './python-f
 description = "Run Python DeepEval experiment adapter tests"
 run = "uv run --python \"$PYTHON_BIN\" --with-editable './python[dev]' --with-editable './python-frameworks/deepeval[dev]' pytest python-frameworks/deepeval/tests"
 
+[tasks."test:py:sdk-harbor"]
+description = "Run Python Harbor experiment importer tests"
+run = "uv run --python \"$PYTHON_BIN\" --with-editable './python[dev]' --with-editable './python-frameworks/harbor[dev]' pytest python-frameworks/harbor/tests"
+
 [tasks."test:py:sdk-provider-conformance"]
 description = "Run Python provider-wrapper conformance tests"
 run = """
@@ -447,6 +476,7 @@ mise run test:py:sdk-strands
 mise run test:py:sdk-claude-agent-sdk
 mise run test:py:sdk-litellm
 mise run test:py:sdk-deepeval
+mise run test:py:sdk-harbor
 """
 
 # --- .NET SDK tests ---
@@ -693,6 +723,7 @@ set -euo pipefail
 mise run test:go:sdk-core
 mise run test:go:weavertest
 mise run test:go:conformance
+mise run test:go:tool-execution-kinds-conformance
 mise run test:go:sdk-anthropic
 mise run test:go:sdk-openai
 mise run test:go:sdk-gemini
@@ -742,20 +773,24 @@ PACKAGE_DIRS=(
   python-frameworks/litellm
   python-frameworks/pydantic-ai
   python-frameworks/deepeval
+  python-frameworks/harbor
   python-frameworks/strands
   python-frameworks/claude-agent-sdk
+  plugins/hermes
 )
 
 for dir in "${PACKAGE_DIRS[@]}"; do
   file="${dir}/pyproject.toml"
   perl -i -pe "s/^version = \".*\"/version = \"${VERSION}\"/" "$file"
-  if [[ "$dir" != "python" ]]; then
+  if [[ "$dir" != "python" && "$dir" != "plugins/hermes" ]]; then
     perl -i -pe "s/\"agento11y>=.*\"/\"agento11y>=${VERSION}\"/" "$file"
   fi
   echo "  updated ${file}"
 done
+(cd python && uv --no-config lock)
+(cd plugins/hermes && uv --no-config lock)
 
-echo "All Python SDK versions bumped to ${VERSION}"
+echo "All Python package versions bumped to ${VERSION}"
 '''
 
 # --- Proto generation ---

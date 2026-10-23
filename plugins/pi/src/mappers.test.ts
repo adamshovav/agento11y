@@ -1,4 +1,11 @@
-import type { Message } from "@grafana/agento11y";
+import {
+  Agento11yClient,
+  createSecretRedactionSanitizer,
+  type ExportGenerationsRequest,
+  type GenerationExporter,
+  type Message,
+  redactSecretTextLightweight,
+} from "@grafana/agento11y";
 import { describe, expect, it } from "vitest";
 import {
   applyRedactedText,
@@ -829,6 +836,99 @@ describe("resolveConversationTitle", () => {
     expect(Array.from(clipped ?? "")).toHaveLength(MAX_TITLE_LEN);
     expect(clipped).not.toContain("\uFFFD");
   });
+
+  // Regression: the title was clipped before the SDK's sanitizer redacted it.
+  // A secret the clip split no longer matched its pattern, so its first part
+  // was exported in the title while the same prompt's input was redacted.
+  describe("redacts a secret before the clip can split it", () => {
+    // What the SDK's generation sanitizer does to conversationTitle on export.
+    const exported = (title: string | undefined) =>
+      redactSecretTextLightweight(title ?? "");
+    const token = `ghp_${"A".repeat(36)}`;
+
+    it("a token across the clip", () => {
+      const title = resolveConversationTitle({
+        firstUserText: `${"x".repeat(70)} ${token} please`,
+        contentCapture: "full",
+      });
+      expect(exported(title)).toBe(
+        `${"x".repeat(70)} [REDACTED:github-pat] please`,
+      );
+    });
+
+    it("a token whose marker crosses the clip", () => {
+      const title = resolveConversationTitle({
+        firstUserText: `${"x".repeat(85)} ${token} please`,
+        contentCapture: "full",
+      });
+      expect(exported(title)).toBe("x".repeat(85));
+    });
+
+    it("a token in a session name", () => {
+      const title = resolveConversationTitle({
+        sessionName: `${"y".repeat(70)} ${token}`,
+        firstUserText: "unused",
+        contentCapture: "metadata_only",
+      });
+      expect(exported(title)).not.toContain("ghp_");
+      expect(exported(title)).toContain("[REDACTED:github-pat]");
+    });
+  });
+
+  // Regression: the SDK sends the title twice, as conversationTitle and as the
+  // agento11y.conversation.title metadata mirror, and its sanitizer redacts
+  // only the first. A whole token in the first prompt went out unredacted in
+  // the mirror. Pi now hands the SDK a title that is already redacted.
+  it("exports no secret in the title or its metadata mirror", async () => {
+    const token = `ghp_${"A".repeat(36)}`;
+    for (const prompt of [
+      `deploy ${token} now`,
+      `${"x".repeat(70)} ${token} please`,
+    ]) {
+      const requests: ExportGenerationsRequest[] = [];
+      const exporter: GenerationExporter = {
+        exportGenerations: async (request) => {
+          requests.push(structuredClone(request));
+          return {
+            results: request.generations.map((g) => ({
+              generationId: g.id,
+              accepted: true,
+            })),
+          };
+        },
+        exportWorkflowSteps: async () => ({ results: [] }),
+      };
+      // As createAgento11yClient configures it, with the export captured.
+      const client = new Agento11yClient({
+        generationExporter: exporter,
+        contentCapture: "full",
+        generationSanitizer: createSecretRedactionSanitizer({
+          redactInputMessages: true,
+        }),
+      });
+      const recorder = client.startGeneration({
+        conversationId: "pi-conv-1",
+        conversationTitle: resolveConversationTitle({
+          firstUserText: prompt,
+          contentCapture: "full",
+        }),
+        model: { provider: "anthropic", name: "claude" },
+      });
+      recorder.end();
+      await client.shutdown();
+
+      const generation = requests[0]?.generations[0];
+      expect(generation?.conversationTitle).toContain("[REDACTED:github-pat]");
+      expect(JSON.stringify(generation)).not.toContain("ghp_");
+    }
+  });
+
+  it("keeps text that only looks like the start of a marker", () => {
+    const text = `see [REDACTED: notes ${"z".repeat(120)}`;
+    expect(
+      resolveConversationTitle({ firstUserText: text, contentCapture: "full" }),
+    ).toBe(Array.from(text).slice(0, MAX_TITLE_LEN).join(""));
+  });
 });
 
 describe("userMessageText", () => {
@@ -1450,10 +1550,11 @@ describe("applyRedactedText", () => {
 describe("mapPiUsage", () => {
   it.each([
     {
-      name: "full usage block",
+      name: "full usage block with positive reasoning",
       usage: {
         input: 120000,
         output: 8000,
+        reasoning: 7,
         cacheRead: 40,
         cacheWrite: 12,
         totalTokens: 128052,
@@ -1465,6 +1566,7 @@ describe("mapPiUsage", () => {
         totalTokens: 128052,
         cacheReadInputTokens: 40,
         cacheWriteInputTokens: 12,
+        reasoningTokens: 7,
       },
     },
     {
@@ -1479,10 +1581,11 @@ describe("mapPiUsage", () => {
       },
     },
     {
-      name: "absent cost is not part of the token mapping",
+      name: "explicit zero reasoning without cost",
       usage: {
         input: 1,
         output: 2,
+        reasoning: 0,
         cacheRead: 0,
         cacheWrite: 0,
         totalTokens: 3,
@@ -1493,6 +1596,7 @@ describe("mapPiUsage", () => {
         totalTokens: 3,
         cacheReadInputTokens: 0,
         cacheWriteInputTokens: 0,
+        reasoningTokens: 0,
       },
     },
     {
@@ -1510,12 +1614,20 @@ describe("mapPiUsage", () => {
     expect(mapPiUsage(usage)).toEqual(want);
   });
 
-  it("produces the same fields the turn path exports", () => {
+  it.each([
+    undefined,
+    0,
+    7,
+  ])("matches the turn path with reasoning=%s", (reasoning) => {
     // Guard against drift: mapGenerationResult must stay byte-identical to
     // mapPiUsage so turn and summary generations report tokens the same way.
     const msg = makeMsg();
-    expect(mapGenerationResult(msg, [], "metadata_only").usage).toEqual(
-      mapPiUsage(msg.usage),
+    if (reasoning !== undefined) Object.assign(msg.usage, { reasoning });
+    const usage = mapGenerationResult(msg, [], "metadata_only").usage;
+    expect(usage).toEqual(mapPiUsage(msg.usage));
+    expect(usage?.reasoningTokens).toBe(reasoning);
+    expect(Object.hasOwn(usage!, "reasoningTokens")).toBe(
+      reasoning !== undefined,
     );
   });
 });

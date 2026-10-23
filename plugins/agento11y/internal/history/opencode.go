@@ -2,6 +2,8 @@ package history
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"iter"
 	"os"
 	"path/filepath"
@@ -116,7 +118,7 @@ func openCodeConversationIDs(rows []sessiondb.Session) map[string]string {
 		seen := map[string]bool{current: true}
 		for {
 			currentRow, found := byID[current]
-			if !found || currentRow.ParentID == "" {
+			if !found || currentRow.ParentID == "" || currentRow.ForkSessionID != "" {
 				break
 			}
 			if seen[currentRow.ParentID] {
@@ -130,8 +132,16 @@ func openCodeConversationIDs(rows []sessiondb.Session) map[string]string {
 	return out
 }
 
+func openOpenCodeStore(ctx context.Context, path string) (*sessiondb.Store, error) {
+	store, err := sessiondb.Open(ctx, path)
+	if errors.Is(err, sessiondb.ErrUnsupportedSchema) {
+		return nil, fmt.Errorf("%w; no sessions were read from this database", err)
+	}
+	return store, err
+}
+
 func (o *opencodeImporter) Previews(ctx context.Context, path string) ([]SessionPreview, error) {
-	store, err := sessiondb.Open(path)
+	store, err := openOpenCodeStore(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +168,7 @@ func (o *opencodeImporter) Previews(ctx context.Context, path string) ([]Session
 			SizeBytes:      row.LogicalSizeBytes,
 			StartedAt:      row.CreatedAt,
 			LastActivityAt: row.UpdatedAt,
+			Active:         row.Active,
 		})
 	}
 	return previews, nil
@@ -165,12 +176,21 @@ func (o *opencodeImporter) Previews(ctx context.Context, path string) ([]Session
 
 func (o *opencodeImporter) Turns(ctx context.Context, sess SessionPreview) iter.Seq2[HistoricalGeneration, error] {
 	return func(yield func(HistoricalGeneration, error) bool) {
-		store, err := sessiondb.Open(sess.SourcePath)
+		store, err := openOpenCodeStore(ctx, sess.SourcePath)
 		if err != nil {
 			yield(HistoricalGeneration{}, err)
 			return
 		}
 		defer func() { _ = store.Close() }()
+
+		if store.Layout() == sessiondb.LayoutV2 {
+			for gen, err := range opencodeV2Turns(ctx, store, sess) {
+				if !yield(gen, err) {
+					return
+				}
+			}
+			return
+		}
 
 		lineage, err := resolveOpenCodeLineage(ctx, store, sess.SessionID, sess.SourcePath)
 		if err != nil {

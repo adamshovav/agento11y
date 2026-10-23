@@ -12,6 +12,8 @@
 //	agento11y vibe     [--local|--no-local] [--tag k=v] [-- args...]  — exec vibe after installing the sigil hook in vibe's hooks.toml
 //	agento11y cursor   install|uninstall                              — wire (or remove) the Cursor hook in ~/.cursor/hooks.json
 //	agento11y claude   install [--json]                               — register the Claude Code plugin without launching or prompting
+//	agento11y harbor   [run] -- <harbor run arguments>                — run Harbor with live experiment publishing
+//	agento11y harbor   export <job-directory> [flags]                 — publish a completed Harbor job
 //	agento11y agents   reconcile --agents all|name[,name...] --json   — reconcile registered noninteractive installers
 //	agento11y local start|open|status [--json]|stop|restart           — manage the local capture daemon
 //	agento11y history import <agent> [flags]                          — backfill an agent's existing local sessions
@@ -50,12 +52,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/grafana/agento11y/go/agento11y"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agentinstall"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/claudecode"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/codex"
+	codexconfig "github.com/grafana/agento11y/plugins/agento11y/internal/agents/codex/config"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/copilot"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/cursor"
 	cursorinstall "github.com/grafana/agento11y/plugins/agento11y/internal/agents/cursor/install"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/kiro"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/opencode"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/pi"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/vibe"
@@ -66,9 +71,13 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/doctor"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/dotenv"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
+	launcherpkg "github.com/grafana/agento11y/plugins/agento11y/internal/launcher"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/local"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/localhealth"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/login"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/skills"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/usagestats"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/usagestats/capture"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/useragent"
 )
 
@@ -86,6 +95,14 @@ func renderLocalBanner(w io.Writer, uiURL string, posture local.ForwardPosture, 
 	lines = append(lines, title)
 	for _, line := range privacy {
 		lines = append(lines, renderer.Detail(line))
+	}
+	switch usageStatsMode() {
+	case usagestats.ModeEnabled:
+		lines = append(lines, renderer.Detail("The CLI sends anonymous usage statistics to Grafana separately, even in local mode."))
+	case usagestats.ModeLog:
+		lines = append(lines, renderer.Detail("CLI usage statistics are logged locally and not sent."))
+	case usagestats.ModeDisabled:
+		lines = append(lines, renderer.Detail("CLI usage statistics are disabled."))
 	}
 	lines = append(lines, "", renderer.Detail("View ")+uiURL)
 	return strings.Join(lines, "\n") + "\n\n"
@@ -157,6 +174,7 @@ var agents = map[string]agentHook{
 	"copilot":     copilot.Hook,
 	"cursor":      cursor.Hook,
 	"vibe":        vibe.Hook,
+	"kiro":        kiro.Hook,
 }
 
 // launchers maps the argv name to its launcher adapter. Launchers are
@@ -170,10 +188,123 @@ var launchers = map[string]agentLauncher{
 	"opencode": opencode.Launch,
 	"pi":       pi.Launch,
 	"vibe":     vibe.Launch,
+	"kiro":     kiro.Launch,
+}
+
+// launcherPreflight validates one launcher invocation from its forwarded args
+// before entry runs any launcher-side setup: the login prompt, the local
+// receiver, and SIGIL_TAGS. It must not change any file or start anything the
+// user would have to undo; a returned error ends the invocation.
+type launcherPreflight func(ctx context.Context, forwarded []string) (preparedLaunch, error)
+
+// preparedLaunch is an invocation a preflight accepted.
+type preparedLaunch struct {
+	// launch replaces the registered launcher for this invocation. It is bound
+	// to what the preflight resolved, so nothing is probed twice.
+	launch agentLauncher
+	// direct marks a host command that is not an agent session (help,
+	// version, plugin maintenance). It runs without the login prompt, the
+	// local receiver, or session tags.
+	direct bool
+}
+
+// launcherPreflights maps a launcher name to its preflight. Launchers without
+// one keep their original order: setup first, then the launcher. A package var
+// so tests can substitute stubs.
+var launcherPreflights = map[string]launcherPreflight{
+	"opencode": prepareOpenCode,
+}
+
+// prepareOpenCode checks the OpenCode release and the forwarded args. It runs
+// `opencode --version` and nothing else.
+func prepareOpenCode(ctx context.Context, forwarded []string) (preparedLaunch, error) {
+	inv, err := opencode.Prepare(ctx, forwarded)
+	if err != nil {
+		return preparedLaunch{}, err
+	}
+	return preparedLaunch{
+		launch: func(ctx context.Context, _ []string, localEnv *local.LaunchEnv, _ io.Reader, _, stderr io.Writer, logger *log.Logger, binaryVersion string) error {
+			return inv.Launch(ctx, localEnv, stderr, logger, binaryVersion)
+		},
+		direct: inv.Direct(),
+	}, nil
+}
+
+// preflightLauncher runs name's preflight, when it has one, and returns the
+// launcher the session should use. It parses the launcher-side args without
+// side effects first. Misused launcher flags, and forwarded args the
+// preflight rejects as usage errors, exit 2; any other preflight error, such
+// as an unsupported host release, exits 1. A direct (non-session) host command
+// runs right here, without login, the local receiver, or tags. The returned
+// bool is false when the invocation is already over.
+func preflightLauncher(name string, rest []string, launcher agentLauncher, stdin io.Reader, stdout, stderr io.Writer) (agentLauncher, bool) {
+	preflight, has := launcherPreflights[name]
+	if !has {
+		return launcher, true
+	}
+	opts, err := parseLauncherOptions(name, rest)
+	if err != nil {
+		usageError(stderr, name, err.Error())
+		exit(2)
+		return nil, false
+	}
+	prepared, err := preflight(context.Background(), opts.forwarded)
+	if err != nil {
+		if _, usage := errors.AsType[*opencode.ArgumentError](err); usage {
+			usageError(stderr, name, err.Error())
+			exit(2)
+			return nil, false
+		}
+		_, _ = fmt.Fprintf(stderr, "agento11y: %v\n", err)
+		exit(1)
+		return nil, false
+	}
+	if !prepared.direct {
+		return prepared.launch, true
+	}
+	if opts.local || len(opts.tags) > 0 {
+		_, _ = fmt.Fprintf(stderr, "agento11y: --local and --tag only apply to %s sessions; running this %[1]s command without agento11y setup\n", name)
+	}
+	logger, closeLog := cli.InitLogger(name)
+	defer closeLog()
+	runLauncher(name, prepared.launch, opts.forwarded, nil, stdin, stdout, stderr, logger)
+	return nil, false
+}
+
+// runLauncher preserves the target agent's exit code when it ran as a child
+// process on Windows.
+func runLauncher(name string, launch agentLauncher, args []string, localEnv *local.LaunchEnv, stdin io.Reader, stdout, stderr io.Writer, logger *log.Logger) {
+	// Launcher panics must surface to the user (non-zero exit, message on
+	// stderr) — log to the debug file, then re-panic so the Go runtime
+	// reports it. cli.RecoverAndLog would silently swallow the panic and
+	// exit 0, which is the hook-agent contract, not the launcher one.
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("launch %s: panic: %v", name, r)
+			panic(r)
+		}
+	}()
+
+	if err := launch(context.Background(), args, localEnv, stdin, stdout, stderr, logger, version); err != nil {
+		logger.Printf("launch %s: %v", name, err)
+		exitAfterLaunchError(stderr, err)
+	}
 }
 
 // exit is a package var so tests can intercept termination.
-var exit = os.Exit
+var exit = usageExit
+
+// exitAfterLaunchError exits with the agent's own code when the agent ran and
+// failed. The agent has already reported that failure itself, so only an error
+// from starting it gets a message here.
+func exitAfterLaunchError(stderr io.Writer, err error) {
+	if exitErr, ok := errors.AsType[*launcherpkg.ExitError](err); ok {
+		exit(exitErr.ExitCode())
+		return
+	}
+	_, _ = fmt.Fprintf(stderr, "agento11y: %v\n", err)
+	exit(1)
+}
 
 // loginRun is a package var so tests can stub the interactive login flow
 // without driving the huh TTY. Production code points at login.Run.
@@ -193,6 +324,8 @@ var (
 	cursorUninstall = cursorinstall.Uninstall
 	claudeInstall   = claudecode.Install
 	copilotInstall  = copilot.Install
+	kiroInstall     = kiro.Install
+	kiroUninstall   = kiro.Uninstall
 	opencodeInstall = opencode.Install
 	piInstall       = pi.Install
 )
@@ -202,6 +335,21 @@ var (
 // ldflags; unstamped builds get their version from Go build metadata.
 func Main(buildVersion string) {
 	version = buildversion.Resolve(buildVersion)
+	// Usage reporting is resolved once per CLI process, including help and errors.
+	startUsage(os.Args[1:])
+	showUsageNotice(os.Stderr)
+	launcherpkg.BeforeExec = func() {
+		capture.SetLaunched()
+		emitUsageOnce()
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			emitUsageOnce()
+			panic(r)
+		}
+		capture.SetCompleted()
+		emitUsageOnce()
+	}()
 	run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 }
 
@@ -252,11 +400,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) {
 		return
 	}
 
+	if handleKiroUninstall(args, stderr) {
+		return
+	}
+
 	// These installers configure one host without launching it or prompting for
 	// Agent Observability credentials. They are safe to invoke from unattended
 	// setup after the current user's config.env is in place.
 	if len(args) >= 2 && args[1] == "install" &&
-		(args[0] == "claude" || args[0] == "copilot" || args[0] == "opencode" || args[0] == "pi") {
+		(args[0] == "kiro" || args[0] == "claude" || args[0] == "copilot" || args[0] == "opencode" || args[0] == "pi") {
 		runAgentInstall(args[0], args[2:], stdout, stderr)
 		return
 	}
@@ -265,6 +417,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) {
 	// dispatch, so an agent named `skills` cannot shadow it.
 	if args[0] == skills.Command {
 		runSkillsCommand(args[1:], stdout, stderr)
+		return
+	}
+
+	if args[0] == "harbor" {
+		runHarborCommand(args[1:], stderr)
 		return
 	}
 
@@ -303,14 +460,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) {
 		shellLocal, shellLocalValid := envconfig.ParseBoolValue(localValue)
 		shellCloudOverride := inShell && shellLocalValid && !shellLocal
 
-		launcherArgs, localEnv, noLocalOverride, ok := parseLauncherArgs(args[0], args[1:], stderr, envLocal)
+		// A launcher with a preflight validates its host and forwarded args
+		// before any setup below can prompt, start the local receiver, or export
+		// --tag values, so a refused launch leaves nothing behind.
+		var proceed bool
+		if launcher, proceed = preflightLauncher(args[0], args[1:], launcher, stdin, stdout, stderr); !proceed {
+			return
+		}
+
+		launcherArgs, localEnv, noLocalOverride, protocol, ok := parseLauncherArgs(args[0], args[1:], stderr, envLocal)
 		if !ok {
 			return
 		}
 		destinationSet := localDestinationSet()
 		keepLocalSetting := noLocalOverride || shellCloudOverride
 
-		logger := cli.InitLogger(args[0])
+		logger, closeLog := cli.InitLogger(args[0])
+		defer closeLog()
 
 		// Run first-time setup before launching. login.Run asks where sessions go
 		// before it asks for Cloud credentials. It returns ErrNotInteractive when
@@ -324,7 +490,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) {
 		// In --local mode we never prompt: the launcher will inject
 		// placeholder credentials so the SDK proceeds without contacting
 		// Grafana Cloud.
-		if localEnv == nil && !dotenv.HasCredentials() {
+		hasCredentials := dotenv.HasCredentials()
+		if args[0] == "codex" {
+			hasCredentials = codexconfig.HasCredentials()
+		}
+		if needsLauncherLogin(localEnv, protocol, hasCredentials) {
 			result, err := loginRun(context.Background(), login.RunOpts{
 				Stderr:           stderr,
 				Logger:           logger,
@@ -353,23 +523,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) {
 				}
 			}
 		}
-		// Launcher panics must surface to the user (non-zero exit, message on
-		// stderr) — log to the debug file, then re-panic so the Go runtime
-		// reports it. cli.RecoverAndLog would silently swallow the panic and
-		// exit 0, which is the hook-agent contract, not the launcher one.
-		defer func() {
-			if r := recover(); r != nil {
-				logger.Printf("launch %s: panic: %v", args[0], r)
-				panic(r)
-			}
-		}()
-
-		if err := launcher(context.Background(), launcherArgs, localEnv, stdin, stdout, stderr, logger, version); err != nil {
-			logger.Printf("launch %s: %v", args[0], err)
-			_, _ = fmt.Fprintf(stderr, "agento11y: %v\n", err)
-			exit(1)
-			return
-		}
+		runLauncher(args[0], launcher, launcherArgs, localEnv, stdin, stdout, stderr, logger)
 		return
 	}
 
@@ -416,7 +570,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) {
 	// Cursor (and Codex headless) launch hooks under a stripped environment
 	// where the dotenv is the only place SIGIL_DEBUG could come from.
 	dotenv.ApplyEnv(nil)
-	logger := cli.InitLogger(agent)
+	logger, closeLog := cli.InitLogger(agent)
+	defer closeLog()
 	defer cli.RecoverAndLog(logger)
 	applyLocalHookEnv(logger)
 
@@ -445,9 +600,8 @@ const (
 var (
 	localHookStartMu     sync.Mutex
 	localHookStartFailed bool
-	// hookLocalReceiverSupported is a test seam for the Windows path,
-	// where the local receiver cannot start and hooks must keep Cloud
-	// credentials instead of rewriting to loopback.
+	// hookLocalReceiverSupported is a test seam for the path taken when
+	// local.ReceiverSupported reports false. Every current build target reports true.
 	hookLocalReceiverSupported = local.ReceiverSupported
 )
 
@@ -463,8 +617,8 @@ var (
 // daemon is logged and the env still points at loopback so a down receiver
 // cannot leak the turn to Cloud. A later hook in this process, or a later
 // process within hookStartFailTTL, skips the start attempt unless a
-// receiver is already healthy. On platforms where the receiver cannot
-// run (Windows), the Cloud endpoint is left in place.
+// receiver is already healthy. When local.ReceiverSupported reports false,
+// the configured endpoint is left in place.
 func applyLocalHookEnv(logger *log.Logger) {
 	if !envconfig.ParseBool(envconfig.Getenv("LOCAL")) {
 		return
@@ -580,7 +734,8 @@ func runLoginCommand(args []string, stdin io.Reader, stderr io.Writer) {
 
 	dotenv.ApplyEnv(nil)
 	destinationSet := localDestinationSet()
-	logger := cli.InitLogger("login")
+	logger, closeLog := cli.InitLogger("login")
+	defer closeLog()
 
 	result, err := loginRun(context.Background(), login.RunOpts{
 		// Only the explicit `agento11y login` shows the “Try sigil claude/pi”
@@ -681,7 +836,8 @@ func runCursorInstall(verb string, stdout, stderr io.Writer) {
 	// $XDG_CONFIG_HOME/agento11y/config.env still enables file logging, and
 	// before HasCredentials so dotenv-supplied credentials are visible.
 	dotenv.ApplyEnv(nil)
-	logger := cli.InitLogger("cursor")
+	logger, closeLog := cli.InitLogger("cursor")
+	defer closeLog()
 
 	if verb == "uninstall" {
 		if err := cursorUninstall(stdout, stderr, logger); err != nil {
@@ -771,12 +927,18 @@ func runAgentInstall(agent string, args []string, stdout, stderr io.Writer) {
 	switch agent {
 	case "claude":
 		changed, err = claudeInstall(context.Background(), writer)
+	case "kiro":
+		changed, err = kiroInstall()
 	case "copilot":
 		changed, err = copilotInstall()
 	case "opencode":
-		changed, err = opencodeInstall(context.Background(), writer, cli.InitLogger("opencode"))
+		logger, closeLog := cli.InitLogger("opencode")
+		changed, err = opencodeInstall(context.Background(), writer, logger)
+		closeLog()
 	case "pi":
-		changed, err = piInstall(context.Background(), writer, cli.InitLogger("pi"))
+		logger, closeLog := cli.InitLogger("pi")
+		changed, err = piInstall(context.Background(), writer, logger)
+		closeLog()
 	}
 	switch {
 	case errors.Is(err, claudecode.ErrCLINotFound), errors.Is(err, opencode.ErrCLINotFound), errors.Is(err, pi.ErrCLINotFound):
@@ -889,7 +1051,9 @@ func runAgentsReconcile(args []string, stdout, stderr io.Writer) {
 	failed := false
 	missingHost := false
 	for _, spec := range selected {
-		changed, err := spec.Install(context.Background(), io.Discard, cli.InitLogger("reconcile-"+spec.Name))
+		logger, closeLog := cli.InitLogger("reconcile-" + spec.Name)
+		changed, err := spec.Install(context.Background(), io.Discard, logger)
+		closeLog()
 		result := agentInstallResult{Agent: spec.Name}
 		switch {
 		case err != nil && spec.IsMissingHost != nil && spec.IsMissingHost(err):
@@ -978,10 +1142,11 @@ func runDoctorCommand(args []string, stdout, stderr io.Writer) {
 	osEnv := doctor.SnapshotEnv()
 	dotenv.ApplyEnv(nil)
 	code := doctor.Run(context.Background(), args, doctor.Params{
-		Version: version,
-		OSEnv:   osEnv,
-		Stdout:  stdout,
-		Stderr:  stderr,
+		Version:        version,
+		OSEnv:          osEnv,
+		Stdout:         stdout,
+		Stderr:         stderr,
+		UsageStatsMode: string(usageStatsMode()),
 	})
 	if code != 0 {
 		exit(code)
@@ -1085,14 +1250,31 @@ func parseLauncherOptions(name string, rest []string) (*launcherOptions, error) 
 //     forgot the separator, so we point them at `agento11y <name> -- <args>`.
 //   - `--` is present but unrecognised tokens precede it: those are
 //     genuinely unknown sigil-side options, so we name them explicitly.
-func parseLauncherArgs(name string, rest []string, stderr io.Writer, envLocal localEnvRequest) ([]string, *local.LaunchEnv, bool, bool) {
+func parseLauncherArgs(name string, rest []string, stderr io.Writer, envLocal localEnvRequest) ([]string, *local.LaunchEnv, bool, agento11y.GenerationExportProtocol, bool) {
 	opts, err := parseLauncherOptions(name, rest)
 	if err != nil {
 		usageError(stderr, name, err.Error())
 		exit(2)
-		return nil, nil, false, false
+		return nil, nil, false, "", false
 	}
 	forwarded, localFlag, noLocalFlag, flagTags := opts.forwarded, opts.local, opts.noLocal, opts.tags
+	localMode := !noLocalFlag && (localFlag || envLocal.on)
+	if (name == "pi" || name == "opencode") && strings.EqualFold(envconfig.Getenv("PROTOCOL"), "otel") {
+		_, _ = fmt.Fprintf(stderr, "agento11y: %s live capture does not support OTel generation export. Set AGENTO11Y_PROTOCOL=http for this launch; Go history imports support OTel.\n", name)
+		exit(1)
+		return nil, nil, false, "", false
+	}
+	localOTLP := ""
+	if localMode {
+		// Managed local launches replace the collector before capture starts.
+		localOTLP = fmt.Sprintf("http://127.0.0.1:%d/otlp", local.DefaultPort)
+	}
+	protocol, err := resolveLaunchTransport(localOTLP)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "agento11y: %v\n", err)
+		exit(1)
+		return nil, nil, false, "", false
+	}
 
 	if len(flagTags) > 0 {
 		// Merge onto the effective selected tags and write the result under
@@ -1109,7 +1291,7 @@ func parseLauncherArgs(name string, rest []string, stderr io.Writer, envLocal lo
 	}
 
 	var localEnv *local.LaunchEnv
-	if !noLocalFlag && (localFlag || envLocal.on) {
+	if localMode {
 		// An explicit --local speaks for itself, so name the variable only when
 		// it is what turned local mode on.
 		sourceKey := envLocal.key
@@ -1119,11 +1301,25 @@ func parseLauncherArgs(name string, rest []string, stderr io.Writer, envLocal lo
 		endpoint, otlp, err := setupLocalLaunch(stderr, sourceKey)
 		if err != nil {
 			exit(1)
-			return nil, nil, false, false
+			return nil, nil, false, "", false
 		}
 		localEnv = &local.LaunchEnv{Endpoint: endpoint, OTLPEndpoint: otlp}
 	}
-	return forwarded, localEnv, noLocalFlag, true
+	return forwarded, localEnv, noLocalFlag, protocol, true
+}
+
+func needsLauncherLogin(localEnv *local.LaunchEnv, protocol agento11y.GenerationExportProtocol, hasCredentials bool) bool {
+	return localEnv == nil && protocol == agento11y.GenerationExportProtocolHTTP && !hasCredentials
+}
+
+func resolveLaunchTransport(localOTLP string) (agento11y.GenerationExportProtocol, error) {
+	look := func(suffix string) (string, string, bool) {
+		if suffix == "OTEL_EXPORTER_OTLP_ENDPOINT" && localOTLP != "" {
+			return localOTLP, "local receiver", true
+		}
+		return envconfig.LookupEnv(suffix)
+	}
+	return envconfig.ResolveGenerationTransportWith(look, os.Getenv)
 }
 
 // normalizeTag validates a `--tag` value and returns it as a trimmed
@@ -1205,6 +1401,14 @@ func setupLocalLaunch(stderr io.Writer, envKey string) (endpoint, otlp string, e
 
 	endpoint = status.Endpoint
 	otlp = status.Endpoint + "/otlp"
+	protocol, err := resolveLaunchTransport(otlp)
+	if err == nil && protocol == agento11y.GenerationExportProtocolOTel {
+		err = localhealth.RequireGenerationIngest(ctx, otlp)
+	}
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "agento11y: %v\n", err)
+		return "", "", err
+	}
 
 	posture, postureErr := local.FetchForwardPosture(ctx, status.Endpoint)
 	if postureErr != nil {
@@ -1342,7 +1546,8 @@ func runLocalCommand(args []string, stdout, stderr io.Writer) {
 		_, _ = fmt.Fprintln(stdout, clihelp.New(stdout).Success(fmt.Sprintf("agento11y local receiver running at %s (pid %d)", status.Endpoint, status.PID)))
 	case "serve":
 		// Internal: invoked by the daemon child. Blocks until SIGTERM.
-		logger := cli.InitLogger("local")
+		logger, closeLog := cli.InitLogger("local")
+		defer closeLog()
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 		defer cancel()
 		if err := local.Serve(ctx, dir, local.DefaultPort, logger); err != nil {
@@ -1354,4 +1559,21 @@ func runLocalCommand(args []string, stdout, stderr io.Writer) {
 		_, _ = fmt.Fprintf(stderr, "agento11y: unknown local verb %q\n", args[0])
 		exit(2)
 	}
+}
+
+// handleKiroUninstall routes removal before the launcher can forward the verb.
+func handleKiroUninstall(args []string, stderr io.Writer) bool {
+	if len(args) < 2 || args[0] != "kiro" || args[1] != "uninstall" {
+		return false
+	}
+	if len(args) != 2 {
+		usageError(stderr, "kiro uninstall", "unexpected arguments")
+		exit(2)
+		return true
+	}
+	if err := kiroUninstall(); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		exit(1)
+	}
+	return true
 }

@@ -516,12 +516,21 @@ export interface WorkflowStep {
   metadata?: Record<string, unknown>;
 }
 
+export type ToolExecutionKind = 'load_skill' | 'read_skill_resource' | 'command';
+
 /** Tool execution start seed fields. */
 export interface ToolExecutionStart {
   toolName: string;
   toolCallId?: string;
   toolType?: string;
   toolDescription?: string;
+  executionKind?: ToolExecutionKind;
+  skillName?: string;
+  skillDescription?: string;
+  skillSourceURI?: string;
+  skillResourceName?: string;
+  processExecutableName?: string;
+  processExecutablePath?: string;
   conversationId?: string;
   conversationTitle?: string;
   agentName?: string;
@@ -559,6 +568,7 @@ export interface ExecuteToolCallsOptions {
 export interface ToolExecutionResult {
   arguments?: unknown;
   result?: unknown;
+  processExitCode?: number;
   completedAt?: Date;
 }
 
@@ -568,6 +578,14 @@ export interface ToolExecution {
   toolCallId?: string;
   toolType?: string;
   toolDescription?: string;
+  executionKind?: ToolExecutionKind;
+  skillName?: string;
+  skillDescription?: string;
+  skillSourceURI?: string;
+  skillResourceName?: string;
+  processExecutableName?: string;
+  processExecutablePath?: string;
+  processExitCode?: number;
   conversationId?: string;
   conversationTitle?: string;
   agentName?: string;
@@ -646,6 +664,8 @@ export interface HooksConfig {
    * caller can proceed with the LLM call. Defaults to true.
    */
   failOpen: boolean;
+  /** Invalid transforms must throw even when evaluator failures are allowed. Defaults to false. */
+  strictTransforms?: boolean;
 }
 
 /** Identifies the upstream LLM call for hook rule matching. */

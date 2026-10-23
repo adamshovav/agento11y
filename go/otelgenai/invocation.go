@@ -8,9 +8,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Operation is the value of gen_ai.operation.name. A span is named
-// "<operation> <subject>", and the operation decides which field is the
-// subject:
+// Operation is the value of gen_ai.operation.name. A span is named with the
+// operation followed by a space and its subject when that subject is non-empty;
+// otherwise, it is named with the operation alone. The operation decides which
+// field supplies the subject:
 //
 //	execute_tool                      ToolName
 //	invoke_agent, create_agent, plan  AgentName
@@ -19,9 +20,12 @@ import (
 //	fetch_response                    no subject
 //	every other operation             RequestModel
 //
-// Except for fetch_response, an empty operation-specific subject falls back
-// to RequestModel. If the subject field and RequestModel are both empty, the
-// span name is the operation alone.
+// An empty subject falls back to RequestModel except for fetch_response,
+// invoke_agent, create_agent, plan, and execute_tool with a recognized ExecutionKind.
+// Tool execution kinds add the skill for load_skill, resource with optional skill
+// for read_skill_resource, and resource with optional skill or an executable
+// fallback for command.
+// For invoke_agent, create_agent, and plan, an empty AgentName leaves no subject.
 type Operation string
 
 const (
@@ -38,11 +42,22 @@ const (
 	OperationPlan            Operation = "plan"
 )
 
+// ToolExecutionKind selects development GenAI tool conventions explicitly;
+// unset or unknown values retain generic execute_tool behavior.
+type ToolExecutionKind string
+
+const (
+	ToolExecutionKindLoadSkill         ToolExecutionKind = "load_skill"
+	ToolExecutionKindReadSkillResource ToolExecutionKind = "read_skill_resource"
+	ToolExecutionKindCommand           ToolExecutionKind = "command"
+)
+
 // Role is the author of a message in the conventions' message schema.
 type Role string
 
 const (
 	RoleSystem    Role = "system"
+	RoleDeveloper Role = "developer"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
 	RoleTool      Role = "tool"
@@ -136,17 +151,16 @@ type ToolDefinition struct {
 	Extensions map[string]any
 }
 
-// Usage holds the token counts of one invocation. Every field maps to a
-// gen_ai.usage.* attribute; zero values are omitted except for input and
-// output tokens, which are always emitted when the usage counts as reported.
-// The handler leaves unreported usage off the span and out of
-// gen_ai.client.token.usage, so counts a provider did not return are never
-// summed as zeros.
+// Usage holds the token counts of one invocation. Every count maps to a
+// gen_ai.usage.* attribute. Input and output counts can be marked as known
+// independently, so a known zero is emitted while an unknown count is omitted.
+// The handler leaves unknown usage off the span and token metric.
 type Usage struct {
-	// Reported marks that the provider returned usage. Set it for an
-	// all-zero usage the provider really did return; any non-zero count
-	// already counts as reported without it.
+	// Reported marks both input and output counts as returned. Use the
+	// per-counter flags when only one count is known.
 	Reported             bool
+	InputTokensReported  bool
+	OutputTokensReported bool
 	InputTokens          int64
 	OutputTokens         int64
 	CacheReadInputTokens int64
@@ -155,13 +169,17 @@ type Usage struct {
 	ReasoningTokens       int64
 }
 
-// reported reports whether the invocation carries usage data. A non-zero
-// count counts on its own; Reported is needed only for the all-zero usage a
-// provider did return.
+func (u Usage) inputTokensReported() bool {
+	return u.Reported || u.InputTokensReported || u.InputTokens != 0
+}
+
+func (u Usage) outputTokensReported() bool {
+	return u.Reported || u.OutputTokensReported || u.OutputTokens != 0
+}
+
 func (u Usage) reported() bool {
-	return u.Reported ||
-		u.InputTokens != 0 ||
-		u.OutputTokens != 0 ||
+	return u.inputTokensReported() ||
+		u.outputTokensReported() ||
 		u.CacheReadInputTokens != 0 ||
 		u.CacheWriteInputTokens != 0 ||
 		u.ReasoningTokens != 0
@@ -206,6 +224,17 @@ type Invocation struct {
 	ToolCallID      string
 	ToolType        string
 	ToolDescription string
+	// ExecutionKind applies only to execute_tool. Nonblank applicable identity at
+	// Start is preserved through end hooks; unknown fields can be completed later.
+	// Description, source URI, and executable path require span content capture.
+	ExecutionKind         ToolExecutionKind
+	SkillName             string
+	SkillDescription      string
+	SkillSourceURI        string
+	SkillResourceName     string
+	ProcessExecutableName string
+	ProcessExecutablePath string
+	ProcessExitCode       *int64
 
 	// ServerAddress and ServerPort locate the provider endpoint. The
 	// conventions treat them as sampling-relevant, so set them before Start.
@@ -261,7 +290,8 @@ type Invocation struct {
 
 	// Attributes are extra span attributes the caller attaches to this
 	// invocation. They are emitted after the semantic-convention attributes,
-	// so a caller can override one it disagrees with.
+	// so a caller can override one it disagrees with. These and hook-returned
+	// attributes can disagree with the typed identity supplied to the sampler.
 	Attributes []attribute.KeyValue
 
 	// MetricAttributes are extra dimensions for this invocation's metrics.
@@ -273,7 +303,8 @@ type Invocation struct {
 	// package never reads it.
 	Vendor any
 
-	span trace.Span
+	span         trace.Span
+	toolIdentity *toolIdentity
 	// spanStartedAt is the timestamp the span opened with. Metrics
 	// derive from it rather than from StartedAt, which a caller may rewrite
 	// between Start and End.
@@ -292,16 +323,22 @@ func (inv *Invocation) operation() Operation {
 	return inv.Operation
 }
 
-// spanName is the conventions' span name, "<operation> <subject>". The
-// Operation doc lists the subject field of each operation, including the
-// fallbacks and the fetch_response exception.
+// spanName returns the operation followed by its non-empty subject, separated
+// by one space, or the operation alone when there is no subject. The Operation
+// doc lists each subject field and its fallback rules.
 func (inv *Invocation) spanName() string {
 	op := inv.operation()
 	var subject string
 	switch op {
 	case OperationExecuteTool:
+		if inv.toolExecutionKind() != "" {
+			return inv.toolExecutionKindSpanName()
+		}
 		subject = inv.ToolName
 	case OperationInvokeAgent, OperationCreateAgent, OperationPlan:
+		if inv.AgentName == "" {
+			return string(op)
+		}
 		subject = inv.AgentName
 	case OperationRetrieval:
 		subject = inv.DataSourceID

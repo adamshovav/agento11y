@@ -754,6 +754,22 @@ export class Agento11yClient {
     return resolveContentCaptureMode(seed.contentCapture ?? 'default', clientMode);
   }
 
+  /**
+   * Reports whether a framework chain or retriever span must leave the error
+   * text off. Its mode resolves the way the framework's generations resolve
+   * theirs: the resolver sees this run's metadata, then the client default
+   * applies. A
+   * generation sanitizer cannot redact a chain error, so with one configured
+   * the text stays off too.
+   */
+  internalShouldRedactFrameworkSpanErrors(metadata: Record<string, unknown>): boolean {
+    const resolverMode = callContentCaptureResolver(this.config.contentCaptureResolver, metadata);
+    const mode = resolveClientContentCaptureMode(resolveContentCaptureMode(resolverMode, this.config.contentCapture));
+    return (
+      mode === 'metadata_only' || mode === 'full_with_metadata_spans' || this.config.generationSanitizer !== undefined
+    );
+  }
+
   internalHasGenerationSanitizer(): boolean {
     return this.config.generationSanitizer !== undefined;
   }
@@ -823,12 +839,11 @@ export class Agento11yClient {
   }
 
   internalStartToolExecutionSpan(seed: ToolExecutionStart, startedAt: Date): Span {
-    const span = this.tracer.startSpan(toolSpanName(seed.toolName), {
+    const span = this.tracer.startSpan(toolSpanName(seed), {
       kind: SpanKind.INTERNAL,
       startTime: startedAt,
+      attributes: { ...toolSpanAttributes(seed), ...skillProcessAttributes(seed) },
     });
-
-    setToolSpanAttributes(span, seed);
     setTagSpanAttributes(span, this.config.tags);
     return span;
   }
@@ -970,7 +985,18 @@ export class Agento11yClient {
     localError: Error | undefined,
     contentCaptureMode: ContentCaptureMode = 'default',
   ): Error | undefined {
-    setToolSpanAttributes(span, toolExecution);
+    const includePrivate = contentCaptureMode !== 'metadata_only' && contentCaptureMode !== 'full_with_metadata_spans';
+    span.setAttributes({
+      ...toolSpanAttributes(toolExecution),
+      ...skillProcessAttributes(toolExecution, includePrivate),
+    });
+    if (
+      toolExecution.executionKind === 'command' &&
+      typeof toolExecution.processExitCode === 'number' &&
+      Number.isSafeInteger(toolExecution.processExitCode)
+    ) {
+      span.setAttribute('process.exit.code', toolExecution.processExitCode);
+    }
 
     if (toolExecution.includeContent) {
       const argumentsResult = serializeToolContent(toolExecution.arguments);
@@ -1591,6 +1617,7 @@ class GenerationRecorderImpl implements GenerationRecorder {
     const callErrorCategory = errorCategoryFromError(this.callError, false);
 
     let effectiveContentCaptureMode = this.contentCaptureMode;
+    let sanitized = false;
     let validationTarget = cloneGeneration(generation);
     stampContentCaptureMetadata(generation, this.contentCaptureMode);
     if (this.contentCaptureMode === 'metadata_only') {
@@ -1598,7 +1625,11 @@ class GenerationRecorderImpl implements GenerationRecorder {
     } else if (this.client.internalHasGenerationSanitizer()) {
       try {
         generation = this.client.internalSanitizeGeneration(generation);
+        // The mirrors were written from the values before the sanitizer ran,
+        // so a secret it redacted would still go out in them.
+        syncCanonicalMetadataMirrors(generation);
         validationTarget = cloneGeneration(generation);
+        sanitized = true;
       } catch (error) {
         effectiveContentCaptureMode = 'metadata_only';
         stripContent(generation, callErrorCategory);
@@ -1628,6 +1659,16 @@ class GenerationRecorderImpl implements GenerationRecorder {
       // start-span omission isn't re-emitted here as an empty value.
       this.client.internalClearSpanConversationTitle(this.span);
     }
+    if (
+      sanitized &&
+      this.contentCaptureMode !== 'full_with_metadata_spans' &&
+      notEmpty(this.seed.conversationTitle) &&
+      !notEmpty(generation.conversationTitle)
+    ) {
+      // The start span published the seed title. A sanitizer that cleared
+      // the title must not leave that value on the span.
+      this.client.internalClearSpanConversationTitle(this.span);
+    }
     this.client.internalApplyTraceContextFromSpan(this.span, generation);
     this.client.internalRecordGeneration(generation);
 
@@ -1649,14 +1690,19 @@ class GenerationRecorderImpl implements GenerationRecorder {
     // with the category, so the span path can read it back from the
     // generation. Under full_with_metadata_spans generation.callError stays
     // raw for the gRPC export, so we substitute the precomputed category for
-    // the span path here.
+    // the span path here. After a sanitizer the span takes its text, so it
+    // cannot show what the sanitizer redacted; a sanitizer that cleared the
+    // error leaves the category, so the span still reads as an error.
+    const callErrorFallback = callErrorCategory.length > 0 ? callErrorCategory : 'sdk_error';
     let finalCallError: string | undefined;
     if (this.callError === undefined) {
       finalCallError = undefined;
     } else if (effectiveContentCaptureMode === 'metadata_only') {
       finalCallError = generation.callError;
     } else if (effectiveContentCaptureMode === 'full_with_metadata_spans') {
-      finalCallError = callErrorCategory.length > 0 ? callErrorCategory : 'sdk_error';
+      finalCallError = callErrorFallback;
+    } else if (sanitized) {
+      finalCallError = notEmpty(generation.callError) ? generation.callError : callErrorFallback;
     } else {
       finalCallError = this.callError;
     }
@@ -1825,6 +1871,14 @@ class ToolExecutionRecorderImpl implements ToolExecutionRecorder {
       toolCallId: this.seed.toolCallId,
       toolType: this.seed.toolType,
       toolDescription: this.seed.toolDescription,
+      executionKind: this.seed.executionKind,
+      skillName: this.seed.skillName,
+      skillDescription: this.seed.skillDescription,
+      skillSourceURI: this.seed.skillSourceURI,
+      skillResourceName: this.seed.skillResourceName,
+      processExecutableName: this.seed.processExecutableName,
+      processExecutablePath: this.seed.processExecutablePath,
+      processExitCode: this.result?.processExitCode,
       conversationId: this.seed.conversationId,
       conversationTitle: this.seed.conversationTitle,
       agentName: this.seed.agentName,
@@ -1909,12 +1963,94 @@ function embeddingSpanName(modelName: string): string {
   return `${defaultEmbeddingOperationName} ${model}`;
 }
 
-function toolSpanName(toolName: string): string {
-  const normalized = toolName.trim();
-  if (normalized.length === 0) {
-    return 'execute_tool unknown';
+function toolSpanName(tool: ToolExecutionStart): string {
+  const base = `execute_tool ${tool.toolName.trim() || 'unknown'}`;
+  let suffix: string | undefined;
+  switch (tool.executionKind) {
+    case 'load_skill':
+      suffix = tool.skillName?.trim();
+      break;
+    case 'read_skill_resource':
+    case 'command': {
+      const skill = tool.skillName?.trim();
+      const resource = tool.skillResourceName?.trim();
+      suffix = resource ? (skill ? `${skill} ${resource}` : resource) : undefined;
+      if (!suffix && tool.executionKind === 'command') {
+        suffix = tool.processExecutableName?.trim();
+      }
+      break;
+    }
   }
-  return `execute_tool ${normalized}`;
+  return suffix ? `${base} ${suffix}` : base;
+}
+
+// Private fields are added at completion, never to sampler inputs.
+function skillProcessAttributes(tool: ToolExecutionStart, includePrivate = false): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  if (
+    tool.executionKind !== 'load_skill' &&
+    tool.executionKind !== 'read_skill_resource' &&
+    tool.executionKind !== 'command'
+  ) {
+    return attrs;
+  }
+  const add = (key: string, value: string | undefined): void => {
+    const normalized = value?.trim();
+    if (normalized) {
+      attrs[key] = normalized;
+    }
+  };
+  add('gen_ai.skill.name', tool.skillName);
+  if (tool.executionKind !== 'load_skill') {
+    add('gen_ai.skill.resource.name', tool.skillResourceName);
+  }
+  if (tool.executionKind === 'command') {
+    add('process.executable.name', tool.processExecutableName);
+    if (includePrivate) {
+      add('process.executable.path', tool.processExecutablePath);
+    }
+  }
+  if (includePrivate) {
+    add('gen_ai.skill.description', tool.skillDescription);
+    const uri = projectSkillSourceURI(tool.skillSourceURI);
+    if (uri) {
+      attrs['gen_ai.skill.source.uri'] = uri;
+    }
+  }
+  return attrs;
+}
+
+function projectSkillSourceURI(uri: string | undefined): string | undefined {
+  uri = uri?.replace(/^[\s\u0085]+|[\s\u0085]+$/gu, '');
+  if (!uri || /[\s\\]|\p{Cc}|%(?![\da-f]{2})/iu.test(uri)) {
+    return undefined;
+  }
+  // Validate the original location before URL can repair a missing host or absolute path.
+  const location = /^([a-z][a-z\d+.-]*):(?:\/\/([^/?#]*))?([^?#]*)/i.exec(uri);
+  if (!location) {
+    return undefined;
+  }
+  const [, scheme = '', authority, path = ''] = location;
+  if (scheme.toLowerCase() === 'file' ? !path.startsWith('/') : !authority) {
+    return undefined;
+  }
+  try {
+    if (authority) {
+      if (authority.split('@').length > 2 || authority.endsWith(':')) {
+        return undefined;
+      }
+      // Validate host and port even for schemes with opaque WHATWG hosts (e.g. s3).
+      new URL(`https://${authority}/`);
+    }
+    const url = new URL(uri);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 function tagMetricAttributes(tags: Record<string, string> | undefined): Record<string, string> {
@@ -2161,52 +2297,29 @@ function setEmbeddingEndSpanAttributes(
   }
 }
 
-function setToolSpanAttributes(
-  span: Span,
-  tool: {
-    toolName: string;
-    toolCallId?: string;
-    toolType?: string;
-    toolDescription?: string;
-    conversationId?: string;
-    conversationTitle?: string;
-    agentName?: string;
-    agentVersion?: string;
-    requestProvider?: string;
-    requestModel?: string;
-  },
-): void {
-  span.setAttribute(spanAttrOperationName, 'execute_tool');
-  span.setAttribute(spanAttrToolName, tool.toolName);
-  span.setAttribute(spanAttrSDKName, sdkName);
-
-  if (notEmpty(tool.toolCallId)) {
-    span.setAttribute(spanAttrToolCallID, tool.toolCallId);
+function toolSpanAttributes(tool: ToolExecutionStart): Record<string, string> {
+  const attrs: Record<string, string> = {
+    [spanAttrOperationName]: 'execute_tool',
+    [spanAttrToolName]: tool.toolName.trim(),
+    [spanAttrSDKName]: sdkName,
+  };
+  const optional = {
+    [spanAttrToolCallID]: tool.toolCallId,
+    [spanAttrToolType]: tool.toolType,
+    [spanAttrToolDescription]: tool.toolDescription,
+    [spanAttrConversationID]: tool.conversationId,
+    [spanAttrConversationTitle]: tool.conversationTitle,
+    [spanAttrAgentName]: tool.agentName,
+    [spanAttrAgentVersion]: tool.agentVersion,
+    [spanAttrProviderName]: tool.requestProvider,
+    [spanAttrRequestModel]: tool.requestModel,
+  };
+  for (const [key, value] of Object.entries(optional)) {
+    if (notEmpty(value)) {
+      attrs[key] = value;
+    }
   }
-  if (notEmpty(tool.toolType)) {
-    span.setAttribute(spanAttrToolType, tool.toolType);
-  }
-  if (notEmpty(tool.toolDescription)) {
-    span.setAttribute(spanAttrToolDescription, tool.toolDescription);
-  }
-  if (notEmpty(tool.conversationId)) {
-    span.setAttribute(spanAttrConversationID, tool.conversationId);
-  }
-  if (notEmpty(tool.conversationTitle)) {
-    span.setAttribute(spanAttrConversationTitle, tool.conversationTitle);
-  }
-  if (notEmpty(tool.agentName)) {
-    span.setAttribute(spanAttrAgentName, tool.agentName);
-  }
-  if (notEmpty(tool.agentVersion)) {
-    span.setAttribute(spanAttrAgentVersion, tool.agentVersion);
-  }
-  if (notEmpty(tool.requestProvider)) {
-    span.setAttribute(spanAttrProviderName, tool.requestProvider);
-  }
-  if (notEmpty(tool.requestModel)) {
-    span.setAttribute(spanAttrRequestModel, tool.requestModel);
-  }
+  return attrs;
 }
 
 function serializeToolContent(value: unknown): { value?: string; error?: Error } {
@@ -2607,4 +2720,25 @@ function isJSON(value: string): boolean {
 
 function notEmpty(value: string | undefined): value is string {
   return value !== undefined && value.trim().length > 0;
+}
+
+/**
+ * Write the metadata mirrors of conversationTitle and callError from the
+ * fields as they are now, and drop a mirror whose field is empty. The Go and
+ * .NET SDKs do the same after their sanitizer runs.
+ */
+function syncCanonicalMetadataMirrors(generation: Generation): void {
+  if (generation.metadata === undefined) {
+    return;
+  }
+  if (notEmpty(generation.conversationTitle)) {
+    generation.metadata[spanAttrConversationTitle] = generation.conversationTitle;
+  } else {
+    delete generation.metadata[spanAttrConversationTitle];
+  }
+  if (notEmpty(generation.callError)) {
+    generation.metadata.call_error = generation.callError;
+  } else {
+    delete generation.metadata.call_error;
+  }
 }

@@ -122,7 +122,7 @@ const client = new Agento11yClient({
 });
 ```
 
-The resolver receives the recording's metadata (or `undefined` for recording types that have no metadata, like tool executions). Thrown errors are caught and treated as `"metadata_only"` (fail-closed).
+The resolver receives the recording's metadata (or `undefined` for recording types that have no metadata, like tool executions). When a framework chain or retriever span ends with an error, it also calls the resolver with that run's metadata, to decide whether the error text is shown. Thrown errors are caught and treated as `"metadata_only"` (fail-closed).
 
 Resolution precedence (highest to lowest):
 
@@ -230,6 +230,12 @@ messages = response.transformedInput?.messages ?? messages;
 
 With `failOpen: true`, hook transport errors resolve to allow so an unavailable evaluator does not block production traffic. Set `failOpen: false` for strict paths that should fail closed.
 
+Set `hooks.strictTransforms: true` to reject malformed or empty `transformed_input` before the decoder discards data. The default is `false`, which preserves permissive decoding. Strict mode accepts the same valid SDK, snake_case, and Go/protobuf encodings. A supplied null or empty transform, empty collections, and unsupported transform fields throw `HookTransformError`. Omitting `transformed_input` remains valid.
+
+Import `HookTransformError` from `@grafana/agento11y` or `@grafana/agento11y-core`. The error contains no response payload, source input, or authentication headers. The SDK throws the error even with `failOpen: true`; callers must not treat it as an evaluator outage or forward the original input. Strict decoding validates shape, not whether your integration can safely apply a rewrite. Refuse transforms your integration cannot apply.
+
+Override strict mode for one evaluation with `client.evaluateHook(request, { strictTransforms: true })`. The override does not change the client configuration.
+
 Set `context.conversationId` to the same ID used by `startGeneration(...)`. The SDK also reads `withConversationId(...)` and the active OpenTelemetry span when explicit correlation fields are omitted. This lets Agent Observability retain denied preflight attempts even though no LLM generation is created.
 
 If you use transformed input, pass the transformed messages/system prompt to the provider and record those same values in `startGeneration(...)`. If you use the Vercel AI SDK adapter, see `docs/frameworks/vercel-ai-sdk.md` for automatic preflight hook wiring.
@@ -333,6 +339,63 @@ await client.startToolExecution(
   }
 );
 ```
+
+### Tracing skill loads, resource reads, and commands
+
+Set `ToolExecutionStart.executionKind` explicitly to `"load_skill"`, `"read_skill_resource"`, or `"command"`.
+The `ToolExecutionKind` type defines these values. The SDK does not infer execution kinds from tool names, paths, or arguments.
+Skill and process attributes follow [merged GenAI #498](https://github.com/open-telemetry/semantic-conventions-genai/pull/498), which remains in development.
+
+| Execution kind | Meaning | Applicable fields |
+| --- | --- | --- |
+| `"load_skill"` | Load skill instructions | `skillName`, `skillDescription`, `skillSourceURI` |
+| `"read_skill_resource"` | Read a skill resource | Skill fields above, `skillResourceName` |
+| `"command"` | Execute a command, optionally for a skill | Skill/resource fields above, `processExecutableName`, `processExecutablePath`; completion `processExitCode` |
+
+Unset or unrecognized execution kinds keep generic tool behavior and emit no skill or process attributes. The SDK ignores inapplicable fields.
+Skill fields emit `gen_ai.skill.name`, `gen_ai.skill.description`, `gen_ai.skill.source.uri`, and `gen_ai.skill.resource.name`.
+Process fields emit `process.executable.name`, `process.executable.path`, and `process.exit.code`.
+The SDK does not dual-write `agento11y.skill.name`.
+
+Span names start with `execute_tool <tool>` and use trimmed, nonblank identity:
+
+- `load_skill` appends the skill name, when present.
+- `read_skill_resource` appends `<skill> <resource>`, or just `<resource>` without a skill. Without a resource, it appends nothing.
+- `command` uses the same resource suffix, then falls back to the executable name, then no suffix.
+
+Skill resource reads and commands never use a skill-only suffix.
+The span name and applicable structural names are available to samplers at creation.
+Private fields and the completion exit code are excluded from sampler attributes.
+
+Process fields describe one directly executed process. Do not infer them from shell text, pipelines, or command batches.
+`ToolExecutionResult.processExitCode` is an optional integer-valued `number`: omission means unknown; zero records successful completion.
+Only safe integers are emitted. Booleans, strings, and fractional values are not coerced into exit codes.
+Exit codes are independent of recorded execution errors.
+For example, record a known completion code as follows:
+
+```ts
+await client.startToolExecution(
+  {
+    toolName: "exec",
+    executionKind: "command",
+    skillName: "review",
+    skillResourceName: "scripts/check.py",
+    processExecutableName: "python3",
+  },
+  async (recorder) => {
+    recorder.setResult({ processExitCode: 0 });
+  }
+);
+```
+
+`skillDescription`, `skillSourceURI`, and `processExecutablePath` are private content.
+The SDK omits them from spans under effective `"metadata_only"` or `"full_with_metadata_spans"`, after resolving overrides and the resolver.
+Core `"no_tool_content"` retains these private fields; arguments/results still require the existing content opt-in.
+Every exported skill source URI has userinfo, query, and fragment removed, even under `"full"`.
+Invalid or relative URIs are omitted without network or filesystem lookup.
+Capture modes do not sanitize debug snapshots: raw tool arguments, results, and error text remain there.
+
+Generic tool recording, `executeToolCalls`, and existing metrics are unchanged. No skill/process metric dimensions are added.
 
 ## Provider Helpers
 
@@ -634,3 +697,8 @@ await experiment.withTrial(testCase, async (trial) => {
 See [`docs/experiments.md`](docs/experiments.md) for the full surface: score
 kinds, local judges, artifacts, reports, portable and stored suites, cross-process
 trials, and experimental OpenTelemetry trial telemetry.
+
+Promptfoo users can publish a completed eval through its `afterAll` hook with
+`createPromptfooExtension` from `@grafana/agento11y/promptfoo`. See the
+[`Promptfoo integration guide`](docs/integrations/promptfoo.md) and the
+[`runnable example`](../examples/experiments/promptfoo/README.md).

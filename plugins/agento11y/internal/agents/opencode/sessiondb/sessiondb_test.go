@@ -2,8 +2,10 @@ package sessiondb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,12 +14,168 @@ import (
 
 func openTestStore(t *testing.T, path string) *Store {
 	t.Helper()
-	store, err := Open(path)
+	store, err := Open(context.Background(), path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+func TestOpenValidatesSchema(t *testing.T) {
+	tests := []struct {
+		name   string
+		opts   []sessiondbtest.Option
+		v1Rows bool
+		v2Rows bool
+		layout Layout
+		marker string
+		// reason is empty when Open accepts the database.
+		reason string
+	}{
+		{name: "v1", v1Rows: true, layout: LayoutV1},
+		{
+			name:   "v1 with v1.18.29 session_message",
+			opts:   []sessiondbtest.Option{sessiondbtest.WithSessionMessage()},
+			v1Rows: true,
+			layout: LayoutV1,
+		},
+		{
+			name:   "v2",
+			opts:   []sessiondbtest.Option{sessiondbtest.WithoutV1(), sessiondbtest.WithSessionV2()},
+			v2Rows: true,
+			layout: LayoutV2,
+		},
+		{
+			name:   "completed mixed v1 and v2",
+			opts:   []sessiondbtest.Option{sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState()},
+			v1Rows: true,
+			v2Rows: true,
+			layout: LayoutV2,
+			marker: `{"phase":"completed"}`,
+		},
+		{
+			name:   "v1 table missing a column",
+			opts:   []sessiondbtest.Option{sessiondbtest.WithoutColumn("part", "data")},
+			v1Rows: true,
+			layout: LayoutUnknown,
+			reason: "table part is missing column data",
+		},
+		{
+			name: "v1 table missing columns",
+			opts: []sessiondbtest.Option{
+				sessiondbtest.WithoutColumn("session", "title"),
+				sessiondbtest.WithoutColumn("session", "parent_id"),
+			},
+			layout: LayoutUnknown,
+			reason: "table session is missing columns parent_id, title",
+		},
+		{
+			name:   "empty database",
+			opts:   []sessiondbtest.Option{sessiondbtest.WithoutV1()},
+			layout: LayoutUnknown,
+			reason: "missing OpenCode v1 tables session, message, part",
+		},
+		{
+			name:   "no session tables",
+			opts:   []sessiondbtest.Option{sessiondbtest.WithoutV1(), sessiondbtest.WithSessionMessage()},
+			layout: LayoutUnknown,
+			reason: "missing OpenCode v1 tables session, message, part",
+		},
+		{
+			name: "unrecognized session_v2",
+			opts: []sessiondbtest.Option{
+				sessiondbtest.WithoutColumn("session_v2", "slug"),
+				sessiondbtest.WithSessionV2(),
+			},
+			v1Rows: true,
+			layout: LayoutV2,
+			reason: "table session_v2 is missing column slug",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := sessiondbtest.New(t, tt.opts...)
+			if tt.v1Rows {
+				db.AddSession("legacy", "", "secret v1 title", "/work/secret-v1", 1, 2)
+				db.AddMessage("legacy-assistant", "legacy", 1, 2, `{"role":"assistant","time":{"created":1,"completed":2},"secret":"v1 payload"}`)
+			}
+			if tt.v2Rows {
+				db.AddSessionV2("current", "secret v2 title", "/work/secret-v2", 3, 4)
+				db.AddV2Message("current-assistant", "current", "assistant", 0, 3, 4, `{"time":{"created":3,"completed":4}}`)
+			}
+			if tt.marker != "" {
+				db.SetMigrationState(tt.marker)
+			}
+
+			store, err := Open(context.Background(), db.Path)
+			if tt.reason == "" {
+				if err != nil {
+					t.Fatalf("Open: %v", err)
+				}
+				defer func() { _ = store.Close() }()
+				if store.Layout() != tt.layout {
+					t.Fatalf("Layout = %v, want %v", store.Layout(), tt.layout)
+				}
+				sessions, err := store.Sessions(context.Background())
+				if err != nil || len(sessions) != 1 || sessions[0].TerminalMessageCount != 1 {
+					t.Fatalf("Sessions = (%+v, %v), want one terminal assistant", sessions, err)
+				}
+				if tt.layout == LayoutV2 && sessions[0].ID != "current" {
+					t.Fatalf("v2 selection resurrected legacy session: %+v", sessions)
+				}
+				return
+			}
+
+			if store != nil {
+				t.Fatal("Open returned a store with its error")
+			}
+			if !errors.Is(err, ErrUnsupportedSchema) {
+				t.Fatalf("Open error = %v, want ErrUnsupportedSchema", err)
+			}
+			var schemaErr *SchemaError
+			if !errors.As(err, &schemaErr) {
+				t.Fatalf("Open error %T is not a *SchemaError", err)
+			}
+			want := SchemaError{Path: db.Path, Layout: tt.layout, Reason: tt.reason}
+			if *schemaErr != want {
+				t.Fatalf("SchemaError = %+v, want %+v", *schemaErr, want)
+			}
+			if got, want := err.Error(), "sessiondb: unsupported OpenCode database schema in "+db.Path+": "+tt.reason; got != want {
+				t.Fatalf("Open error = %q, want %q", got, want)
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Fatalf("Open error contains session content: %q", err)
+			}
+		})
+	}
+}
+
+func TestOpenReportsUnreadableFilesAsReadErrors(t *testing.T) {
+	dir := t.TempDir()
+	garbage := filepath.Join(dir, "garbage.db")
+	if err := os.WriteFile(garbage, []byte(strings.Repeat("not a database ", 128)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "missing file", path: filepath.Join(dir, "missing.db")},
+		{name: "not a database", path: garbage},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := Open(context.Background(), tt.path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatal("Open accepted an unreadable file")
+			}
+			if errors.Is(err, ErrUnsupportedSchema) || !strings.Contains(err.Error(), "read schema of "+tt.path) {
+				t.Fatalf("Open error = %v, want a schema read error", err)
+			}
+		})
+	}
 }
 
 func TestSessionsReturnsContentFreeAggregates(t *testing.T) {

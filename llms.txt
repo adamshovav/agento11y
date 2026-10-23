@@ -4,7 +4,7 @@ You are a coding agent. The user wants help with [Grafana Agent observability](h
 
 There are two distinct things this file covers. Pick the path that matches the request before doing anything else.
 
-- Path A, [Monitor a coding agent](#path-a-monitor-a-coding-agent): the user wants telemetry from Claude Code, Codex, Copilot CLI, Cursor, OpenCode, Pi, or Vibe sent to Grafana Agent observability. They are not changing application code.
+- Path A, [Monitor a coding agent](#path-a-monitor-a-coding-agent): the user wants telemetry from Claude Code, Codex, Copilot CLI, Cursor, OpenCode, Pi, Vibe, or experimental Kiro CLI sent to Grafana Agent observability. They are not changing application code.
 - Path B, [Instrument an LLM app or agent](#path-b-instrument-an-llm-app-or-agent): the user wants their own code (an app, agent, framework pipeline) to send generations to Grafana Agent observability.
 
 If you cannot tell, ask one clarifying question and stop.
@@ -69,7 +69,7 @@ printf '%s' '<otlp-instance-id>:<glc_token>' | base64 | tr -d '\n'
 
 The user wants Grafana Agent observability to capture sessions from their coding agent. They do not write app code for this; they install a plugin and configure credentials.
 
-For Hermes, stop here and follow https://github.com/grafana/agento11y/tree/main/plugins/hermes/llms.txt. Hermes uses an independent Python plugin, not the shared launcher. Install in Hermes's Python environment and enable its `agento11y` entry point through Hermes YAML. Shared login, `config.env`, local mode, and the launcher steps below do not apply. Read the Hermes README's release warning before installing from PyPI.
+For Hermes, stop here and follow https://github.com/grafana/agento11y/tree/main/plugins/hermes/llms.txt. Hermes uses an independent Python plugin, not the shared launcher. Install in Hermes's Python environment and enable its `agento11y` entry point through Hermes YAML. Shared login, `config.env`, local mode, and the launcher steps below do not apply. Follow the Hermes README's package-rename instructions before installing from PyPI.
 
 If the `agento11y` binary is already installed on this machine, run `agento11y skills show setup-coding-agent`. It prints a fuller version of everything below: doctor-based triage, troubleshooting, and the config reference.
 
@@ -83,10 +83,11 @@ A binary older than that command prints `agento11y: unknown agent "skills"` and 
 | [Codex](https://developers.openai.com/codex) | [`plugins/codex/`](https://github.com/grafana/agento11y/tree/main/plugins/codex) | Shared `agento11y` Go binary via hooks |
 | [Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`plugins/copilot/`](https://github.com/grafana/agento11y/tree/main/plugins/copilot) | Shared `agento11y` Go binary via hooks |
 | [Cursor](https://cursor.com) | [`plugins/cursor/`](https://github.com/grafana/agento11y/tree/main/plugins/cursor) | Shared `agento11y` Go binary via hooks |
-| [OpenCode](https://opencode.ai) | [`plugins/opencode/`](https://github.com/grafana/agento11y/tree/main/plugins/opencode) | Shared `agento11y` Go binary, installs `@grafana/agento11y-opencode` |
+| [OpenCode](https://opencode.ai) | [`plugins/opencode/`](https://github.com/grafana/agento11y/tree/main/plugins/opencode) | Independent npm package `@grafana/agento11y-opencode`, installed by `agento11y opencode`; supports OpenCode 1.3.13 to 1.x and 2.0.22 to 2.x |
 | [Pi](https://github.com/earendil-works/pi) | [`plugins/pi/`](https://github.com/grafana/agento11y/tree/main/plugins/pi) | Independent npm package `@grafana/agento11y-pi` |
+| [Kiro CLI 3 (experimental)](https://kiro.dev/cli/) | [`plugins/kiro/`](https://github.com/grafana/agento11y/tree/main/plugins/kiro) | Workspace hooks; prompts/tools only, no assistant text, model usage, or cost |
 | [Vibe](https://github.com/mistralai/mistral-vibe) | [`plugins/vibe/`](https://github.com/grafana/agento11y/tree/main/plugins/vibe) | Shared `agento11y` Go binary via `hooks.toml` |
-| [Hermes](https://github.com/NousResearch/hermes-agent) | [`plugins/hermes/`](https://github.com/grafana/agento11y/tree/main/plugins/hermes) | Independent Python package `grafana-agento11y-hermes`; use its separate setup guide |
+| [Hermes](https://github.com/NousResearch/hermes-agent) | [`plugins/hermes/`](https://github.com/grafana/agento11y/tree/main/plugins/hermes) | Independent Python package `agento11y-hermes`; use its separate setup guide |
 
 ## Fast path
 
@@ -95,11 +96,11 @@ Install the `agento11y` binary (renamed from `sigil`; the old name still works b
 - **Quick install (Linux/macOS):** `curl -fsSL https://raw.githubusercontent.com/grafana/agento11y/main/plugins/agento11y/scripts/install.sh | sh` (downloads the latest release, verifies the checksum, installs to `~/.local/bin`)
 - **Homebrew (macOS):** `brew install grafana/grafana/agento11y`
 - **mise:** `mise use -g aqua:grafana/agento11y@latest` (requires [mise shell activation](https://mise.jdx.dev/cli/activate.html) so `agento11y` is on your `PATH`)
-- **Go install (Windows, or any platform with Go 1.25+):** `go install github.com/grafana/agento11y/plugins/agento11y/cmd/agento11y@latest`
+- **Go install (Windows, or any platform with Go 1.26.9+):** `go install github.com/grafana/agento11y/plugins/agento11y/cmd/agento11y@latest`
 
 The script installs to `~/.local/bin`; `go install` puts the binary in `go env GOPATH`/bin (or `GOBIN`). Make sure that directory is on your `PATH`.
 
-Launch your agent with `agento11y <agent>`, where `<agent>` is `claude`, `codex`, `copilot`, `opencode`, `pi`, or `vibe`. A first launch asks where sessions go, with two options: **Local only**, and **Grafana Cloud**. **Local only** needs no Cloud credentials, starts the local receiver, and does not forward sessions. **Grafana Cloud** continues to the credential questions. Its interactive preferences on macOS and Linux include **Local web UI**. The question starts on **Yes** by default and remembers an earlier answer. **Yes** keeps a full local copy and forwards a Cloud copy. **No** sends directly to Cloud without a local copy. The launcher asks nothing when local mode is already on (`--local` or `AGENTO11Y_LOCAL=true`) or when stdin is not a terminal. Windows has no local receiver, so it shows neither local choice.
+Launch your agent with `agento11y <agent>`, where `<agent>` is `claude`, `codex`, `copilot`, `opencode`, `pi`, `vibe`, or `kiro`. A first launch asks where sessions go, with two options: **Local only**, and **Grafana Cloud**. **Local only** needs no Cloud credentials, starts the local receiver, and does not forward sessions. **Grafana Cloud** continues to the credential questions. Its interactive preferences include **Local web UI**. The question starts on **Yes** by default and remembers an earlier answer. **Yes** keeps a full local copy and forwards a Cloud copy. **No** sends directly to Cloud without a local copy. The launcher asks nothing when local mode is already on (`--local` or `AGENTO11Y_LOCAL=true`) or when stdin is not a terminal. The same destination and local web UI choices are available on every supported platform.
 
 Cursor has no launcher because it is a GUI app. After installing the binary, wire its hooks once with `agento11y cursor install`. The command merges into `~/.cursor/hooks.json`, and asks the same first-run destination question under the same conditions. **Local only** there takes effect on the next Cursor hook, because the install does not start the receiver itself. `agento11y cursor uninstall` removes the hooks. See [`plugins/cursor/`](https://github.com/grafana/agento11y/tree/main/plugins/cursor) for details.
 
@@ -122,13 +123,32 @@ AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT=<otlp-gateway-url>
 
 To re-enter credentials later, run `agento11y login`. It asks where sessions go first when no destination and no credentials are saved. A rerun with a complete saved Cloud connection first shows its Grafana stack. **Keep this connection** jumps to preferences without changing the connection. **Change connection** opens the Cloud questions. For Grafana Cloud it asks for your Grafana stack and prints that stack's coding-agent setup page (`https://<your-stack>.grafana.net/a/grafana-agento11y-app/setup-coding-agent`), trying to open it in a browser. Paste the environment block from that page into the next field, which is masked because the block carries a token. Login fills the endpoint, tenant ID, token, OTLP endpoint, and OTLP headers from it. It asks for missing values individually, followed by the local web UI, content capture mode, session tags, and guards. The stack is saved as `AGENTO11Y_STACK_URL` so a later run offers it back. It only builds the printed links and is never saved as `AGENTO11Y_ENDPOINT`, which points at a different host. Before writing the file, login sends one request to the endpoint with the credentials and reports what came back. Run `agento11y doctor` to repeat that check later.
 
+## Experimental OTel generation export
+
+HTTP remains the default. To export generations as OpenTelemetry (OTel) spans, set these values in the environment or `~/.config/agento11y/config.env`:
+
+```dotenv
+AGENTO11Y_PROTOCOL=otel
+AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=true
+```
+
+Configure `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) and OTLP authentication. Use an endpoint that supports Agent Observability generation ingestion.
+
+OTel export supports Claude Code, Codex, Copilot, Cursor, Vibe, and Kiro. Local mode, history imports, and Claude plugin eval imports also support OTel. Pi and OpenCode live plugins still use HTTP.
+
+Guards, scores, and experiment APIs still need HTTP credentials.
+
 ## Local mode
 
-`agento11y <agent> --local`, **Local only**, or **Local web UI = Yes** records full session content to a JSONL store on this machine and serves a local viewer. The launcher prints the viewer URL: it tries `http://127.0.0.1:8765` first and moves to a higher port when that one is taken. Manage the daemon with `agento11y local start|open|status|stop|restart`. Use `agento11y local open` to start the receiver if needed, print its address, and try to open the viewer. Local mode runs on macOS and Linux only; Windows has no local receiver.
+`agento11y <agent> --local`, **Local only**, or **Local web UI = Yes** records full session content to a JSONL store on this machine and serves a local viewer. The launcher prints the viewer URL: it tries `http://127.0.0.1:8765` first and moves to a higher port when that one is taken. Manage the daemon with `agento11y local start|open|status|stop|restart`. Use `agento11y local open` to start the receiver if needed, print its address, and try to open the viewer. Local mode is available on every supported platform.
 
 **Local only** writes `AGENTO11Y_LOCAL` and `SIGIL_LOCAL` as true, and writes `AGENTO11Y_LOCAL_FORWARD` and `SIGIL_LOCAL_FORWARD` as false. Sessions then stay on the machine. **Local web UI = Yes** writes all four keys as true and forwards with valid Cloud credentials. **Local web UI = No** writes all four keys as false and sends directly to Cloud. `--no-local` sends one launcher session to Cloud without changing those keys.
 
+Separately from captured sessions, versioned builds of the binary report statistics about their own use (which subcommand ran, flag names, outcome, duration, a random per-installation ID) and never argument values, endpoints, tenant IDs, tokens, tags, hostnames, or file paths. Local development builds do not send usage statistics. `AGENTO11Y_ANONYMOUS_USAGE_STATS=disabled` or `DO_NOT_TRACK=1` turns it off; `=log` prints the event instead of sending it.
+
 The daemon always stores full generation content locally. It forwards full generation content only when `AGENTO11Y_CONTENT_CAPTURE_MODE=full`. Every other selected mode is reduced to `metadata_only` for the forwarded Cloud copy.
+
+Local tool-span sidecars can store optional `skill_name`, `skill_resource_name`, `process_executable_name`, and integer `process_exit_code` (int64). Zero differs from absent. The reader prefers nonblank `gen_ai.skill.name` and accepts legacy `agento11y.skill.name` as a fallback. Sidecars never store skill descriptions, source URIs, or executable paths. Old sidecars have no backfill; these fields add no UI or analytics.
 
 For local safety packs, run `agento11y skills show setup-local-guards` and follow its inspect, approve, configure, and test workflow. Ask before changing packs or destinations. The [local guard pack guide](docs/local-guards.md) documents pack coverage and limits. High-risk prompt triage and PHI-like data egress are deterministic text controls, not EU AI Act or HIPAA compliance determinations. These checks do not replace a sandbox, and an offline dry run does not prove host enforcement.
 
@@ -148,13 +168,17 @@ Plain output reports the local verdict, rules path, enforceable count, rule resu
 
 Exits: `0` for completed allow, including warnings or transforms; `1` for completed deny; `2` for input, file, compilation, evaluation, or output errors. Compilation errors take precedence. The output retains the partial response from valid rules. Failed evaluations include warnings and dropped redactions, not just denials. A response rule ID does not identify every transform that ran. Diagnostic JSON includes the submitted command and rewritten content: do not use real secrets in shared test output. Run `agento11y guards test --help` for details.
 
+## History import
+
+`agento11y history import opencode` supports v1 and released v2 databases. Use `--dry-run` to preview without exporting. See [History import](https://github.com/grafana/agento11y/tree/main/plugins/agento11y#history-import) for limitations before importing into local storage or Cloud.
+
 ## Content capture
 
 Coding-agent plugins default to `metadata_only`: only model, tokens, tool names, timing, and cost are sent. Prompts, responses, and tool I/O stay on the local machine. To opt into sending content, set `AGENTO11Y_CONTENT_CAPTURE_MODE` in `~/.config/agento11y/config.env`.
 
 Accepted values depend on the plugin surface:
 
-- Claude Code, Codex, Copilot, Cursor, Vibe (shared `agento11y` binary), OpenCode (`@grafana/agento11y-opencode`), and Pi (`@grafana/agento11y-pi`): `full`, `no_tool_content`, `metadata_only`, `full_with_metadata_spans`. `default` is accepted as an alias for `metadata_only`.
+- Claude Code, Codex, Copilot, Cursor, Vibe, Kiro (shared `agento11y` binary), OpenCode (`@grafana/agento11y-opencode`), and Pi (`@grafana/agento11y-pi`): `full`, `no_tool_content`, `metadata_only`, `full_with_metadata_spans`. `default` is accepted as an alias for `metadata_only`.
 
 Unknown values fall back to `metadata_only` with a warning. Capture modes choose which fields ship, not whether the shipped fields are scrubbed.
 
@@ -223,6 +247,10 @@ To attach custom key/values, pick the mechanism by where it must show up. See [`
 - **`user_id`** (`AGENTO11Y_USER_ID` / per-call / context): sets the `user.id` span attribute (all SDKs) plus the export; not a metric label. Use this for end-user identity instead of a tag.
 
 Coding-agent plugins (Path A) add one opt-in switch on top: `AGENTO11Y_AUTO_CODING_AGENT_TAGS=true` resolves the session's user, repository, and branch and attaches them as **client tags**, so they do become metric labels (`agento11y_tag_user`, `agento11y_tag_repo`, `agento11y_tag_git_branch`). `AGENTO11Y_AUTO_CODING_AGENT_TAGS_NAMES=user,repo` narrows that to some of the names and defaults to all of them; on its own, with the switch off, it does nothing. The switch is off by default, a key already set in `AGENTO11Y_TAGS` wins, and neither variable exists in the SDKs. Two consequences to state before recommending it: the `user` value is commonly a work email address that then lives in Prometheus labels for the metric retention period, and cardinality is the product of users, repositories, and branches, with branch names growing without bound. Suggest `user,repo` before all three.
+
+Coding-agent account discovery is local-only. Claude uses its selected config-directory account file, Codex uses existing `auth.json` email fields, and Cursor uses saved session email before current hook email. Other hosts have no account-email lookup. Discovery makes no provider requests, refreshes no credentials, and runs no host account commands. See [local account identity sources](https://github.com/grafana/agento11y/blob/main/docs/concepts/tags-and-metadata.md#local-account-identity-sources).
+
+Automatic user-tag precedence is explicit `TAGS[user]`, explicit `USER_ID`, host account identity, then OS username. The OS fallback sets only the optional tag, never conversation identity. An explicit `user` tag stays independent of identity. Disabling automatic tags does not disable account identity. `AGENTO11Y_USER_ID` accepts arbitrary identifiers, including pseudonyms; set the same value across plugins to unify attribution. Legacy `SIGIL_*` aliases remain supported.
 
 Capture modes do not strip `tags`/`metadata`/`user_id`; do not put secrets there.
 
@@ -357,6 +385,48 @@ Framework adapters:
 - JS/TS: subpath exports like `@grafana/agento11y/langgraph`, `@grafana/agento11y/vercel-ai-sdk`; single npm package, multiple entry points.
 - Go: `go-frameworks/google-adk`.
 - Java: `java/frameworks/google-adk`.
+
+## Tracing skill loads, resource reads, and commands
+
+Use the OpenTelemetry conventions for loading skills, reading skill resources, and running commands from [GenAI #498](https://github.com/open-telemetry/semantic-conventions-genai/pull/498).
+These conventions have Development status. The global schema declaration stays on the legacy schema while other signals still use it.
+Each execution remains one `INTERNAL` span with `gen_ai.operation.name=execute_tool` and no new metric labels.
+The execution kind selects span naming and standard `gen_ai.skill.*` and `process.*` attributes.
+The SDK does not emit the execution kind as an attribute.
+
+| Execution kind | Use | Suffix after `execute_tool {tool}` |
+| --- | --- | --- |
+| `load_skill` | Load skill instructions. | Skill name when present. |
+| `read_skill_resource` | Read a skill resource. | Skill plus resource; resource alone; otherwise none. |
+| `command` | Execute commands, with or without a skill. | Skill plus resource; resource alone; executable name; otherwise none. |
+
+Resource reads and commands never append a skill name alone. Resource naming takes precedence over executable naming.
+Set Go `ToolExecutionStart.ExecutionKind`, Python `ToolExecutionStart.execution_kind` (`ToolExecutionKind` enum), or JS/TS `executionKind` (the string values above).
+Go `otelgenai.Invocation` uses `ExecutionKind`. Java uses `setExecutionKind(...)`; .NET uses `ExecutionKind`.
+Do not change `ToolType`; it still describes categories such as `function` or `extension`.
+Unset or unknown execution kinds stay generic and omit skill and process attributes, even when those fields are supplied.
+There is no automatic skill detection or inference from tool names, arguments, paths, or results.
+Generic convenience loops remain generic and infer no exit codes.
+
+- All three execution kinds accept skill name, description, and source URI (`gen_ai.skill.name`, `gen_ai.skill.description`, `gen_ai.skill.source.uri`).
+- Resource reads and commands also accept `gen_ai.skill.resource.name`.
+- Commands alone accept `process.executable.name`, `process.executable.path`, and completion-time `process.exit.code`.
+- Only populate process fields for an actual, directly executed single process. Never guess or aggregate a pipeline outcome.
+- Report an optional integer exit code at completion: zero is reported success; absent is unknown. Go uses `*int64`.
+- Exit codes do not map to errors, span status, or `error.type`; keep using the existing execution-error API.
+- Applicable structural names reach samplers at span creation; typed private fields and completion exit codes do not.
+
+Typed skill and process fields follow the **effective** capture mode.
+`metadata_only` and `full_with_metadata_spans` exclude skill description, source URI, and executable path.
+Go/Python experimental OTel generation export resolves `full_with_metadata_spans` to `full`, so those clients can export the private fields.
+Skill source URIs exported from typed fields lose all user information, query parameters, and fragments.
+Malformed values are omitted without lookups.
+In Go `otelgenai`, raw `Invocation.Attributes` and attributes returned by end hooks bypass capture filtering and URI scrubbing.
+They can override typed attributes. Callers must filter private attributes and sanitize source URIs themselves.
+Core recorders can retain private inputs in memory. JS/Java completed-tool debug snapshots retain raw arguments, results, and error text even in reduced modes.
+The existing `no_tool_content` arguments/results opt-in remains unchanged and does not bypass reduced effective modes.
+SDKs emit the standard skill-name key, not `agento11y.skill.name`; a skill name does not by itself identify a load.
+See [field names and applicability](https://github.com/grafana/agento11y/blob/main/docs/concepts/tool-call-vs-tool-execution.md#api-fields-and-applicability) and [privacy rules](https://github.com/grafana/agento11y/blob/main/docs/concepts/content-capture-modes.md#skill-and-process-attribute-privacy).
 
 ## Telemetry fields to prioritize
 
@@ -533,6 +603,29 @@ Publish a reviewed suite checkpoint and pin its version when comparing candidate
 Choose Grafana or Git as the authoring source of truth; SDK push/pull are explicit
 transfers, not automatic bidirectional synchronization.
 
+To run an actual agent against a published suite version with the evaluators
+pinned to it in Grafana Cloud, use Python
+`agento11y.experiments.run_checkpoint(suite_id, version, target)` (0.20.0 or
+later). The target returns `AgentOutput(text=..., flush=instrumentation_client.flush)`.
+The version needs exactly one primary verdict binding. It checks every case's
+grading inputs before calling the agent, records a failing case as errored and
+continues, and stops starting new cases or grading when `timeout` runs out (it
+can't interrupt a running agent call). Gate CI with `agento11y-checkpoint-gate
+--suite-id ... --suite-version ... --baseline <RUN_ID> --candidate <RUN_ID>
+--min-pass-rate ... --max-drop ...`, which exits 0 (passed), 1 (regression) or
+2 (the runs can't be compared; any errored case makes a run incomparable, so
+rerun it).
+
+To record CI context, pass `metadata={...}` (for example commit SHA, PR number,
+run URL) and `tags=[...]` to `run_checkpoint` or `run_evals` (the next release
+after 0.20.0), e.g. `metadata=json.loads(os.environ.get("AGENTO11Y_CI_METADATA", "{}"))`
+when your CI provides JSON; the SDK never reads that variable itself. The keys
+`execution_kind`, `framework`, `input_selector`, `evaluation_plan`, `suite_id`
+and `suite_version` are reserved and raise `ValueError`. Without
+`experiment_id`, both helpers use `AGENTO11Y_EXPERIMENT_ID` when set, so a CI
+wrapper can pre-allocate the run ID; `experiment()` does not read it, and with
+it set you call one helper per process or pass `experiment_id` explicitly.
+
 The Grafana `run_evals` helper accepts an `evaluate(trial, case, answer)`
 callback for local scoring or stored evaluator invocation. Its recommended
 mixed-judge flow is `text_case(...)`,
@@ -548,6 +641,13 @@ versions. `setup_evals()` configures HTTP/protobuf OTLP using existing
 dependencies and reuses application providers. `AgentOutput` can carry an
 existing conversation ID and flush callback. See `python/docs/evaluation-plans.md`.
 
+Promptfoo can register `createPromptfooExtension(...)` from
+`@grafana/agento11y/promptfoo` as an `afterAll` extension. Promptfoo keeps
+execution and grading; the extension publishes each completed result row as a
+trial, marks the aggregate row score as `primary_verdict`, and marks supporting
+named scores as `diagnostic`. It does not create or invoke stored cloud
+evaluators. See `examples/experiments/promptfoo/`.
+
 - Run-side publishing uses `AGENTO11Y_ENDPOINT`, `AGENTO11Y_AUTH_TOKEN`, and
   optional `AGENTO11Y_AUTH_TENANT_ID`.
 - Stored suite push/pull is optional and additionally uses
@@ -562,6 +662,12 @@ existing conversation ID and flush callback. See `python/docs/evaluation-plans.m
 - Local `LLMJudge` and `RegexJudge` helpers do not require an evaluator created
   in Grafana. Frameworks can submit their native grader result and transcript
   through `trial.record_evaluation(...)`.
+- Use `ReportRole.PRIMARY_VERDICT` on the one score intended to drive the trial
+  headline and pass rate. Use `ReportRole.DIAGNOSTIC` for supporting scores that
+  remain available for analysis but must not determine the verdict. If no score
+  declares a role, an unannotated score under the legacy `final` key remains the
+  fallback. A primary verdict takes precedence over that fallback, and a
+  diagnostic `final` score is never selected.
 - `trial.evaluate(evaluator_id)` grades the trial's bound
   conversation with an evaluator that already exists in the tenant, instead of a
   locally computed score. Go spells it `trial.Evaluate(ctx, evaluatorID)` and
@@ -577,8 +683,9 @@ existing conversation ID and flush callback. See `python/docs/evaluation-plans.m
   - The score is stored against the conversation and the trial, with no
     `generation_id`, so read it from the experiment's scores or the trial's
     `scores` in the report rather than from a per-generation lookup.
-  - Leave `score_count` unset when finalizing such a run, and expect the report's
-    `pass_rate` to be unset: it only counts a score stored under the `final` key.
+  - Leave `score_count` unset when finalizing such a run. The report selects a
+    score marked `primary_verdict`, then falls back to an unannotated score under
+    the legacy `final` key; without either, `pass_rate` remains unset.
   - For concurrent evaluations use `client.trigger_trial_evaluation(...)` and
     `client.get_trial_evaluation(...)`, keeping both the trigger and the polling
     inside the experiment block. Finalizing while one is still queued raises a

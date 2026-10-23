@@ -23,10 +23,15 @@ A/B testing is just two runs with different experiment ids or tags over the same
 | --- | --- | --- |
 | Grafana Agent O11y Evals | Default text-reference workflow; local pass/fail comparison | [`grafana/`](grafana/) |
 | Framework-free | Python + core `agento11y` | [`python/`](python/) |
+| Published suite version with pinned evaluators | Python `run_checkpoint` | [`python/`](python/README.md#run-a-published-suite-version-with-your-agent) |
+| Real instrumented agent | Python + Anthropic; Grafana, DeepEval, or Harbor runner | [`real-agent/`](real-agent/) |
+| DeepEval | Python + DeepEval | [`deepeval/`](deepeval/) |
+| Harbor | Python + Harbor | [`harbor/`](harbor/) |
 | Framework-free | Go + `agento11y/go` | [`go/`](go/) |
 | Prompt optimizer | Go + `agento11y/go/experiments` | [`go/prompt-optimization/`](go/prompt-optimization/) |
 | Stored evaluator | Go + `agento11y/go/experiments` | [`go/cloud-evaluator/`](go/cloud-evaluator/) |
 | Stored evaluator | TypeScript + `@grafana/agento11y/experiments` | [`typescript/`](typescript/) |
+| Promptfoo adapter | TypeScript + Promptfoo | [`promptfoo/`](promptfoo/) |
 | Claude plugin eval exporter | Claude Code + `agento11y` CLI | [`claude-plugin-evals/`](claude-plugin-evals/) |
 | CI quality gate | Python, Go, or TypeScript + Agent Observability | [`ci/`](ci/) |
 

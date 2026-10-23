@@ -5,7 +5,7 @@ import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-ho
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 
 import { ExperimentsClient } from '../.test-dist/experiments/client.js';
-import { Experiment } from '../.test-dist/experiments/experiment.js';
+import { Experiment, withExperiment } from '../.test-dist/experiments/experiment.js';
 import {
   runStatusTelemetry,
   scoreEventAttributes,
@@ -53,6 +53,21 @@ test('experimental telemetry is off by default', async () => {
   }
 });
 
+test('the suite span reflects an explicitly failed experiment', async () => {
+  const recorder = withRecorder();
+  try {
+    const client = new FakeExperimentsClient({ useExperimentalOtel: true });
+    await withExperiment(client, { experimentId: 'run-1', name: 'nightly', suite }, async (experiment) => {
+      await experiment.finalize('failed', { error: 'candidate failed' });
+    });
+    const span = recorder.exporter.getFinishedSpans().find((item) => item.name === 'test_suite_run');
+    assert.equal(span.attributes['test.suite.run.status'], 'failure');
+    assert.equal(span.status.code, SpanStatusCode.ERROR);
+  } finally {
+    await recorder.dispose();
+  }
+});
+
 test('the opt-in emits a trial span with the documented identity attributes', async () => {
   const recorder = withRecorder();
   try {
@@ -67,7 +82,7 @@ test('the opt-in emits a trial span with the documented identity attributes', as
     assert.equal(spans.length, 1);
     const span = spans[0];
     assert.equal(span.name, 'eval.trial add');
-    assert.equal(span.instrumentationScope.name, 'sigil_sdk.experiments');
+    assert.equal(span.instrumentationScope.name, 'agento11y.experiments');
     assert.equal(span.attributes['agento11y.eval.schema.version'], 'experiments-otel-2026-06');
     assert.equal(span.attributes['test.suite.run.id'], 'run-1');
     assert.equal(span.attributes['test.suite.id'], 'smoke');

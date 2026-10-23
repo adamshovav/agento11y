@@ -431,6 +431,61 @@ with client.start_tool_execution(
     rec.set_result(arguments={"city": "Paris"}, result={"temp_c": 18})
 ```
 
+### Tracing skill loads, resource reads, and commands
+
+Set `ToolExecutionStart.execution_kind` explicitly with `ToolExecutionKind`. The SDK does not infer execution kinds from tool names, paths, or arguments.
+These additions follow [merged GenAI #498](https://github.com/open-telemetry/semantic-conventions-genai/pull/498), which remains in development.
+
+| Execution kind | Meaning | Applicable fields |
+| --- | --- | --- |
+| `ToolExecutionKind.LOAD_SKILL` (`load_skill`) | Load skill instructions | `skill_name`, `skill_description`, `skill_source_uri` |
+| `ToolExecutionKind.READ_SKILL_RESOURCE` (`read_skill_resource`) | Read a skill resource | Skill fields above, `skill_resource_name` |
+| `ToolExecutionKind.COMMAND` (`command`) | Execute a command, optionally for a skill | Skill/resource fields above, `process_executable_name`, `process_executable_path`; completion `process_exit_code` |
+
+Unset or unrecognized execution kinds keep generic tool behavior and emit no skill or process attributes. The SDK ignores inapplicable fields.
+Skill fields emit `gen_ai.skill.name`, `gen_ai.skill.description`, `gen_ai.skill.source.uri`, and `gen_ai.skill.resource.name`.
+Process fields emit `process.executable.name`, `process.executable.path`, and `process.exit.code`.
+The SDK does not dual-write `agento11y.skill.name`.
+
+Span names start with `execute_tool <tool>` and use trimmed, nonblank identity:
+
+- `load_skill` appends the skill name, when present.
+- `read_skill_resource` appends `<skill> <resource>`, or just `<resource>` without a skill. Without a resource, it appends nothing.
+- `command` uses the same resource suffix, then falls back to the executable name, then no suffix.
+
+Resource reads and commands never use a skill-only suffix.
+The span name and applicable structural names are available to samplers at creation.
+Private fields and the completion exit code are excluded from sampler attributes.
+
+Process fields describe one directly executed process. Do not infer them from shell text, pipelines, or command batches.
+`ToolExecutionEnd.process_exit_code` is a nullable integer (`int | None`): `None` means unknown; zero records successful completion.
+Booleans, strings, and fractional values are invalid. Exit codes are independent of recorded execution errors.
+For example, record a known completion code as follows:
+
+```python
+from agento11y import ToolExecutionEnd, ToolExecutionKind, ToolExecutionStart
+
+with client.start_tool_execution(
+    ToolExecutionStart(
+        tool_name="exec",
+        execution_kind=ToolExecutionKind.COMMAND,
+        skill_name="review",
+        skill_resource_name="scripts/check.py",
+        process_executable_name="python3",
+    )
+) as rec:
+    rec.set_result(ToolExecutionEnd(process_exit_code=0))
+```
+
+`skill_description`, `skill_source_uri`, and `process_executable_path` are private content.
+The SDK omits them from spans under effective `METADATA_ONLY` or `FULL_WITH_METADATA_SPANS`, after resolving overrides, inheritance, and the resolver.
+Core `NO_TOOL_CONTENT` retains these private fields; arguments/results still require the existing content opt-in.
+Every exported skill source URI has userinfo, query, and fragment removed, even under `FULL`.
+Invalid or relative URIs are omitted without network or filesystem lookup.
+With experimental OTel generation export, `FULL_WITH_METADATA_SPANS` resolves to `FULL`; it does not protect private fields from spans.
+
+Generic tool recording, `execute_tool_calls`, and existing metrics are unchanged. No skill/process metric dimensions are added.
+
 ## SDK identity attributes
 
 - Generation and tool spans always include:
@@ -465,7 +520,7 @@ with with_conversation_id("conv-ctx"), with_agent_name("planner"), with_agent_ve
 
 `DEFAULT` is a placeholder for "inherit from the next layer"; at the client level it resolves to `NO_TOOL_CONTENT`. The SDK default is `NO_TOOL_CONTENT`, which matches the SDK's behavior before this feature was added.
 
-`FULL_WITH_METADATA_SPANS` is the right mode when the gRPC ingest destination is private but the OTel trace/metric destination is shared and must not receive any content. Tool execution and embedding spans behave like `METADATA_ONLY` under this mode because they have no separate gRPC export.
+With HTTP/gRPC generation export, `FULL_WITH_METADATA_SPANS` keeps generation content in ingest and omits content from spans. Tool execution and embedding spans behave like `METADATA_ONLY` because they have no separate generation export. With experimental OTel generation export, this mode resolves to `FULL` instead; content can appear in spans.
 
 User-provided `metadata` and `tags` are **not** stripped by any capture mode; callers must avoid putting sensitive content in those dicts when using `METADATA_ONLY` or `FULL_WITH_METADATA_SPANS`. SDK-internal metadata keys that carry content (e.g. `call_error`, `agento11y.conversation.title`) are stripped along with the matching content. See [Tags and Metadata](../docs/concepts/tags-and-metadata.md) for where client tags, per-generation tags, metadata, and `user_id` each show up (export vs spans vs metrics).
 
@@ -991,7 +1046,8 @@ uses strict exact matching, and records explicit primary verdicts. Your target
 receives and returns strings; existing instrumentation binds conversations.
 Set `record_io=True` only to capture input/output for an uninstrumented target.
 Use a rubric or native framework metric for open-ended answers rather than
-assuming exact matching measures general quality. The
+assuming exact matching measures general quality. To record CI context on the
+run, refer to [Add CI context to a run](#add-ci-context-to-a-run). The
 [local demo](../examples/experiments/grafana/README.md) publishes a suite and
 compares a deliberately failing candidate with its correction.
 
@@ -1004,6 +1060,84 @@ affect it, and required judge errors remain unrated. `setup_evals()` provides
 one-call OTel setup without replacing application-owned providers. See the
 [evaluation-plan guide](docs/evaluation-plans.md) and
 [runnable mixed-judge example](../examples/experiments/grafana/judged.py).
+
+### Run a published suite version with your agent
+
+`run_checkpoint` runs your instrumented agent once per case of a published
+suite version and grades each case with the evaluators pinned to that version
+in Grafana Cloud. It requires `agento11y` 0.20.0 or later.
+
+```python
+from agento11y.experiments import AgentOutput, run_checkpoint
+
+run = run_checkpoint(
+    "dashboard-regression",
+    "3",
+    lambda prompt: AgentOutput(text=my_agent(prompt), flush=instrumentation_client.flush),
+    candidate={"agent_name": "dashboards", "agent_version": "1.4.0", "git_sha": "abc123"},
+)
+print(run.url)
+```
+
+Before calling your agent, it checks that the version is published, has
+exactly one primary verdict binding, and can resolve every case's grading
+inputs. Return `AgentOutput` with the flush of the client that instruments your
+agent, so each conversation is stored before it's graded. A case whose agent
+call or grading fails is recorded as errored and the run continues. If any
+case can't be fully graded, the run is finalized as failed. `timeout`
+(default one hour) stops new cases and grading from starting, but it can't
+interrupt an agent call that is already running, so give your agent its own
+timeout. It uses the same `AGENTO11Y_*` ingest and service-account credentials
+as `experiment_from_suite`.
+
+To gate CI on the result, compare a candidate run with a baseline run of the
+same version:
+
+```sh
+agento11y-checkpoint-gate --suite-id dashboard-regression --suite-version 3 \
+  --baseline <BASELINE_RUN_ID> --candidate <CANDIDATE_RUN_ID> \
+  --min-pass-rate 0.9 --max-drop 0.05
+```
+
+The gate prints a JSON verdict and exits `0` when the candidate passes, `1` on
+a regression, and `2` when either run can't support the comparison, for
+example an errored case or a score that doesn't match the pinned evaluators.
+The gate needs every case to complete on its first attempt, so a single
+provider error makes the comparison invalid. Rerun that run and gate again.
+
+#### Add CI context to a run
+
+`run_checkpoint` and `run_evals` accept `metadata` and `tags` for the run, such
+as the commit SHA, pull request number, or CI run URL. When you don't pass
+`experiment_id`, they use `AGENTO11Y_EXPERIMENT_ID` if it's set, so a CI wrapper
+can allocate the run ID before your command starts and find the run afterwards.
+Both require the next `agento11y` release after 0.20.0.
+
+```python
+import json
+import os
+
+from agento11y.experiments import AgentOutput, run_checkpoint
+
+run = run_checkpoint(
+    "dashboard-regression",
+    "3",
+    lambda prompt: AgentOutput(text=my_agent(prompt), flush=instrumentation_client.flush),
+    # Your CI passes this context however it likes; the SDK doesn't read AGENTO11Y_CI_METADATA.
+    metadata=json.loads(os.environ.get("AGENTO11Y_CI_METADATA", "{}")),
+    tags=["ci"],
+)
+```
+
+The SDK owns the `execution_kind`, `framework`, `input_selector`,
+`evaluation_plan`, `suite_id`, and `suite_version` keys, so a gate can trust
+them. Passing any of them in `metadata` raises `ValueError` before the run is
+created. Your `metadata` is copied, not changed.
+
+Only these two helpers read `AGENTO11Y_EXPERIMENT_ID`. `experiment()` and the
+framework adapters still create a new ID for every run. Because every helper
+call in one process gets the same ID, call one helper per process while the
+variable is set, or pass `experiment_id` to each call.
 
 ## Public API Overview
 

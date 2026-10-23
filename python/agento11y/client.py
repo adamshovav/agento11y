@@ -11,7 +11,7 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -36,6 +36,8 @@ from .context import (
 from .errors import (
     ClientShutdownError,
     EnqueueError,
+    ExportFlushError,
+    FlushNotVerifiableError,
     QueueFullError,
     RatingConflictError,
     RatingTransportError,
@@ -64,6 +66,7 @@ from .models import (
     SubmitConversationRatingResponse,
     TokenInputSemantics,
     ToolExecutionEnd,
+    ToolExecutionKind,
     ToolExecutionStart,
     ToolResult,
     WorkflowStep,
@@ -72,6 +75,9 @@ from .models import (
 )
 from .proto_mapping import generation_to_proto, workflow_step_to_proto
 from .validation import validate_embedding_result, validate_embedding_start, validate_generation
+
+if TYPE_CHECKING:
+    from opentelemetry.util.genai.invocation import InferenceInvocation
 
 _span_attr_generation_id = "agento11y.generation.id"
 _span_attr_sdk_name = "agento11y.sdk.name"
@@ -338,6 +344,7 @@ class Client:
         self._pending_workflow_steps: list[WorkflowStep] = []
         self._pending_lock = threading.Lock()
         self._flush_lock = threading.Lock()
+        self._unreported_export_error: Exception | None = None
         self._flush_thread_lock = threading.Lock()
         self._flush_thread: threading.Thread | None = None
 
@@ -345,9 +352,16 @@ class Client:
         self._shutting_down = False
         self._closed = False
 
+        self._otel_handler = None
+        protocol = self._config.generation_export.protocol.strip().lower()
         self._generation_exporter = self._config.generation_exporter
-        if self._generation_exporter is None:
-            protocol = self._config.generation_export.protocol.strip().lower()
+        if protocol == "otel":
+            if self._generation_exporter is not None:
+                raise ValueError("agento11y: protocol='otel' conflicts with generation_exporter")
+            from .otel_export import build_otel_handler
+
+            self._otel_handler = build_otel_handler(self._config)
+        elif self._generation_exporter is None:
             if protocol == "http":
                 self._generation_exporter = HTTPGenerationExporter(
                     endpoint=self._config.generation_export.endpoint,
@@ -367,15 +381,33 @@ class Client:
                 raise ValueError(f"unsupported generation export protocol {self._config.generation_export.protocol!r}")
 
         self._tracer = (
-            self._config.tracer if self._config.tracer is not None else trace.get_tracer(_instrumentation_name)
+            self._config.tracer
+            if self._config.tracer is not None
+            else trace.get_tracer(_instrumentation_name, tracer_provider=self._config.tracer_provider)
         )
-        if self._config.meter is None and _global_meter_provider_is_proxy():
-            self._log_warn(
-                "OTel metrics are not configured: register a MeterProvider and pass its meter to "
-                "ClientConfig(meter=...). Generation export can still work, but token usage, cost, "
-                "and latency metrics will be missing."
-            )
-        self._meter = self._config.meter if self._config.meter is not None else metrics.get_meter(_instrumentation_name)
+        if (
+            (self._otel_handler is not None or self._config.meter is None)
+            and self._config.meter_provider is None
+            and _global_meter_provider_is_proxy()
+        ):
+            if self._otel_handler is not None:
+                self._log_warn(
+                    "OTel metrics are not configured: register a global MeterProvider or pass one to "
+                    "ClientConfig(meter_provider=...). ClientConfig(meter=...) does not configure generation "
+                    "metrics with protocol='otel'. Generation export can still work, but token usage, cost, "
+                    "and latency metrics will be missing."
+                )
+            else:
+                self._log_warn(
+                    "OTel metrics are not configured: register a MeterProvider and pass its meter to "
+                    "ClientConfig(meter=...). Generation export can still work, but token usage, cost, "
+                    "and latency metrics will be missing."
+                )
+        self._meter = (
+            self._config.meter
+            if self._config.meter is not None
+            else metrics.get_meter(_instrumentation_name, meter_provider=self._config.meter_provider)
+        )
 
         self._operation_duration_histogram: Histogram = self._meter.create_histogram(
             _metric_operation_duration,
@@ -398,10 +430,34 @@ class Client:
             _metric_tool_calls_per_operation, unit="count"
         )
 
+        if self._otel_handler is not None:
+            from .otel_export import SCHEMA_URL
+
+            generation_meter = metrics.get_meter(
+                _instrumentation_name,
+                "",
+                meter_provider=self._config.meter_provider,
+                schema_url=SCHEMA_URL,
+            )
+            self._otel_token_usage_histogram = generation_meter.create_histogram(
+                _metric_token_usage,
+                description="Number of input and output tokens used by GenAI clients",
+                unit="{token}",
+                explicit_bucket_boundaries_advisory=_TOKEN_USAGE_BUCKETS,
+            )
+            self._otel_ttft_histogram = generation_meter.create_histogram(
+                _metric_ttft,
+                unit="s",
+                explicit_bucket_boundaries_advisory=_DURATION_BUCKETS_SECONDS,
+            )
+            self._otel_tool_calls_histogram = generation_meter.create_histogram(
+                _metric_tool_calls_per_operation, unit="count"
+            )
+
         self._timer_stop = threading.Event()
         self._timer_thread: threading.Thread | None = None
         flush_interval_s = self._config.generation_export.flush_interval.total_seconds()
-        if flush_interval_s > 0:
+        if flush_interval_s > 0 and self._otel_handler is None:
             self._timer_thread = threading.Thread(target=self._run_flush_timer, daemon=True)
             self._timer_thread.start()
 
@@ -450,6 +506,7 @@ class Client:
             _resolve_content_capture_mode(resolver_mode, self._config.content_capture)
         )
 
+        embedding_mode = self._resolve_otel_capture_mode(embedding_mode)
         span = self._tracer.start_span(
             _embedding_span_name(seed.model.name),
             kind=SpanKind.CLIENT,
@@ -475,6 +532,19 @@ class Client:
         seed.tool_name = seed.tool_name.strip()
         if seed.tool_name == "":
             return NoopToolExecutionRecorder()
+
+        for name in (
+            "tool_call_id",
+            "tool_type",
+            "skill_name",
+            "skill_description",
+            "skill_source_uri",
+            "skill_resource_name",
+            "process_executable_name",
+            "process_executable_path",
+        ):
+            setattr(seed, name, getattr(seed, name).strip())
+        seed.skill_source_uri = _sanitize_skill_source_uri(seed.skill_source_uri)
 
         seed.conversation_title = seed.conversation_title.strip()
         if seed.conversation_id == "":
@@ -502,7 +572,9 @@ class Client:
         resolver_mode = _call_content_capture_resolver(self._config.content_capture_resolver, {}, self._config.logger)
         effective_client_default = _resolve_content_capture_mode(resolver_mode, self._config.content_capture)
         ctx_mode = content_capture_mode_from_context()
-        tool_mode = _resolve_tool_content_capture_mode(seed.content_capture, ctx_mode, effective_client_default)
+        tool_mode = self._resolve_otel_capture_mode(
+            _resolve_tool_content_capture_mode(seed.content_capture, ctx_mode, effective_client_default)
+        )
 
         if tool_mode in (
             ContentCaptureMode.METADATA_ONLY,
@@ -521,11 +593,27 @@ class Client:
             include_content = seed.include_content
 
         span = self._tracer.start_span(
-            _tool_span_name(seed.tool_name),
+            _tool_span_name(seed),
             kind=SpanKind.INTERNAL,
             start_time=_datetime_to_ns(started_at),
+            attributes={
+                _span_attr_operation_name: "execute_tool",
+                _span_attr_tool_name: seed.tool_name,
+                **{
+                    key: value
+                    for key, value in (
+                        (_span_attr_tool_call_id, seed.tool_call_id),
+                        (_span_attr_tool_type, seed.tool_type),
+                    )
+                    if value
+                },
+                **_tool_skill_process_attributes(seed),
+            },
         )
         _set_tool_span_attributes(span, seed)
+        if tool_mode not in (ContentCaptureMode.METADATA_ONLY, ContentCaptureMode.FULL_WITH_METADATA_SPANS):
+            for key, value in _tool_skill_process_attributes(seed, private=True).items():
+                span.set_attribute(key, value)
         self._set_client_tag_attributes(span)
 
         return ToolExecutionRecorder(
@@ -822,14 +910,30 @@ class Client:
         )
 
     def flush(self) -> None:
-        """Flushes all queued generations immediately."""
+        """Flushes queued generations and raises export failures since the last flush.
+
+        With native export, a rejected generation or failed export raises
+        ``ExportFlushError`` (or the exporter's error). A generation the server
+        already stored, for example after a retry, is not a failure; rejected
+        workflow steps are logged without failing the flush. A failure
+        from a background flush is raised once by the next explicit flush as an
+        ``ExportFlushError`` that says so, even though that batch already left
+        the queue; a later successful flush does not restore lost records.
+
+        OTel requires an explicit tracer_provider with force_flush() and flushes
+        traces only. Success confirms local processor completion, not backend acceptance.
+        """
 
         if self._shutting_down:
             raise ClientShutdownError("agento11y: client is shutting down")
-        self._flush_internal()
+        self._flush_internal(report_background_errors=True)
 
     def shutdown(self) -> None:
-        """Flushes pending data and shuts down exporters."""
+        """Flushes pending data and shuts down exporters with native export.
+
+        OTel attempts a trace flush and closes the SDK client without flushing
+        metrics or shutting down application providers.
+        """
 
         with self._shutdown_lock:
             if self._closed:
@@ -853,6 +957,11 @@ class Client:
                 self._log_warn("agento11y generation exporter shutdown failed", exc)
 
             self._closed = True
+
+    def _resolve_otel_capture_mode(self, mode: ContentCaptureMode) -> ContentCaptureMode:
+        if self._otel_handler is not None and mode == ContentCaptureMode.FULL_WITH_METADATA_SPANS:
+            return ContentCaptureMode.FULL
+        return mode
 
     def _start_generation(self, start: GenerationStart, default_mode: GenerationMode) -> GenerationRecorder:
         self._assert_open()
@@ -915,6 +1024,23 @@ class Client:
             else seed.conversation_title
         )
 
+        otel_invocation = None
+        if self._otel_handler is not None:
+            from .otel_export import start_invocation
+
+            otel_invocation = start_invocation(self._otel_handler, seed)
+            recorder = GenerationRecorder(
+                client=self,
+                seed=seed,
+                span=otel_invocation.span,
+                started_at=started_at,
+                _content_capture_mode=self._resolve_otel_capture_mode(cc_mode),
+                _otel_invocation=otel_invocation,
+            )
+            # Keep shared capture context protocol-neutral for native clients.
+            _push_capture_mode(id(recorder), cc_mode)
+            return recorder
+
         span = self._tracer.start_span(
             _generation_span_name(seed.operation_name, seed.model.name),
             kind=SpanKind.CLIENT,
@@ -952,7 +1078,7 @@ class Client:
         _push_capture_mode(id(recorder), cc_mode)
         return recorder
 
-    def _enqueue_generation(self, generation: Generation) -> None:
+    def _check_generation_admission(self, generation: Generation) -> None:
         if self._shutting_down or self._closed:
             raise ClientShutdownError("agento11y: client is shutting down")
 
@@ -962,6 +1088,8 @@ class Client:
             if payload_size > max_payload_bytes:
                 raise EnqueueError(f"generation payload exceeds max bytes ({payload_size} > {max_payload_bytes})")
 
+    def _enqueue_generation(self, generation: Generation) -> None:
+        self._check_generation_admission(generation)
         should_trigger_flush = False
         with self._pending_lock:
             if len(self._pending_generations) >= self._config.generation_export.queue_size:
@@ -974,7 +1102,9 @@ class Client:
             self._trigger_async_flush()
 
     def enqueue_workflow_step(self, step: WorkflowStep) -> None:
-        """Enqueues a workflow execution node for background export.
+        """Enqueues a workflow execution node for background export with native export.
+
+        Raises EnqueueError on an open OTel client.
 
         The step is normalized the same way generations are: timestamps default
         to the client clock (UTC), client-level ``tags`` are merged in (the
@@ -988,6 +1118,9 @@ class Client:
         """
         if self._shutting_down or self._closed:
             raise ClientShutdownError("agento11y: client is shutting down")
+
+        if self._otel_handler is not None:
+            raise EnqueueError("agento11y: workflow step export is unsupported with protocol='otel'; use http/grpc")
 
         # Validate the raw input before defaulting timestamps, matching Go and
         # JS. The completed_at < started_at rule only fires when the caller
@@ -1048,9 +1181,23 @@ class Client:
             raise ValueError("generation sanitizer must return a generation")
         return copy.deepcopy(sanitized)
 
-    def _flush_internal(self) -> None:
+    def _flush_internal(self, *, report_background_errors: bool = False) -> None:
+        if self._otel_handler is not None:
+            provider = self._config.tracer_provider
+            force_flush = getattr(provider, "force_flush", None)
+            if not callable(force_flush):
+                raise FlushNotVerifiableError(
+                    "agento11y: OTel flush requires an explicit tracer_provider with force_flush"
+                )
+            if force_flush() is not True:
+                raise ExportFlushError("agento11y: OTel tracer provider did not complete force_flush")
+            return
         first_error: Exception | None = None
+        prior_error: Exception | None = None
         with self._flush_lock:
+            if report_background_errors:
+                prior_error = self._unreported_export_error
+                self._unreported_export_error = None
             while True:
                 with self._pending_lock:
                     has_gens = bool(self._pending_generations)
@@ -1076,10 +1223,12 @@ class Client:
                             lambda req=gen_request: self._generation_exporter.export_generations(req)
                         )
                         for result in response.results:
-                            if not result.accepted:
-                                self._log_warn(
+                            if not result.accepted and not _is_duplicate_generation_result(result):
+                                message = (
                                     f"agento11y generation rejected id={result.generation_id} error={result.error}"
                                 )
+                                self._log_warn(message)
+                                first_error = first_error or ExportFlushError(message)
                     except Exception as exc:  # noqa: BLE001
                         self._log_warn("agento11y generation export failed", exc)
                         first_error = first_error or exc
@@ -1092,6 +1241,8 @@ class Client:
                         )
                         for result in wf_response.results:
                             if not result.accepted:
+                                # Logged only: grading doesn't read workflow steps, and the server reports
+                                # a retried step that already landed as an opaque internal error.
                                 self._log_warn(
                                     f"agento11y workflow step rejected id={result.step_id} error={result.error}"
                                 )
@@ -1101,9 +1252,18 @@ class Client:
 
                 if first_error is not None:
                     break
+            if first_error is not None and not report_background_errors:
+                self._unreported_export_error = self._unreported_export_error or first_error
 
+        if prior_error is not None:
+            prior_error = _earlier_background_flush_error(prior_error)
         if first_error is not None:
+            if prior_error is not None:
+                # Chain it so the earlier loss is shown with this failure instead of dropped.
+                first_error.__context__ = prior_error
             raise first_error
+        if prior_error is not None:
+            raise prior_error
 
     def _export_with_retry(self, send: Callable[[], Any]):
         """Run an export call with the configured exponential backoff retry.
@@ -1164,7 +1324,34 @@ class Client:
         error_type: str,
         error_category: str,
         first_token_at: datetime | None,
+        otel_invocation: InferenceInvocation | None = None,
     ) -> None:
+        if otel_invocation is not None:
+            attrs = dict(otel_invocation.metric_attributes)
+            if generation.response_model:
+                attrs[_span_attr_response_model] = generation.response_model
+            if error_type:
+                attrs[_span_attr_error_type] = error_type
+            context = otel_invocation.context
+            usage = generation.usage
+            for token_type, count in (
+                (_metric_token_type_cache_read, usage.cache_read_input_tokens),
+                (_metric_token_type_cache_write, usage.cache_write_input_tokens),
+                (_metric_token_type_reasoning, usage.reasoning_tokens),
+            ):
+                if count != 0:
+                    self._otel_token_usage_histogram.record(
+                        count, attributes={**attrs, _metric_attr_token_type: token_type}, context=context
+                    )
+            self._otel_tool_calls_histogram.record(
+                _count_tool_call_parts(generation.output), attributes=attrs, context=context
+            )
+            if generation.mode == GenerationMode.STREAM and first_token_at is not None and generation.started_at:
+                seconds = (first_token_at - generation.started_at).total_seconds()
+                if seconds >= 0:
+                    self._otel_ttft_histogram.record(seconds, attributes=attrs, context=context)
+            return
+
         started_at = generation.started_at
         completed_at = generation.completed_at
         if started_at is None or completed_at is None:
@@ -1314,6 +1501,8 @@ class GenerationRecorder:
     started_at: datetime
 
     _content_capture_mode: ContentCaptureMode = ContentCaptureMode.NO_TOOL_CONTENT
+    _otel_invocation: InferenceInvocation | None = field(default=None, repr=False)
+    _otel_finished: bool = field(default=False, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _ended: bool = False
     _call_error: Exception | None = None
@@ -1391,7 +1580,10 @@ class GenerationRecorder:
                 self._extra_metadata[CACHE_DIAGNOSTICS_PREVIOUS_MESSAGE_ID_KEY] = prev
 
     def end(self) -> None:
-        """Finalizes span and queues generation export. Safe to call multiple times."""
+        """Finalizes the span and queues generation export with native export.
+
+        OTel completes the invocation without a native queue. Safe to call multiple times.
+        """
 
         with self._lock:
             if self._ended:
@@ -1408,11 +1600,20 @@ class GenerationRecorder:
             generation = self._normalize_generation(result, completed_at, call_error, extra_metadata)
             _apply_trace_context_from_span(self.span, generation)
 
+            call_failed = call_error is not None or generation.call_error != ""
+            call_category = ""
+            if self._otel_invocation is not None and call_failed:
+                call_category = _error_category_from_exception(
+                    call_error if call_error is not None else generation.call_error, fallback_sdk=True
+                )
+
             effective_content_capture_mode = self._content_capture_mode
             _stamp_content_capture_metadata(generation, self._content_capture_mode)
             validation_target = copy.deepcopy(generation)
             if self._content_capture_mode == ContentCaptureMode.METADATA_ONLY:
-                error_cat = _error_category_from_exception(call_error, fallback_sdk=True) if call_error else ""
+                error_cat = call_category
+                if self._otel_invocation is None:
+                    error_cat = _error_category_from_exception(call_error, fallback_sdk=True) if call_error else ""
                 _strip_content(generation, error_cat)
             elif self.client._has_generation_sanitizer():
                 try:
@@ -1420,7 +1621,9 @@ class GenerationRecorder:
                     validation_target = copy.deepcopy(generation)
                 except Exception:  # noqa: BLE001
                     effective_content_capture_mode = ContentCaptureMode.METADATA_ONLY
-                    error_cat = _error_category_from_exception(call_error, fallback_sdk=True) if call_error else ""
+                    error_cat = call_category
+                    if self._otel_invocation is None:
+                        error_cat = _error_category_from_exception(call_error, fallback_sdk=True) if call_error else ""
                     _strip_content(generation, error_cat)
                     _stamp_content_capture_metadata(generation, effective_content_capture_mode)
                     if self.client._config.logger is not None:
@@ -1428,6 +1631,18 @@ class GenerationRecorder:
                             "agento11y: generation sanitization failed, falling back to metadata_only",
                             exc_info=True,
                         )
+
+            if self._otel_invocation is not None:
+                self._end_otel_generation(
+                    generation,
+                    validation_target,
+                    call_failed,
+                    call_category,
+                    mapping_error,
+                    first_token_at,
+                    effective_content_capture_mode,
+                )
+                return
 
             self.span.update_name(_generation_span_name(generation.operation_name, generation.model.name))
             # FULL_WITH_METADATA_SPANS: proto export keeps full content, but
@@ -1525,8 +1740,125 @@ class GenerationRecorder:
             with self._lock:
                 self._last_generation = copy.deepcopy(generation)
                 self._final_error = local_error
+        except Exception as exc:  # noqa: BLE001
+            if self._otel_invocation is None:
+                raise
+            local_error = ValidationError("agento11y: generation normalization failed")
+            local_error.__cause__ = exc
+            self._reject_otel_generation(local_error)
+            with self._lock:
+                self._final_error = local_error
         finally:
             _pop_capture_mode(id(self))
+
+    def _finish_otel_invocation(self, error_type: str = "", message: str = "") -> None:
+        if self._otel_finished:
+            return
+        self._otel_finished = True
+        try:
+            if error_type:
+                from opentelemetry.util.genai.invocation import Error
+
+                self._otel_invocation.fail(Error(type=error_type, message=message))
+            else:
+                self._otel_invocation.stop()
+        except Exception:  # noqa: BLE001
+            # Utility completion ends the span even when telemetry extensions raise;
+            # an already published record cannot become a local rejection.
+            self.client._logger.warning("agento11y: OTel invocation completion failed; span may already be exported")
+
+    def _reject_otel_generation(self, error: Exception) -> None:
+        invocation = self._otel_invocation
+        invocation.attributes.clear()
+        invocation.attributes.update(
+            {
+                "agento11y.record": "false",
+                _span_attr_operation_name: "agento11y.invalid_generation",
+                _span_attr_error_category: "sdk_error",
+                "agento11y.export.error": type(error).__name__,
+            }
+        )
+        invocation.metric_attributes[_span_attr_operation_name] = "agento11y.invalid_generation"
+        invocation.metric_attributes[_span_attr_error_category] = "sdk_error"
+        self.span.update_name("agento11y.invalid_generation")
+        self._finish_otel_invocation("sdk_export_error", "sdk_error")
+
+    def _end_otel_generation(
+        self,
+        generation: Generation,
+        validation_target: Generation,
+        call_failed: bool,
+        category: str,
+        mapping_error: Exception | None,
+        first_token_at: datetime | None,
+        capture_mode: ContentCaptureMode,
+    ) -> None:
+        from .otel_export import generation_attributes, metric_attributes, operation_name, provider_name
+
+        local_error: Exception | None = None
+        attrs = None
+        try:
+            if mapping_error is not None:
+                raise mapping_error
+            validate_generation(validation_target)
+            attrs = generation_attributes(generation, capture_mode, self.client._config.tags)
+        except Exception as exc:  # noqa: BLE001
+            local_error = ValidationError("agento11y: OTel generation validation or encoding failed")
+            local_error.__cause__ = exc
+        if local_error is None:
+            try:
+                self.client._check_generation_admission(generation)
+            except ClientShutdownError as exc:
+                local_error = exc
+            except Exception as exc:  # noqa: BLE001
+                local_error = EnqueueError("agento11y: generation admission failed")
+                local_error.__cause__ = exc
+
+        if local_error is not None:
+            self._reject_otel_generation(local_error)
+        else:
+            invocation = self._otel_invocation
+            operation = operation_name(generation.operation_name)
+            provider = provider_name(generation.model.provider)
+            invocation.attributes.update(attrs)
+            invocation.metric_attributes.update(
+                {
+                    _span_attr_operation_name: operation,
+                    _span_attr_provider_name: provider,
+                    _span_attr_request_model: generation.model.name,
+                    **metric_attributes(generation, self.client._config.tags, error_category=category),
+                }
+            )
+            invocation.conversation_id = generation.conversation_id or None
+            invocation.response_model_name = generation.response_model or None
+            invocation.response_id = generation.response_id or None
+            invocation.finish_reasons = [generation.stop_reason] if generation.stop_reason else None
+            invocation.input_tokens = generation.usage.input_tokens or None
+            invocation.output_tokens = generation.usage.output_tokens or None
+            invocation.thinking_tokens = generation.usage.reasoning_tokens or None
+            invocation.cache_read_input_tokens = generation.usage.cache_read_input_tokens or None
+            invocation.cache_write_input_tokens = generation.usage.cache_write_input_tokens or None
+            invocation.temperature = generation.temperature
+            invocation.top_p = generation.top_p
+            invocation.max_tokens = generation.max_tokens
+            if category:
+                invocation.attributes[_span_attr_error_category] = category
+            self.span.update_name(f"{operation} {generation.model.name}" if generation.model.name else operation)
+            self.client._record_generation_metrics(
+                generation,
+                "provider_call_error" if call_failed else "",
+                category,
+                first_token_at,
+                otel_invocation=invocation,
+            )
+            message = (
+                (generation.call_error or category) if capture_mode != ContentCaptureMode.METADATA_ONLY else category
+            )
+            self._finish_otel_invocation("provider_call_error" if call_failed else "", message)
+
+        with self._lock:
+            self._last_generation = copy.deepcopy(generation)
+            self._final_error = local_error
 
     def err(self) -> Exception | None:
         """Returns local validation/enqueue error after `end()`."""
@@ -1810,9 +2142,14 @@ class ToolExecutionRecorder:
     def set_result(self, end: ToolExecutionEnd | None = None, **kwargs: Any) -> None:
         """Stores tool arguments/result payload."""
 
-        payload = ToolExecutionEnd(**kwargs) if end is None else end
+        payload = copy.deepcopy(ToolExecutionEnd(**kwargs) if end is None else end)
+        # Dataclasses are mutable: validate again at the recorder boundary.
+        if payload.process_exit_code is not None and (
+            isinstance(payload.process_exit_code, bool) or not isinstance(payload.process_exit_code, int)
+        ):
+            raise ValueError("process_exit_code must be an int or None")
         with self._lock:
-            self._result = copy.deepcopy(payload)
+            self._result = payload
             self._has_result = True
 
     def end(self) -> None:
@@ -1827,8 +2164,10 @@ class ToolExecutionRecorder:
 
         completed_at = _to_utc(result.completed_at) if result.completed_at is not None else _to_utc(self.client._now())
 
-        self.span.update_name(_tool_span_name(self.seed.tool_name))
+        self.span.update_name(_tool_span_name(self.seed))
         _set_tool_span_attributes(self.span, self.seed)
+        if self.seed.execution_kind == ToolExecutionKind.COMMAND and result.process_exit_code is not None:
+            self.span.set_attribute("process.exit.code", result.process_exit_code)
 
         content_error: Exception | None = None
         if self.include_content:
@@ -1909,6 +2248,22 @@ class NoopToolExecutionRecorder:
         return None
 
 
+def _is_duplicate_generation_result(result: Any) -> bool:
+    """An idempotent re-export of a stored generation (for example, after a retry) is not a loss."""
+
+    error = (result.error or "").strip().lower()
+    return "generation already exists" in error or "duplicate entry" in error
+
+
+def _earlier_background_flush_error(error: Exception) -> ExportFlushError:
+    wrapped = ExportFlushError(
+        f"agento11y: an earlier background flush failed and its records were not exported: "
+        f"{type(error).__name__}: {error}"
+    )
+    wrapped.__cause__ = error
+    return wrapped
+
+
 def _apply_trace_context_from_span(span: Span, generation: Generation) -> None:
     context = span.get_span_context()
     if context is None:
@@ -1938,9 +2293,70 @@ def _embedding_span_name(model_name: str) -> str:
     return f"{_default_embedding_operation_name} {model}"
 
 
-def _tool_span_name(tool_name: str) -> str:
-    name = tool_name.strip() or "unknown"
-    return f"execute_tool {name}"
+def _tool_span_name(start: ToolExecutionStart) -> str:
+    name = f"execute_tool {start.tool_name.strip() or 'unknown'}"
+    suffix = ""
+    if start.execution_kind == ToolExecutionKind.LOAD_SKILL:
+        suffix = start.skill_name
+    elif start.execution_kind in (ToolExecutionKind.READ_SKILL_RESOURCE, ToolExecutionKind.COMMAND):
+        if start.skill_resource_name:
+            suffix = " ".join(part for part in (start.skill_name, start.skill_resource_name) if part)
+        elif start.execution_kind == ToolExecutionKind.COMMAND:
+            suffix = start.process_executable_name
+    return f"{name} {suffix}" if suffix else name
+
+
+def _sanitize_skill_source_uri(value: str) -> str:
+    # Validate before parsing or scrubbing can hide malformed input.
+    if (
+        not value
+        or "\\" in value
+        or any(char.isspace() or ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)
+        or re.search(r"%(?![0-9A-Fa-f]{2})", value)
+    ):
+        return ""
+    try:
+        uri = urllib_parse.urlsplit(value)
+        if not uri.scheme or uri.netloc.endswith(":") or uri.netloc.count("@") > 1:
+            return ""
+        if uri.netloc and not uri.hostname:
+            return ""
+        authority = uri.netloc.rsplit("@", 1)[-1]
+        host = urllib_parse.unquote(uri.hostname or "")
+        if re.search(r"[/\\?#@\[\]\s\x00-\x1f\x7f-\x9f]", host) or (":" in host and not authority.startswith("[")):
+            return ""
+        if uri.scheme == "file":
+            if not uri.path.startswith("/"):
+                return ""
+        elif not uri.hostname:
+            return ""
+        # Accessing port validates malformed/non-numeric ports too.
+        _ = uri.port
+        return urllib_parse.urlunsplit((uri.scheme, authority, uri.path, "", ""))
+    except ValueError:
+        return ""
+
+
+def _tool_skill_process_attributes(start: ToolExecutionStart, *, private: bool = False) -> dict[str, str]:
+    if start.execution_kind not in (
+        ToolExecutionKind.LOAD_SKILL,
+        ToolExecutionKind.READ_SKILL_RESOURCE,
+        ToolExecutionKind.COMMAND,
+    ):
+        return {}
+    attrs = (
+        {"gen_ai.skill.description": start.skill_description, "gen_ai.skill.source.uri": start.skill_source_uri}
+        if private
+        else {"gen_ai.skill.name": start.skill_name}
+    )
+    if not private and start.execution_kind != ToolExecutionKind.LOAD_SKILL:
+        attrs["gen_ai.skill.resource.name"] = start.skill_resource_name
+    if start.execution_kind == ToolExecutionKind.COMMAND:
+        if private:
+            attrs["process.executable.path"] = start.process_executable_path
+        else:
+            attrs["process.executable.name"] = start.process_executable_name
+    return {key: value for key, value in attrs.items() if value}
 
 
 def _set_generation_span_attributes(span: Span, generation: Generation) -> None:
@@ -2079,6 +2495,8 @@ def _set_tool_span_attributes(span: Span, start: ToolExecutionStart) -> None:
     span.set_attribute(_span_attr_operation_name, "execute_tool")
     span.set_attribute(_span_attr_tool_name, start.tool_name)
     span.set_attribute(_span_attr_sdk_name, _sdk_name)
+    for key, value in _tool_skill_process_attributes(start).items():
+        span.set_attribute(key, value)
 
     if start.tool_call_id:
         span.set_attribute(_span_attr_tool_call_id, start.tool_call_id)

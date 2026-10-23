@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/grafana/agento11y/go/agento11y"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/opencode/sessiondb/sessiondbtest"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 )
 
 // recordingExporter captures every turn handed to it and can fail on demand,
@@ -190,6 +192,135 @@ func TestRunImportIsIdempotent(t *testing.T) {
 	for i := range forced.got {
 		if forced.got[i].Source.GenerationID() != first.got[i].Source.GenerationID() {
 			t.Fatalf("force changed the deterministic generation ID for turn %d", i)
+		}
+	}
+}
+
+// importTurns imports one session of the given turns into endpoint, through
+// ledger, or the ledger RunImport opens for it when ledger is nil.
+func importTurns(t *testing.T, endpoint string, ledger *Ledger, ids ...string) ImportResult {
+	t.Helper()
+	turns := make([]HistoricalGeneration, len(ids))
+	for i, id := range ids {
+		turns[i] = turn(id)
+	}
+	got, err := RunImport(context.Background(), ImportOptions{
+		Agent: AgentClaudeCode,
+		Importer: &stubImporter{
+			turns: func(context.Context, SessionPreview) iter.Seq2[HistoricalGeneration, error] {
+				return turnSeq(turns, nil)
+			},
+		},
+		Sessions: []SessionPreview{sessionAt("/a.jsonl")},
+		Target:   Target{Endpoint: endpoint},
+		Exporter: &recordingExporter{},
+		Ledger:   ledger,
+	})
+	if err != nil {
+		t.Fatalf("import into %s: %v", endpoint, err)
+	}
+	return got
+}
+
+// Regression: one ledger held every destination's turns, so a Grafana Cloud
+// import after a local one skipped every turn the local store already had.
+func TestRunImportKeepsALedgerPerDestination(t *testing.T) {
+	pinStateHome(t)
+	envconfig.PinAliasEnvBlank(t)
+	t.Setenv("AGENTO11Y_AUTH_TENANT_ID", "123")
+	steps := []struct {
+		name              string
+		endpoint          string
+		imported, skipped int
+	}{
+		{name: "into the local store", endpoint: "http://127.0.0.1:8765", imported: 2},
+		{name: "into Grafana Cloud after the local store", endpoint: "https://agento11y-prod.grafana.net", imported: 2},
+		{name: "into Grafana Cloud again", endpoint: "https://agento11y-prod.grafana.net", skipped: 2},
+		{name: "into the local store on another port", endpoint: "http://127.0.0.1:8768", skipped: 2},
+	}
+	for _, s := range steps {
+		got := importTurns(t, s.endpoint, nil, "t1", "t2")
+		if got.Imported != s.imported || got.Skipped != s.skipped {
+			t.Errorf("%s: %+v, want %d imported and %d skipped", s.name, got, s.imported, s.skipped)
+		}
+	}
+}
+
+func TestRunImportOpenCodeV2DestinationsAndPartialFailure(t *testing.T) {
+	pinStateHome(t)
+	db := sessiondbtest.New(t, sessiondbtest.WithoutV1(), sessiondbtest.WithSessionV2())
+	db.AddSessionV2("session", "Title", "/work", 1, 10)
+	for i, id := range []string{"first", "second"} {
+		db.AddV2Message(id, "session", "assistant", int64(i*3), 1, 2, `{"time":{"created":1,"completed":2}}`)
+	}
+	imp := &opencodeImporter{}
+	sessions, err := imp.Previews(context.Background(), db.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identities := map[string]string{}
+	for _, tc := range []struct {
+		name, endpoint            string
+		fail, force               bool
+		imported, skipped, failed int
+	}{
+		{name: "local partial failure", endpoint: "http://127.0.0.1:8765", fail: true, imported: 1, failed: 1},
+		{name: "local retry", endpoint: "http://127.0.0.1:8765", imported: 1, skipped: 1},
+		{name: "cloud independent", endpoint: "https://history.invalid", imported: 2},
+		{name: "cloud rerun", endpoint: "https://history.invalid", skipped: 2},
+		{name: "local rerun", endpoint: "http://127.0.0.1:8765", skipped: 2},
+		{name: "local force", endpoint: "http://127.0.0.1:8765", force: true, imported: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter := &recordingExporter{}
+			if tc.fail {
+				exporter.failOn = func(gen HistoricalGeneration) error {
+					if gen.Source.TurnID == "second" {
+						return errors.New("synthetic export failure")
+					}
+					return nil
+				}
+			}
+			result, err := RunImport(context.Background(), ImportOptions{Agent: AgentOpenCode, Importer: imp, Sessions: sessions, Exporter: exporter, Target: Target{Endpoint: tc.endpoint}, Force: tc.force})
+			if err != nil || result.Imported != tc.imported || result.Skipped != tc.skipped || result.Failed != tc.failed {
+				t.Fatalf("import = %+v, %v", result, err)
+			}
+			for _, gen := range exporter.got {
+				if previous := identities[gen.Source.TurnID]; previous != "" && previous != gen.Gen.ID {
+					t.Fatal("destination, retry or force changed the generation ID")
+				}
+				identities[gen.Source.TurnID] = gen.Gen.ID
+			}
+		})
+	}
+}
+
+// The ledger from before destinations does not say where its turns went, so
+// every destination starts from all of them. Sending them again would bill a
+// Grafana Cloud turn received more than about a day earlier a second time, and
+// would show a turn twice in the viewer when its session has since moved to
+// another conversation ID.
+func TestRunImportStartsEachDestinationFromTheLedgerBeforeDestinations(t *testing.T) {
+	pinStateHome(t)
+	envconfig.PinAliasEnvBlank(t)
+	t.Setenv("AGENTO11Y_AUTH_TENANT_ID", "123")
+	legacy := openTestLedger(t, legacyLedgerPath(AgentClaudeCode))
+	if got := importTurns(t, "https://agento11y-prod.grafana.net", legacy, "t1", "t2"); got.Imported != 2 {
+		t.Fatalf("filling the old ledger: %+v", got)
+	}
+	steps := []struct {
+		name              string
+		endpoint          string
+		imported, skipped int
+	}{
+		{name: "into Grafana Cloud after the upgrade", endpoint: "https://agento11y-prod.grafana.net", imported: 1, skipped: 2},
+		{name: "into Grafana Cloud again", endpoint: "https://agento11y-prod.grafana.net", skipped: 3},
+		{name: "into the local store after the upgrade", endpoint: "http://127.0.0.1:8765", imported: 1, skipped: 2},
+	}
+	for _, s := range steps {
+		got := importTurns(t, s.endpoint, nil, "t1", "t2", "t3")
+		if got.Imported != s.imported || got.Skipped != s.skipped {
+			t.Errorf("%s: %+v, want %d imported and %d skipped", s.name, got, s.imported, s.skipped)
 		}
 	}
 }

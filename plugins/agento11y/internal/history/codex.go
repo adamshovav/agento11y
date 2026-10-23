@@ -11,13 +11,13 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/grafana/agento11y/go/agento11y"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/codex/codexlog"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/codex/fragment"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/codex/mapper"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/codex/userid"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/redact"
 )
 
 func init() {
@@ -336,6 +336,14 @@ func (c *codexImporter) Turns(ctx context.Context, sess SessionPreview) iter.Seq
 			toolNames: map[string]string{},
 			yield:     yield,
 		}
+		if link != nil && link.ParentGenerationID != "" {
+			if parentPath, ok := c.findSessionPath(ctx, link.ParentSessionID); ok {
+				r.title = c.parentIndex(parentPath).title
+			}
+			if r.title == "" {
+				r.title = link.ParentSessionID
+			}
+		}
 		err := codexlog.ScanRecords(sess.SourcePath, codexlog.ImportScanOptions(), func(rec codexlog.Record) (bool, error) {
 			if err := ctx.Err(); err != nil {
 				return true, err
@@ -640,7 +648,7 @@ func (r *codexReplay) finalizeAndEmit(emit bool) bool {
 	gen.ID = src.GenerationID()
 	gen.ConversationTitle = r.title
 	if turn.reasoning {
-		gen.ThinkingEnabled = codexBoolPtr(true)
+		gen.ThinkingEnabled = new(true)
 	}
 	if gen.ResponseID == "" {
 		gen.ResponseID = turn.frag.TurnID
@@ -833,6 +841,7 @@ type codexSpawn struct {
 // otherwise scanned ten times.
 type codexParent struct {
 	spawns map[string]codexSpawn // by child session ID
+	title  string
 }
 
 func (c *codexImporter) parentIndex(path string) codexParent {
@@ -860,6 +869,7 @@ func codexScanParent(path string) codexParent {
 		segments      codexSegmenter
 		emitted       int
 		sessionID     string
+		title         string
 		open          = map[string]codexSpawn{} // spawn calls in the open segment
 		calls         = map[string]codexSpawn{} // spawn calls in closed segments
 		childByCallID = map[string]string{}
@@ -890,10 +900,24 @@ func codexScanParent(path string) codexParent {
 			if meta, ok := codexlog.ParseSessionMeta(rec.Payload); ok && meta.SessionID != "" {
 				sessionID = meta.SessionID
 			}
+		case "input_item":
+			if title == "" {
+				title = codexTitleFromText(codexInputText(rec.Payload))
+			}
+		case "event_msg":
+			if title == "" {
+				msg := codexlog.ParseEventMsg(rec.Payload)
+				if msg.Type == "user_message" {
+					title = codexTitleFromText(msg.Message)
+				}
+			}
 		case "response_item":
 			item, ok := codexlog.ParseResponseItem(rec.Payload)
 			if !ok {
 				break
+			}
+			if title == "" && item.Type == "message" && item.Role == "user" {
+				title = codexTitleFromText(codexlog.MessageText(item.Content))
 			}
 			callID := strings.TrimSpace(item.CallID)
 			switch {
@@ -922,7 +946,7 @@ func codexScanParent(path string) codexParent {
 	_, sourceID, _ := segments.current()
 	closeSegment(segments.flush(), sourceID)
 
-	parent := codexParent{spawns: map[string]codexSpawn{}}
+	parent := codexParent{spawns: map[string]codexSpawn{}, title: title}
 	for callID, childID := range childByCallID {
 		spawn, ok := calls[callID]
 		if !ok {
@@ -1053,17 +1077,14 @@ func appendText(existing, next string) string {
 }
 
 func codexTitleFromText(text string) string {
-	title := strings.Join(strings.Fields(text), " ")
-	if title == "" {
-		return ""
-	}
-	if len(title) > codexMaxTitleLen {
-		title = title[:codexMaxTitleLen]
-		for !utf8.ValidString(title) {
-			title = title[:len(title)-1]
-		}
-	}
-	return title
+	// Redacted before the cut, the way the Sanitizer redacts: it only ever sees
+	// the title already cut, and a secret the cut splits no longer matches its
+	// pattern. The prompt is redacted whole first, as its input is, so a secret
+	// across lines still matches. Then the collapsed text is redacted again,
+	// because it is what the Sanitizer sees: a separator a pattern does not
+	// take as space, such as \v after "Bearer", collapses into one it does.
+	title := strings.Join(strings.Fields(redact.New().Redact(text)), " ")
+	return redact.RedactTitle(title, codexMaxTitleLen)
 }
 
 func firstNonEmptyString(values ...string) string {
@@ -1074,5 +1095,3 @@ func firstNonEmptyString(values ...string) string {
 	}
 	return ""
 }
-
-func codexBoolPtr(v bool) *bool { return &v }

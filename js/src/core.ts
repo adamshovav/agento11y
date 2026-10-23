@@ -18,7 +18,7 @@ export {
   withConversationTitle,
   withUserId,
 } from './context.js';
-export { HookDeniedError } from './hooks.js';
+export { HookDeniedError, HookTransformError } from './hooks.js';
 export type { SecretRedactionOptions, SecretTextRedactionOptions } from './redaction.js';
 export { createSecretRedactionSanitizer, redactSecretText, redactSecretTextLightweight } from './redaction.js';
 export type {
@@ -74,6 +74,7 @@ export type {
   ToolCallPart,
   ToolDefinition,
   ToolExecution,
+  ToolExecutionKind,
   ToolExecutionRecorder,
   ToolExecutionResult,
   ToolExecutionStart,

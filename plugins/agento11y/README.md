@@ -4,7 +4,7 @@
   <img src="../../.github/img/agento11y.gif" alt="agento11y capturing a coding agent session" width="80%" />
 </p>
 
-Monitor the coding agents you already use — Cursor, Claude Code, Codex, Copilot CLI, OpenCode, Pi, Vibe, and others. Observe usage, cost, tokens, and tools across all of them in one place. Keep sessions on your machine with the local Agent Observability app, or send them to [Grafana Agent Observability](https://grafana.com/docs/grafana-cloud/machine-learning/agent-observability/).
+Monitor the coding agents you already use — Cursor, Claude Code, Codex, Copilot CLI, OpenCode, Pi, Vibe, experimental Kiro CLI, and others. Observe usage, cost, tokens, and tools across all of them in one place. Keep sessions on your machine with the local Agent Observability app, or send them to [Grafana Agent Observability](https://grafana.com/docs/grafana-cloud/machine-learning/agent-observability/).
 
 ## Quick start
 
@@ -39,7 +39,7 @@ mise use -g aqua:grafana/agento11y@latest
 
 Make sure [mise is activated in your shell](https://mise.jdx.dev/cli/activate.html) so `agento11y` is on your `PATH`.
 
-**Go install (Windows, or any platform with Go 1.25+):**
+**Go install (Windows, or any platform with Go 1.26.9+):**
 
 ```sh
 go install github.com/grafana/agento11y/plugins/agento11y/cmd/agento11y@latest
@@ -57,7 +57,7 @@ Verify with `agento11y --version`.
 
 Run `agento11y login` to configure capture. On first run it asks where sessions go: **Local only**, or **Grafana Cloud**. **Local only** needs no Cloud credentials and does not forward sessions. **Grafana Cloud** prints your stack's coding-agent setup page and asks you to paste the connection block from that page.
 
-Interactive Cloud setup on macOS and Linux also asks for **Local web UI** in the preferences. The question starts on **Yes** by default and remembers an earlier answer. **Yes** keeps a full local copy and forwards a copy to Grafana Cloud. **No** sends directly to Grafana Cloud without a local copy. Windows has no local receiver, so it does not show either local choice. Complete credential flags also skip the preferences and keep direct Cloud behavior.
+Interactive Cloud setup also asks for **Local web UI** in the preferences. The question starts on **Yes** by default and remembers an earlier answer. **Yes** keeps a full local copy and forwards a copy to Grafana Cloud. **No** sends directly to Grafana Cloud without a local copy. Complete credential flags also skip the preferences and keep direct Cloud behavior.
 
 Run `agento11y login` again to change the Cloud connection, local web UI, content capture, tags, or guard settings. With a complete saved Cloud connection, a rerun shows its Grafana stack first. **Keep this connection** jumps to preferences without changing the connection. **Change connection** opens the stack and credential questions. A rerun asks where sessions go only when neither a destination nor credentials are saved.
 
@@ -80,8 +80,15 @@ agento11y claude
 | [OpenCode](https://opencode.ai) | `agento11y opencode` |
 | [Pi](https://github.com/earendil-works/pi) | `agento11y pi` |
 | [Vibe](https://github.com/mistralai/vibe) | `agento11y vibe` |
+| [Kiro CLI 3 (experimental)](../kiro/README.md) | `agento11y kiro -- chat` |
 
 Cursor has no launcher. Run `agento11y cursor install` once, then start Cursor normally. Remove its hooks with `agento11y cursor uninstall`. See also [`cursor/README.md`](../cursor/README.md). Per-agent notes and glue live under [`plugins/`](../).
+
+Kiro capture is workspace-scoped and captures prompts and tools only; assistant text, model usage, and cost are unavailable. See the [Kiro limitations](../kiro/README.md#captured-data-and-limits).
+
+On Windows, `agento11y` starts the agent as a child process and exits with the agent's exit code. An agent installed with npm starts through a `.cmd` file, and `cmd.exe` cannot receive an argument that contains a line break. Pass a multiline prompt in a file or on stdin instead.
+
+`agento11y opencode` supports OpenCode 1.3.13 or a later 1.x release, and 2.0.22 or a later 2.x release. It reads `opencode --version` first and refuses any other release before it changes a file, prompts, or starts the local receiver. On OpenCode 2, it adds `--standalone` to sessions (the TUI, `run`, and `mini`), so the session's private server gets the launcher's settings instead of an already-running background service. See the [OpenCode README](../opencode/README.md#opencode-2) for details.
 
 ## Claude plugin evals
 
@@ -100,6 +107,29 @@ The command imports both baseline arms and reuses the saved Cloud/OTLP connectio
 See the [example and CI workflow](../../examples/experiments/claude-plugin-evals/)
 for build instructions, scoring details, and verification with `gcx`. This is a
 new command in this checkout, not a promise about older installed releases.
+
+## Harbor evaluations
+
+Install `agento11y-harbor` in the same Python environment as Harbor, and set
+your Grafana Cloud credentials as described in the
+[Harbor integration guide](../../python-frameworks/harbor/README.md#configure-grafana-cloud).
+`agento11y harbor` also uses the credentials that `agento11y login` saved.
+
+Run a normal Harbor evaluation and publish it while it runs:
+
+```sh
+agento11y harbor -- --dataset terminal-bench@2.0 --agent codex --model openai/gpt-5
+```
+
+Publish a job that already finished:
+
+```sh
+agento11y harbor export jobs/<job-name>
+```
+
+The live command adds Harbor's `agento11y` job plugin and passes every other
+argument to `harbor run`. The [Harbor integration guide](../../python-frameworks/harbor/README.md)
+covers export flags, experiment IDs, errors, retries, and the Python APIs.
 
 ## Skills
 
@@ -134,7 +164,7 @@ The skills for instrumenting your own application code are separate and ship wit
 
 `AGENTO11Y_LOCAL=true` in the shell or `config.env` enables local mode for every launch and installed hook. **Local only** writes `AGENTO11Y_LOCAL` and `SIGIL_LOCAL` as true, and writes `AGENTO11Y_LOCAL_FORWARD` and `SIGIL_LOCAL_FORWARD` as false. Sessions then stay on the machine. **Local web UI = Yes** writes all four keys as true, so the daemon keeps a full local copy and also forwards to Grafana Cloud. **Local web UI = No** writes all four keys as false and sends directly to Cloud. Use `--no-local` to override a saved local destination for one launcher session without changing those keys.
 
-The daemon always stores full session content locally. It forwards full generation content only when `AGENTO11Y_CONTENT_CAPTURE_MODE=full`. Every other selected capture mode is reduced to `metadata_only` for the forwarded copy. Local mode is available on macOS and Linux only; Windows has no local receiver.
+The daemon always stores full session content locally. It forwards full generation content only when `AGENTO11Y_CONTENT_CAPTURE_MODE=full`. Every other selected capture mode is reduced to `metadata_only` for the forwarded copy. Local mode is available on every supported platform.
 
 Manage the app with `agento11y local start|open|status|stop|restart`. `agento11y local open` starts the receiver if needed, prints its address, and tries to open the app.
 
@@ -225,12 +255,16 @@ Imported sessions are thinner than live capture — host logs omit fields that l
 - **opencode**: Reads `opencode*.db` under `$XDG_DATA_HOME/opencode` (default `~/.local/share/opencode`).
   `OPENCODE_DB` adds another database. Absolute values are used as-is. Relative values are resolved under the OpenCode data directory.
   History cannot recover the system prompt, host version, configured agent-name prefix, capture-time Git branch, time to first token, or separate tool spans.
-  An assistant message is imported when it has a completion timestamp or an error. Messages with neither are skipped.
-  OpenCode forks copy all messages before the fork point into a new session with new IDs. If you import both sessions, those copied assistant turns are imported twice.
+  Supports OpenCode v1 and released v2 databases, but not preview versions.
+  Databases with incomplete or unverified upgrades to v2 are skipped with a warning. Sessions OpenCode still marks as active are skipped, regardless of age.
+  Only completed or failed assistant turns are imported. For v2, input contains only new plain-text messages, not the full context sent to the model.
+  Compaction and title-generation costs are excluded, so imported costs can differ from OpenCode's totals.
+  A stored v2 message or accumulated input over 4 MiB stops importing that session with a warning.
+  Importing both a fork and its original session counts copied turns twice. Importing turns already captured live can also count them twice.
 
 Without `--since`, an import covers the last 90 days. Pass `--since 365d` (or a timestamp) to widen the window, and `--until` to bound the other end. Other useful flags: `--workspace`, `--max-sessions`, `--max-turns`, `--all`, `--yes`, `--force`. Without a terminal, pass `--all --yes` to import from a script.
 
-Re-running an import is safe: a per-agent ledger under `~/.local/state/agento11y/history/ledger/` skips turns already recorded. `--force` re-exports those turns under the same generation IDs.
+Re-running an import is safe: a ledger per agent and destination under `~/.local/state/agento11y/history/ledger/` skips turns that destination already has, so an import into Grafana Cloud after one into the local viewer still sends every turn. Turns imported before this ledger existed count as already sent to every destination. If you only ever imported them into the local viewer, run `agento11y history import <agent> --no-local --force` once, right after upgrading and before any other import into Grafana Cloud, with a `--since` that reaches back to your first import (a timestamp is safest). If you only ever imported them into Grafana Cloud, `--local --force` with that `--since` sends them to the viewer. `--force` re-exports every selected turn under the same generation IDs, and Grafana Cloud stores and counts a turn it received more than about a day earlier a second time, so do not repeat it into Cloud.
 
 ## Grafana Agent Observability
 
@@ -248,6 +282,21 @@ AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-<region>.grafana
 ```
 
 Find these values at `https://<your-grafana>.grafana.net/a/grafana-agento11y-app/setup-coding-agent`.
+
+### Experimental OTel generation export
+
+HTTP remains the default. To export generations as OpenTelemetry (OTel) spans, set these values in the environment or `~/.config/agento11y/config.env`:
+
+```dotenv
+AGENTO11Y_PROTOCOL=otel
+AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=true
+```
+
+Configure `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) and OTLP authentication. Use an endpoint that supports Agent Observability generation ingestion.
+
+OTel export supports Claude Code, Codex, Copilot, Cursor, Vibe, and Kiro. Local mode, history imports, and Claude plugin eval imports also support OTel. Pi and OpenCode live plugins still use HTTP.
+
+Guards, scores, and experiment APIs still need HTTP credentials.
 
 ### Content capture
 
@@ -349,7 +398,7 @@ agento11y opencode install --json
 agento11y pi install --json
 ```
 
-Each command prints one secret-free result with `installed`, `already_installed`, `missing_host`, or `error`. Copilot writes its shared user hook file and does not require the Copilot CLI on `PATH`; that file is also read by Copilot Chat in VS Code. OpenCode and pi require their respective CLI to be on the current user's `PATH`; `missing_host` is a successful deferral, so a later run can configure a host installed after the script.
+Each command prints one secret-free result with `installed`, `already_installed`, `missing_host`, or `error`. OpenCode reports `error` and changes nothing for a release outside 1.3.13 to 1.x or 2.0.22 to 2.x. Copilot writes its shared user hook file and does not require the Copilot CLI on `PATH`; that file is also read by Copilot Chat in VS Code. OpenCode and pi require their respective CLI to be on the current user's `PATH`; `missing_host` is a successful deferral, so a later run can configure a host installed after the script.
 
 Claude Code provides the same command as `agento11y claude install --json`.
 
@@ -365,9 +414,24 @@ agento11y agents reconcile --agents all --json
 
 ### Auto-update
 
-`agento11y claude`, `agento11y codex`, and `agento11y opencode` refresh the installed host plugin automatically. Set `AGENTO11Y_AUTO_UPDATE=false` to opt out.
+`agento11y claude`, `agento11y codex`, and `agento11y opencode` refresh the installed host plugin automatically. Set `AGENTO11Y_AUTO_UPDATE=false` to opt out. On OpenCode 2, `agento11y opencode` does not refresh the plugin, because `opencode plugin update` starts or contacts OpenCode's background service. Run `opencode plugin update @grafana/agento11y-opencode` yourself.
 
 `AGENTO11Y_AUTO_UPDATE` does not apply to the other launchers. `agento11y copilot` rewrites its own `agento11y.json` hooks file, and `agento11y vibe` re-upserts its three entries into vibe's `hooks.toml`, so both always point at the installed binary. `agento11y pi` leaves upgrades to pi's own installer.
+
+### Usage statistics
+
+Versioned builds of `agento11y` report statistics about their own use to Grafana: which subcommand ran (`doctor`, `skills show`), flag **names**, the agent, a skill name, outcome, exit code, duration, version, OS, architecture, whether the run was interactive or in CI, and a random per-installation ID. Local development builds do not send usage statistics. Each field is matched against a fixed list in the binary, so anything it does not recognise becomes `unknown`. Never argument or flag values, endpoints, tenant IDs, tokens, tags, user IDs, hostnames, file paths, or error messages. Hooks are never reported, so nothing is sent while a session runs.
+
+Captured sessions are a separate path: they go to your own stack or stay on your machine.
+
+Opt out with either of these, in the environment or in `config.env`. An unrecognised value also disables reporting.
+
+```sh
+AGENTO11Y_ANONYMOUS_USAGE_STATS=disabled
+DO_NOT_TRACK=1
+```
+
+`AGENTO11Y_ANONYMOUS_USAGE_STATS=log` prints the event to stderr and sends nothing. The ID is a random UUID at `$XDG_STATE_HOME/agento11y/install-id`; deleting it resets it.
 
 ## Troubleshooting
 
@@ -379,12 +443,14 @@ Run `agento11y doctor` first. It's a read-only diagnostic that reports both expo
 agento11y doctor
 ```
 
-The two pipelines are independent and fail independently:
+With default HTTP capture, conversations and analytics use separate pipelines. Experimental OTel generations share the trace route:
 
-- **Conversations** (the chat transcripts) export over `AGENTO11Y_ENDPOINT` + `AGENTO11Y_AUTH_TENANT_ID` + `AGENTO11Y_AUTH_TOKEN`. The token needs the `sigil:write` scope.
+- **Conversations** (the chat transcripts) use `AGENTO11Y_ENDPOINT` + `AGENTO11Y_AUTH_TENANT_ID` + `AGENTO11Y_AUTH_TOKEN` by default. The token needs `sigil:write`. With experimental OTel selected, Go producers use the configured OTLP trace route instead.
 - **Analytics** (the Agent Observability metrics and traces) export over `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`). The token needs `metrics:write` and `traces:write`.
 
-The common failure is conversations showing up while the analytics page stays empty: the OTLP endpoint is unset, or the token lacks the metrics/traces scopes. `agento11y doctor` flags that case explicitly and exits non-zero when a pipeline is broken.
+In OTel mode, doctor checks the selected transport, experimental opt-in, and trace route. A successful probe does not confirm storage in Agent Observability.
+
+With default HTTP capture, the common failure is conversations showing up while the analytics page stays empty: the OTLP endpoint is unset, or the token lacks the metrics/traces scopes. `agento11y doctor` flags that case explicitly and exits non-zero when a pipeline is broken.
 
 For onboarding checks and unattended rollout, require a complete healthy Cloud
 connection rather than accepting an unconfigured installation:

@@ -137,6 +137,7 @@ The coding-agent plugins (claude-code, codex, copilot, cursor, opencode, pi, vib
 | `git.branch` | Branch checked out in that directory, or a short commit SHA when HEAD is detached. Omitted outside a git checkout. | all launchers |
 | `subagent` | `"true"` on generations from a subagent run. Absent otherwise, never `"false"`. | claude-code, codex, cursor, opencode |
 | `pi.call_kind` | The host made this model call outside a user turn: `compaction` for context compaction, `branch_summary` for a tree-navigation summary. Absent on ordinary turns. | pi |
+| `opencode.call_kind` | `compaction` for a separate OpenCode 2 compaction generation. Absent on ordinary turns. | opencode v2 |
 
 Launchers also set a few keys specific to one host, so this table is not the full list of what arrives on a generation.
 
@@ -189,6 +190,40 @@ In Prometheus the tags arrive as `agento11y_tag_user`, `agento11y_tag_repo`, and
 
 Run `agento11y doctor` to see the enabled names, the variables that set them, and the value each one resolves to in the current directory before it leaves the machine. `doctor` runs outside a session, so it cannot read the account a host agent signs in to: with `AGENTO11Y_USER_ID` unset it reports `user` as `<depends on the agent>` rather than guessing. Set `AGENTO11Y_USER_ID` to see the exact value.
 
+### Local account identity sources
+
+Automatic user-tag precedence is: explicit `TAGS[user]`, explicit `USER_ID`, host account identity, operating-system username, then absent.
+Both `AGENTO11Y_*` variables and their legacy `SIGIL_*` aliases remain supported.
+`USER_ID` accepts arbitrary identifiers, including pseudonyms; it does not require an email address.
+An explicit `user` tag does not change conversation identity.
+The operating-system fallback supplies only the optional tag, never conversation identity.
+Disabling automatic tags does not disable account identity.
+
+| Plugin | Local source used | Limitation |
+| --- | --- | --- |
+| Claude Code | Account file selected for its config directory | Uses the selected file only; see selection rules below |
+| Codex | Existing `auth.json` email fields | No keyring or ephemeral-auth lookup |
+| Cursor | Saved session email, then current hook email | Uses the first nonblank email |
+| OpenCode | No account lookup | Credential resolution can refresh tokens; private database access is deferred |
+| Pi | No account lookup | Supported extension APIs do not expose passive effective-account email |
+| Copilot | No account lookup | Inspected account/status fields expose login, not email |
+| Vibe, Kiro | No account lookup | Available identity helpers can make network requests |
+| Hermes | No account lookup | Observer callbacks do not identify the selected account credential |
+
+Claude first checks `.config.json` in the selected config directory: `CLAUDE_CONFIG_DIR`, or `HOME/.claude` when unset.
+Only this legacy directory path uses Unicode Normalization Form C (NFC).
+Otherwise, Claude selects `.claude.json` under nonempty `CLAUDE_CONFIG_DIR`, or directly under `HOME`.
+A nonempty `CLAUDE_CODE_CUSTOM_OAUTH_URL` changes that second filename to `.claude-custom-oauth.json`; discovery never contacts the URL.
+An explicitly empty config directory checks `.config.json` in the working directory before the home candidate.
+Relative config directories resolve from the working directory, matching Claude's selection behavior.
+A selected file that cannot supply identity does not trigger a search of another account file.
+Claude's `AGENTO11Y_USER_ID_SOURCE=accountUuid` selects the account UUID instead of email.
+
+Discovery makes no provider requests, refreshes no credentials, and runs no host account commands.
+Plugins do not infer email from usernames, account IDs, Git authors, or another tool's login.
+Different account emails remain different users. Set the same explicit `AGENTO11Y_USER_ID` across plugins to unify attribution.
+History imports do not add automatic tags.
+
 ### Cardinality and personal data
 
 Enabling these names is a deliberate trade. Read this first:
@@ -214,6 +249,13 @@ Codex and copilot also add their own `codex.*` and `copilot.*` keys, so this tab
 | `pi.compaction.will_retry` | `true` when pi retries the turn it aborted to run this compaction. Only overflow recovery retries. | pi |
 | `pi.fork.parent_session_id` | Conversation id of the session a fork was taken from. On the fork's first generation only. | pi |
 | `pi.fork.parent_generation_id` | Generation id of the trunk turn the fork continues from. Ships as metadata rather than a parent edge, because the trunk only holds that generation if it ran instrumented. | pi |
+| `opencode.usage_scope` | `logical_compaction` on OpenCode 2 compaction generations. Usage and cost total all attempts within that compaction, not one provider call. Missing usage stays absent. | opencode v2 |
+| `opencode.compaction.reason` | `manual` or `auto`, as OpenCode reports it. Overflow recovery also reports `auto`. | opencode v2 |
+| `opencode.model_source` | `event` when the compaction terminal names a model; `unavailable` otherwise, with model and provider `unknown`. Failed events name no model. | opencode v2 |
+| `opencode.input_source` | `first_observed_prefix` for turns and compactions with an observed start; `unavailable` for compactions without one. Input is observed history, not the final provider request. | opencode v2 |
+| `opencode.settlement` | Terminal event or lifecycle outcome that ended the generation. Compactions use only `compaction.ended` or `compaction.failed`. | opencode v2 |
+| `opencode.start_time_approximate` | `true` on compactions without an observed start, whose start time equals completion time. `false` when the start was observed. | opencode v2 |
+| `opencode.completion_time_approximate` | `true` on compactions, which use terminal-event time. For turns, `false` when stream-completion time was observed, otherwise `true`. | opencode v2 |
 | `opencode.parent_session_id` | Session id of the run that spawned this subagent session. On every subagent generation, including one whose parent turn could not be named. | opencode |
 | `opencode.child_session_id` | Subagent's own session id. Present when its turns were reparented onto the spawning conversation, where `conversation_id` names the root session of the subagent chain instead. | opencode |
 

@@ -1,10 +1,11 @@
-import type {
-  ContentCaptureMode,
-  GenerationResult,
-  GenerationStart,
-  Message,
-  TokenUsage,
-  ToolDefinition,
+import {
+  type ContentCaptureMode,
+  type GenerationResult,
+  type GenerationStart,
+  type Message,
+  redactSecretTextLightweight,
+  type TokenUsage,
+  type ToolDefinition,
 } from "@grafana/agento11y";
 
 // includesToolBodies decides whether tool argument JSON, tool result content,
@@ -65,6 +66,7 @@ export interface PiAssistantMessage {
   usage: {
     input: number;
     output: number;
+    reasoning?: number;
     cacheRead: number;
     cacheWrite: number;
     totalTokens: number;
@@ -133,12 +135,45 @@ export interface ToolTiming {
  */
 export const MAX_TITLE_LEN = 100;
 
-function clipTitle(value: string): string {
-  const trimmed = value.trim();
-  const codepoints = Array.from(trimmed);
-  return codepoints.length > MAX_TITLE_LEN
-    ? codepoints.slice(0, MAX_TITLE_LEN).join("")
-    : trimmed;
+// A whole redaction marker, as the SDK's redactor writes one.
+const REDACTION_MARKER = /\[REDACTED:[a-z0-9-]+\]/g;
+
+/**
+ * Clip a redacted title to MAX_TITLE_LEN code points. A clip that would split a
+ * redaction marker cuts before the marker instead, so the title never ends in
+ * a partial `[REDACTED:...`.
+ */
+function clipTitle(redacted: string): string {
+  const codepoints = Array.from(redacted);
+  if (codepoints.length <= MAX_TITLE_LEN) return redacted;
+  const cut = codepoints.slice(0, MAX_TITLE_LEN).join("").length;
+  for (const marker of redacted.matchAll(REDACTION_MARKER)) {
+    const start = marker.index;
+    if (start >= cut) break;
+    if (start + marker[0].length > cut) {
+      return redacted.slice(0, start).trimEnd();
+    }
+  }
+  return redacted.slice(0, cut);
+}
+
+let lastTitleSource: string | undefined;
+let lastTitle = "";
+
+/**
+ * Redact a title source and clip it. Redaction runs first, with the redaction
+ * the SDK's generation sanitizer applies to `conversationTitle`: a secret the
+ * clip splits no longer matches its pattern, so the sanitizer's own pass over
+ * the clipped title would leave its first part in the export.
+ *
+ * The title is resolved on every turn from the same first prompt, which can be
+ * a large paste, so the last result is kept.
+ */
+function titleFrom(value: string): string {
+  if (value === lastTitleSource) return lastTitle;
+  lastTitleSource = value;
+  lastTitle = clipTitle(redactSecretTextLightweight(value).trim());
+  return lastTitle;
 }
 
 /** Inputs for {@link resolveConversationTitle}. */
@@ -163,18 +198,18 @@ export interface ResolveConversationTitleOptions {
  * name is metadata rather than content, so it survives. Falls back to the
  * session id when nothing else is available.
  *
- * The returned title is not redacted here: the SDK's generation sanitizer
- * runs `redactLightweight` over `conversationTitle` on export.
+ * The returned title is redacted before it is clipped; see titleFrom. The
+ * SDK's generation sanitizer runs `redactLightweight` over it again on export.
  */
 export function resolveConversationTitle(
   opts: ResolveConversationTitleOptions,
 ): string | undefined {
   const name = opts.sessionName?.trim();
-  if (name) return clipTitle(name);
+  if (name) return titleFrom(name);
 
   if (opts.contentCapture !== "metadata_only") {
     const derived = opts.firstUserText?.trim();
-    if (derived) return clipTitle(derived);
+    if (derived) return titleFrom(derived);
   }
 
   return opts.conversationId;
@@ -334,6 +369,7 @@ export function mapGenerationResult(
 export interface PiUsageLike {
   input?: number;
   output?: number;
+  reasoning?: number;
   cacheRead?: number;
   cacheWrite?: number;
   totalTokens?: number;
@@ -344,8 +380,8 @@ export interface PiUsageLike {
  * Map pi usage to the SDK's `TokenUsage`. Shared by the turn path and the
  * summary path so the two cannot drift.
  *
- * The field set is narrower than pi's `Usage`. `reasoning` and `cacheWrite1h`
- * are not forwarded, and `totalTokens` is passed through as pi computes it
+ * The field set is narrower than pi's `Usage`. `cacheWrite1h` is not
+ * forwarded, and `totalTokens` is passed through as pi computes it
  * (`input + output + cacheRead + cacheWrite`) instead of being recomputed to
  * the Go launchers' `input + output`. Either change would move existing golden
  * fixtures, so both stay as they are.
@@ -357,6 +393,9 @@ export function mapPiUsage(usage: PiUsageLike): TokenUsage {
     totalTokens: usage.totalTokens ?? 0,
     cacheReadInputTokens: usage.cacheRead ?? 0,
     cacheWriteInputTokens: usage.cacheWrite ?? 0,
+    ...(usage.reasoning !== undefined
+      ? { reasoningTokens: usage.reasoning }
+      : {}),
   };
 }
 
@@ -364,6 +403,7 @@ export function mapPiUsage(usage: PiUsageLike): TokenUsage {
 export const PI_USAGE_TOKEN_FIELDS = [
   "input",
   "output",
+  "reasoning",
   "cacheRead",
   "cacheWrite",
   "totalTokens",

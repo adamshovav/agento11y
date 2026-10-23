@@ -26,6 +26,7 @@ import (
 	"github.com/grafana/agento11y/go/proto/agento11y/wire"
 
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/localhealth"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/otel"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/timeutil"
 )
@@ -65,22 +66,40 @@ type ClientOptions struct {
 	// non-empty. Each agent passes its own token via useragent.For; empty
 	// leaves the SDK default in place.
 	UserAgent string
+	// An empty UserID preserves the SDK's environment default.
+	UserID string
 	// Tags are client tags: merged into every generation and emitted as
 	// `agento11y.tag.<key>` on spans and metrics. Adapters pass the values
 	// autotag.FromEnv resolved for AGENTO11Y_AUTO_CODING_AGENT_TAGS. Keys set in
 	// AGENTO11Y_TAGS must not appear here: the SDK lets caller tags win over
 	// env tags, and the explicit tag is the one the user asked for.
 	Tags map[string]string
+	// Auth overrides generation-export auth; an empty mode defaults to basic
+	// with a user and token, tenant with a tenant ID, otherwise none.
+	Auth agento11y.AuthConfig
 }
 
-// exportConfig builds the shared HTTP/basic-auth generation export config.
+// exportConfig builds the shared HTTP generation export config.
 // A non-empty userAgent sets the export User-Agent header (each agent passes
 // its own token via useragent.For); empty leaves the SDK default in place.
-func exportConfig(userAgent string) agento11y.GenerationExportConfig {
+func exportConfig(userAgent string, auth agento11y.AuthConfig) agento11y.GenerationExportConfig {
+	if auth.Mode == "" {
+		hasTenant := strings.TrimSpace(auth.TenantID) != "" || envconfig.Getenv("AUTH_TENANT_ID") != ""
+		hasUser := strings.TrimSpace(auth.BasicUser) != "" || hasTenant
+		hasToken := strings.TrimSpace(auth.BasicPassword) != "" || envconfig.Getenv("AUTH_TOKEN") != ""
+		switch {
+		case hasUser && hasToken:
+			auth.Mode = agento11y.ExportAuthModeBasic
+		case hasTenant:
+			auth.Mode = agento11y.ExportAuthModeTenant
+		default:
+			auth.Mode = agento11y.ExportAuthModeNone
+		}
+	}
 	export := agento11y.GenerationExportConfig{
 		Protocol: agento11y.GenerationExportProtocolHTTP,
 		Endpoint: ExportEndpoint(),
-		Auth:     agento11y.AuthConfig{Mode: agento11y.ExportAuthModeBasic},
+		Auth:     auth,
 	}
 	if userAgent != "" {
 		export.Headers = map[string]string{"User-Agent": userAgent}
@@ -88,20 +107,47 @@ func exportConfig(userAgent string) agento11y.GenerationExportConfig {
 	return export
 }
 
-// NewClient builds an agento11y client with the shared HTTP/basic-auth generation
-// export defaults and optional OTel providers.
-func NewClient(opts ClientOptions) *agento11y.Client {
+func ConfigureGenerationTransport(cfg *agento11y.Config, providers *otel.Providers, protocol agento11y.GenerationExportProtocol) error {
+	cfg.GenerationExport.Protocol = protocol
+	if protocol != agento11y.GenerationExportProtocolOTel {
+		return nil
+	}
+	if providers == nil || providers.GenerationTracerProvider() == nil {
+		return errors.New("OTel generation export requires a configured generation tracer provider")
+	}
+	if endpoint := providers.GenerationEndpoint(); localhealth.IsDaemonEndpoint(endpoint) {
+		if err := localhealth.RequireGenerationIngest(context.Background(), endpoint); err != nil {
+			return err
+		}
+	}
+	cfg.GenerationExport.Auth.Mode = agento11y.ExportAuthModeNone
+	cfg.EnableExperimentalFeatures = new(true)
+	cfg.TracerProvider = providers.GenerationTracerProvider()
+	cfg.MeterProvider = providers.MeterProvider()
+	cfg.Flusher = providers.GenerationFlusher()
+	return nil
+}
+
+func NewClient(opts ClientOptions) (*agento11y.Client, error) {
+	protocol, err := envconfig.ResolveGenerationTransport()
+	if err != nil {
+		return nil, err
+	}
 	c := agento11y.Config{
 		ContentCapture:   opts.ContentCapture,
 		Logger:           opts.Logger,
-		GenerationExport: exportConfig(opts.UserAgent),
+		GenerationExport: exportConfig(opts.UserAgent, opts.Auth),
 		Tags:             opts.Tags,
+		UserID:           opts.UserID,
 	}
 	if opts.Providers != nil {
 		c.Tracer = opts.Providers.Tracer(opts.InstrumentationName)
 		c.Meter = opts.Providers.Meter(opts.InstrumentationName)
 	}
-	return agento11y.NewClient(c)
+	if err := ConfigureGenerationTransport(&c, opts.Providers, protocol); err != nil {
+		return nil, err
+	}
+	return agento11y.NewClient(c), nil
 }
 
 // SetupOTel builds OTel providers when an OTLP endpoint is configured

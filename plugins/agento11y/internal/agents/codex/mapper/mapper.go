@@ -32,6 +32,7 @@ const (
 type Inputs struct {
 	Fragment       *fragment.Fragment
 	SubagentLink   *fragment.SubagentLink
+	ParentTitle    string
 	TokenSnapshot  *codexlog.TokenSnapshot
 	ContentCapture agento11y.ContentCaptureMode
 	// AgentName overrides the exported agent identity. Blank means "codex".
@@ -92,16 +93,24 @@ func Map(in Inputs) Mapped {
 		tags["hook.source"] = frag.Source
 	}
 	tags["codex.stop_hook_active"] = strconv.FormatBool(frag.StopHookActive)
+	conversationID, agentName, parentIDs, metadata := linkFields(frag, in.SubagentLink, tags, in.agent())
+	title := conversationTitle(frag, conversationID)
+	if len(parentIDs) > 0 {
+		title = strings.TrimSpace(in.ParentTitle)
+		if title == "" {
+			title = conversationID
+		}
+	}
 
 	tools := buildToolDefinitions(frag.Tools)
 	input, output := buildMessages(frag, payloadMode, in.RawContent, in.SkipPromptRedaction)
-	conversationID, agentName, parentIDs, metadata := linkFields(frag, in.SubagentLink, tags, in.agent())
 	usage, metadata := usageFields(in.TokenSnapshot, metadata)
 
 	uid := strings.TrimSpace(in.UserID)
 	start := agento11y.GenerationStart{
 		ID:                  id,
 		ConversationID:      conversationID,
+		ConversationTitle:   title,
 		UserID:              uid,
 		AgentName:           agentName,
 		Mode:                agento11y.GenerationModeSync,
@@ -117,6 +126,7 @@ func Map(in Inputs) Mapped {
 	gen := agento11y.Generation{
 		ID:                  id,
 		ConversationID:      conversationID,
+		ConversationTitle:   title,
 		UserID:              uid,
 		AgentName:           agentName,
 		Mode:                agento11y.GenerationModeSync,
@@ -144,6 +154,18 @@ func (in Inputs) agent() string {
 		return n
 	}
 	return AgentName
+}
+
+func conversationTitle(frag *fragment.Fragment, conversationID string) string {
+	if frag != nil {
+		if t := strings.TrimSpace(frag.ConversationTitle); t != "" {
+			return t
+		}
+		if t := fragment.SessionTitle(frag.Prompt); t != "" {
+			return t
+		}
+	}
+	return conversationID
 }
 
 // linkFields names the agent and resolves the conversation edges for one turn.

@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh"
+	"github.com/grafana/agento11y/go/agento11y"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/cli"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/clihelp"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/dotenv"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/history"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/local"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/localhealth"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/login"
 	"golang.org/x/term"
 )
@@ -104,6 +106,16 @@ var historyEnsureLocal = func(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return status.Endpoint, nil
+}
+
+// historyNewExporter builds the exporter for an import. It is a package var so
+// tests can run an import into Grafana Cloud without a network.
+var historyNewExporter = func(ctx context.Context, target history.Target, logger *log.Logger) (history.TurnExporter, func(context.Context) error, error) {
+	exporter, cleanup, err := history.NewTargetExporter(ctx, target, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	return exporter, cleanup, nil
 }
 
 // historySelect and historyConfirm are package vars so tests can drive the
@@ -294,7 +306,12 @@ func historyResolveDestination(ctx context.Context, opts *historyImportOptions, 
 		opts.LocalEnvKey = envLocal.key
 		return nil
 	}
-	if historyDestinationConfigured() || !interactive {
+	protocol, err := envconfig.ResolveGenerationTransport()
+	if err != nil {
+		return err
+	}
+	// The HTTP setup flow asks for an API token that OTel does not need.
+	if protocol == agento11y.GenerationExportProtocolOTel || historyDestinationConfigured() || !interactive {
 		return nil
 	}
 
@@ -321,9 +338,12 @@ func historyResolveDestination(ctx context.Context, opts *historyImportOptions, 
 }
 
 // historyDestinationConfigured reports whether first-run setup has anything to
-// ask. Cloud needs complete credentials, while a loopback endpoint needs none.
+// ask. OTel needs Cloud ledger identity but not an HTTP API token.
 func historyDestinationConfigured() bool {
-	return dotenv.HasCredentials() || envconfig.IsLocalEndpoint(envconfig.Getenv("ENDPOINT"))
+	if protocol, err := envconfig.ResolveGenerationTransport(); err == nil && protocol == agento11y.GenerationExportProtocolOTel {
+		return history.Target{}.Local() || (envconfig.Getenv("ENDPOINT") != "" && envconfig.Getenv("AUTH_TENANT_ID") != "")
+	}
+	return dotenv.HasCredentials() || history.Target{}.Local()
 }
 
 func historyImport(opts historyImportOptions, interactive bool, stdout, stderr io.Writer) error {
@@ -338,7 +358,8 @@ func historyImport(opts historyImportOptions, interactive bool, stdout, stderr i
 		localValue, localKey, _ = envconfig.LookupMap(fileEnv, "LOCAL")
 	}
 	envLocal := localEnvRequest{on: envconfig.ParseBool(localValue), key: localKey}
-	logger := cli.InitLogger("history")
+	logger, closeLog := cli.InitLogger("history")
+	defer closeLog()
 
 	filter := history.NewFilter()
 	filter.Since = opts.Since
@@ -398,7 +419,7 @@ func historyImport(opts historyImportOptions, interactive bool, stdout, stderr i
 	if err != nil {
 		return err
 	}
-	exporter, cleanup, err := history.NewTargetExporter(ctx, target, logger)
+	exporter, cleanup, err := historyNewExporter(ctx, target, logger)
 	if err != nil {
 		return err
 	}
@@ -444,10 +465,13 @@ func historyImport(opts historyImportOptions, interactive bool, stdout, stderr i
 		// exit status. The ledger holds those failures for a rerun to retry.
 		return fmt.Errorf("%d turns failed to export; rerun to retry them", result.Failed)
 	}
-	// A completed import answers the viewer's one-time offer, whether it
-	// exported turns or found them all already imported.
-	if err := history.MarkPrompt(opts.Agent, history.PromptImported); err != nil {
-		logger.Printf("record import prompt state: %v", err)
+	// A completed import into the local store answers the viewer's one-time
+	// offer, whether it exported turns or found them all already imported.
+	// One into Grafana Cloud does not: the viewer still lacks those sessions.
+	if target.Local() {
+		if err := history.MarkPrompt(opts.Agent, history.PromptImported); err != nil {
+			logger.Printf("record import prompt state: %v", err)
+		}
 	}
 	return nil
 }
@@ -464,7 +488,8 @@ func historyImportAuto(opts historyImportOptions, interactive bool, stdout, stde
 		localValue, localKey, _ = envconfig.LookupMap(fileEnv, "LOCAL")
 	}
 	envLocal := localEnvRequest{on: envconfig.ParseBool(localValue), key: localKey}
-	logger := cli.InitLogger("history")
+	logger, closeLog := cli.InitLogger("history")
+	defer closeLog()
 
 	filter := history.NewFilter()
 	filter.Since = opts.Since
@@ -524,7 +549,7 @@ func historyImportAuto(opts historyImportOptions, interactive bool, stdout, stde
 	if err != nil {
 		return err
 	}
-	exporter, cleanup, err := history.NewTargetExporter(ctx, target, logger)
+	exporter, cleanup, err := historyNewExporter(ctx, target, logger)
 	if err != nil {
 		return err
 	}
@@ -561,9 +586,10 @@ func historyImportAuto(opts historyImportOptions, interactive bool, stdout, stde
 		for _, warning := range result.Warnings {
 			_, _ = fmt.Fprintf(stderr, "agento11y: warning: %s\n", warning)
 		}
-		// Match the single-agent path: a partial import leaves the viewer's
-		// one-time offer available so the user can retry the failed turns.
-		if result.Failed == 0 {
+		// Match the single-agent path: only a complete import into the local
+		// store answers the viewer's one-time offer, so a partial one leaves
+		// it for a retry and one into Grafana Cloud leaves it for the viewer.
+		if result.Failed == 0 && target.Local() {
 			if err := history.MarkPrompt(plan.Agent, history.PromptImported); err != nil {
 				logger.Printf("record import prompt state: %v", err)
 			}
@@ -611,13 +637,11 @@ func historyProgress(stderr io.Writer) (func(history.Progress), func()) {
 		}
 }
 
-// historyTarget builds the export destination from the resolved Local value.
-// A Cloud import leaves the target empty so [history.NewTargetExporter] reads
-// the configured endpoint. A local import points at the daemon, where the
-// exporter enables full content and adds the marker that prevents forwarding.
+// Freeze the destination before exporter construction so the ledger uses
+// the same identity even if the environment changes during setup.
 func historyTarget(ctx context.Context, opts historyImportOptions) (history.Target, error) {
 	if !opts.Local {
-		return history.Target{}, nil
+		return history.ResolveTarget(history.Target{}, nil)
 	}
 	startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -628,10 +652,19 @@ func historyTarget(ctx context.Context, opts historyImportOptions) (history.Targ
 		}
 		return history.Target{}, fmt.Errorf("start the local receiver: %w", err)
 	}
-	return history.Target{
+	target, err := history.ResolveTarget(history.Target{
 		Endpoint:     endpoint,
 		OTLPEndpoint: endpoint + "/otlp",
-	}, nil
+	}, nil)
+	if err != nil {
+		return history.Target{}, err
+	}
+	if target.Protocol == agento11y.GenerationExportProtocolOTel {
+		if err := localhealth.RequireGenerationIngest(startCtx, target.OTLPEndpoint); err != nil {
+			return history.Target{}, err
+		}
+	}
+	return target, nil
 }
 
 func printHistoryPlan(stdout io.Writer, opts historyImportOptions, plan history.ImportPlan) {

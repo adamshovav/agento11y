@@ -6,9 +6,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/grafana/agento11y/plugins/agento11y/internal/fragmentstore"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/redact"
 )
 
 const DefaultStaleAge = 24 * time.Hour
@@ -27,13 +29,35 @@ type ToolRecord struct {
 }
 
 type Session struct {
-	SessionID      string `json:"sessionId"`
-	Cwd            string `json:"cwd,omitempty"`
-	Source         string `json:"source,omitempty"`
-	Model          string `json:"model,omitempty"`
-	TranscriptPath string `json:"transcriptPath,omitempty"`
-	StartedAt      string `json:"startedAt,omitempty"`
-	LastEventAt    string `json:"lastEventAt,omitempty"`
+	SessionID         string `json:"sessionId"`
+	Cwd               string `json:"cwd,omitempty"`
+	Source            string `json:"source,omitempty"`
+	Model             string `json:"model,omitempty"`
+	TranscriptPath    string `json:"transcriptPath,omitempty"`
+	ConversationTitle string `json:"conversationTitle,omitempty"`
+	StartedAt         string `json:"startedAt,omitempty"`
+	LastEventAt       string `json:"lastEventAt,omitempty"`
+}
+
+// MaxTitleLen caps a conversation title in bytes, matching the history importer.
+const MaxTitleLen = 100
+
+// Bound redaction work in the blocking userPromptSubmit hook, as Cursor does.
+// shortcut: secrets longer than 64 KiB may be split; history redacts the full prompt.
+const titleRedactBytes = 64 << 10
+
+// SessionTitle redacts a prompt, collapses whitespace, and cuts its title.
+func SessionTitle(prompt string) string {
+	head := strings.TrimSpace(prompt)
+	if len(head) > titleRedactBytes {
+		head = redact.CutTitle(head, titleRedactBytes)
+	}
+	if head == "" {
+		return ""
+	}
+	redacted := redact.New().Redact(head)
+	collapsed := strings.Join(strings.Fields(redacted), " ")
+	return redact.RedactTitle(collapsed, MaxTitleLen)
 }
 
 type SubagentLink struct {
@@ -56,6 +80,7 @@ type Fragment struct {
 	Source               string       `json:"source,omitempty"`
 	Model                string       `json:"model,omitempty"`
 	Prompt               string       `json:"prompt,omitempty"`
+	ConversationTitle    string       `json:"conversationTitle,omitempty"`
 	TranscriptPath       string       `json:"transcriptPath,omitempty"`
 	LastAssistantMessage string       `json:"lastAssistantMessage,omitempty"`
 	Tools                []ToolRecord `json:"tools,omitempty"`

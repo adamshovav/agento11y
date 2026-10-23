@@ -4,7 +4,7 @@ Notes for contributors working in this repo.
 
 ## Hermes plugin
 
-[`plugins/hermes`](../plugins/hermes/README.md) is an independent Python package. There is no release-table registration or publishing workflow. Install in Hermes's Python environment, not through the shared launcher.
+[`plugins/hermes`](../plugins/hermes/README.md) is the Python distribution `agento11y-hermes`, with module `agento11y_hermes`. Install it in Hermes's Python environment, not through the shared launcher.
 
 Run these tasks from the repository root:
 
@@ -16,9 +16,31 @@ mise run test:py:plugin-hermes
 mise run build:py:plugin-hermes
 ```
 
-The build task validates the wheel and source distribution, including package identity, version, dependencies, and entry point. Root `mise run check` includes artifact validation. CI tests Python 3.11, 3.12, 3.13, and 3.14 with branch coverage enabled and a 99% minimum. Keep the plugin's `uv.lock` synchronized with dependencies.
+The build task validates the wheel and source distribution, including package identity, version, dependencies, entry point, and the full Apache license. Root `mise run check` includes artifact validation. CI tests Python 3.11, 3.12, 3.13, and 3.14 with branch coverage enabled and a 99% minimum. Keep the plugin's `uv.lock` synchronized with dependencies.
 
 Tests must run without inherited Cloud/provider credentials or personal configuration. Real-Hermes tests are optional and separate from the normal checks. Read the [e2e skill](../plugins/hermes/.agents/skills/e2e-test/SKILL.md) and inspect scripts before running them. Use an explicit loopback model provider. Route both telemetry channels to loopback receivers, or disable unused channels. A local OTLP sink alone does not prevent paid model calls.
+
+### Hermes releases
+
+Hermes releases through `python-sdks-publish.yml`, either with the Python SDK packages or on its own. The workflow bumps Hermes from its own version. `mise run sdk:py:bump <VERSION>` instead sets all Python packages to a specified version. New sections of `python/CHANGELOG.md` record core SDK changes only; the separate `plugins/hermes/v0.11.0` tag remains historical. Hermes keeps its own `CHANGELOG.md` for older releases.
+
+When Hermes is selected, the release workflow builds and checks its wheel and source distribution, then publishes them from the Python dependents job. The Hermes dependency allows the last released core SDK because the new core SDK is not available on PyPI when the release artifacts are built.
+
+Before the first release from this workflow, a PyPI owner must configure a [Trusted Publisher](https://docs.pypi.org/trusted-publishers/adding-a-publisher/) for `agento11y-hermes` with owner `grafana`, repository `agento11y`, workflow filename `python-sdks-publish.yml`, and environment `pypi`. The failed `0.11.0` publish used `hermes-publish.yml`; changing the workflow does not configure PyPI. Confirm the GitHub `pypi` environment permits the SDK release workflow. These are administrative changes, not effects of merging repository files.
+
+Run **Publish Python SDKs to PyPI** on `main`. The workflow previews by default. Select `all` to bump each package from its own version, build and publish them together, and open a version PR. To release one package, select its distribution name. The workflow bumps and builds only that package, publishes only its artifacts, and opens a PR for its changed files.
+
+Core-only and `all` releases update `python/CHANGELOG.md` with core changes; merging their PRs creates an `sdk-python/v*` tag for the new core version. Dependent-only releases do not change this changelog or create an SDK tag. Disable `dry-run` only when ready to publish; this workflow publishes before the release PR merges. Do not use `all` to retry one failed publication. PyPI rejects filenames that the first run already uploaded.
+
+Verify the PyPI artifacts and installation in Hermes's environment. Uninstall the old `grafana-agento11y-hermes` distribution first; pip does not treat the new project name as an upgrade. Keep the old project and its releases. Remove its old Trusted Publisher after verifying the replacement release.
+
+To retain locally validated upload artifacts, pass an empty output directory:
+
+```sh
+bash plugins/hermes/scripts/run-check.sh build --expected-version 0.18.0 --output-dir /tmp/hermes-dist
+```
+
+The checker includes the full `plugins/hermes/LICENSE` in both artifacts and validates a wheel rebuilt from the sdist. Keep that license identical to the repository-root `LICENSE`.
 
 ## Regenerating protobuf stubs
 

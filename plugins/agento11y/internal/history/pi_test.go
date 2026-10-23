@@ -164,7 +164,7 @@ func TestPiRootsResolveFromTheAgentDir(t *testing.T) {
 	}
 
 	t.Setenv("PI_CODING_AGENT_DIR", "")
-	t.Setenv("HOME", "/home/tester")
+	setHomeDir(t, "/home/tester")
 	want := []string{filepath.Join("/home/tester", ".pi", "agent", "sessions")}
 	if got := imp.Roots(); !slices.Equal(got, want) {
 		t.Fatalf("Roots() = %v, want the home fallback %v", got, want)
@@ -469,7 +469,7 @@ func TestPiTurnsMapOneGenerationPerAssistantEntry(t *testing.T) {
 		t.Fatalf("Usage = %+v, want the mapPiUsage mapping", usage)
 	}
 	if usage.ReasoningTokens != 0 {
-		t.Fatalf("ReasoningTokens = %d, want 0: live does not forward reasoning", usage.ReasoningTokens)
+		t.Fatalf("ReasoningTokens = %d, want 0: the entry omits reasoning", usage.ReasoningTokens)
 	}
 	if got := first.Gen.Metadata["cost_usd"]; got != 0.006 {
 		t.Fatalf("metadata cost_usd = %v, want 0.006", got)
@@ -965,7 +965,10 @@ func TestPiTurnsStopWhenTheConsumerStops(t *testing.T) {
 
 	imp := piImporterAt(root)
 	seen := 0
-	for range imp.Turns(context.Background(), piPreview(t, imp, path)) {
+	for _, err := range imp.Turns(context.Background(), piPreview(t, imp, path)) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		seen++
 		if seen == 3 {
 			break
