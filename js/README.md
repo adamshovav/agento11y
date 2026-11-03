@@ -122,7 +122,7 @@ const client = new Agento11yClient({
 });
 ```
 
-The resolver receives the recording's metadata (or `undefined` for recording types that have no metadata, like tool executions). Thrown errors are caught and treated as `"metadata_only"` (fail-closed).
+The resolver receives the recording's metadata (or `undefined` for recording types that have no metadata, like tool executions). When a framework chain or retriever span ends with an error, it also calls the resolver with that run's metadata, to decide whether the error text is shown. Thrown errors are caught and treated as `"metadata_only"` (fail-closed).
 
 Resolution precedence (highest to lowest):
 
@@ -138,6 +138,14 @@ User-provided `metadata` and `tags` are not stripped by any capture mode. SDK-in
 
 Use `generationSanitizer` when you want to redact substrings from normalized generations before
 validation, span sync, debug snapshots, and export.
+
+Tool execution spans show the same conversation title, tool arguments, result, and error, so the
+SDK runs the sanitizer over them too. It passes a generation with `operationName: 'execute_tool'`
+that holds only that text: the title in `conversationTitle`, the arguments as a `tool_call` part,
+and the result and the error as `tool_result` parts, the error one with `isError: true`. The
+sanitizer is called once with the title when the span starts and once with the rest when it ends.
+Text the sanitizer removes stays off the span. If a call throws, the text from that call stays
+off the span; the span keeps the tool name and error category.
 
 ```ts
 import {
@@ -160,7 +168,10 @@ The built-in sanitizer:
 - redacts email addresses by default
 - redacts the conversation title and call error
 - redacts historic assistant turns and tool messages in input
+- redacts secret formats and key/value secrets in `generation.tools` descriptions and encoded schemas
 - leaves user input unchanged unless input redaction is enabled
+
+Tool-definition redaction uses copied definitions, not the application's executable tools. The sanitizer validates schema JSON before and after redacting the complete encoded string. This covers secret-pattern matches in member names and key/value pairs, using the configured email policy too. If either validation fails, it omits the schema body instead of restoring raw content. Names and types remain unchanged. This coverage is JS-only; Go, Python, and .NET sanitizers still lack tool-definition redaction.
 
 To preserve email addresses, opt out explicitly:
 
@@ -230,6 +241,12 @@ messages = response.transformedInput?.messages ?? messages;
 
 With `failOpen: true`, hook transport errors resolve to allow so an unavailable evaluator does not block production traffic. Set `failOpen: false` for strict paths that should fail closed.
 
+Set `hooks.strictTransforms: true` to reject malformed or empty `transformed_input` before the decoder discards data. The default is `false`, which preserves permissive decoding. Strict mode accepts the same valid SDK, snake_case, and Go/protobuf encodings. A supplied null or empty transform, empty collections, and unsupported transform fields throw `HookTransformError`. Omitting `transformed_input` remains valid.
+
+Import `HookTransformError` from `@grafana/agento11y` or `@grafana/agento11y-core`. The error contains no response payload, source input, or authentication headers. The SDK throws the error even with `failOpen: true`; callers must not treat it as an evaluator outage or forward the original input. Strict decoding validates shape, not whether your integration can safely apply a rewrite. Refuse transforms your integration cannot apply.
+
+Override strict mode for one evaluation with `client.evaluateHook(request, { strictTransforms: true })`. The override does not change the client configuration.
+
 Set `context.conversationId` to the same ID used by `startGeneration(...)`. The SDK also reads `withConversationId(...)` and the active OpenTelemetry span when explicit correlation fields are omitted. This lets Agent Observability retain denied preflight attempts even though no LLM generation is created.
 
 If you use transformed input, pass the transformed messages/system prompt to the provider and record those same values in `startGeneration(...)`. If you use the Vercel AI SDK adapter, see `docs/frameworks/vercel-ai-sdk.md` for automatic preflight hook wiring.
@@ -251,7 +268,7 @@ metric exporter, and why analytics stays empty when this step is skipped.
 ## Core API
 
 - `startGeneration(...)` and `startStreamingGeneration(...)`
-- `startToolExecution(...)`
+- `client.startToolExecution(...)`, `GenerationRecorder.startToolExecution(...)`, and `ToolExecutionRecorder.startToolExecution(...)`
 - Recorder methods: `setResult(...)`, `setCallError(...)`, `end()`, `getError()`
 - Lifecycle: `flush()`, `shutdown()`
 
@@ -319,20 +336,104 @@ TraceQL examples:
 
 ## Tool Execution Example
 
+Use `GenerationRecorder.startToolExecution(...)` to parent a tool span to that generation, including across `await`, without a global context manager. The method does not change active context or inherit generation capture settings, identity, or request model. Set those tool options explicitly when they must match the generation. `client.startToolExecution(...)` remains available and uses the active OpenTelemetry context.
+
+`ToolExecutionRecorder.startToolExecution(start: ToolExecutionStart): ToolExecutionRecorder` parents a child span to that tool, including nested children and concurrent siblings. It replaces only the parent span in call-time context, without changing active context. Baggage, suppression, sampling inputs, identity, and capture policy resolve at the child call. End each child yourself. Empty-name no-op recorders also return no-op descendants. Neither recorder method replaces global OpenTelemetry providers or the global context manager.
+
 ```ts
-await client.startToolExecution(
+await client.startGeneration(
   {
-    toolName: "weather",
-    includeContent: true,
+    conversationId: "weather-session",
+    agentName: "weather-agent",
+    model: { provider: "openai", name: "gpt-5" },
+    tools: [{ name: "weather", type: "function" }],
+    contentCapture: "metadata_only",
   },
-  async (recorder) => {
-    recorder.setResult({
-      arguments: { city: "Paris" },
-      result: { temp_c: 18 },
+  async (generation) => {
+    const city = await Promise.resolve("Paris");
+    const tool = generation.startToolExecution({
+      toolName: "weather",
+      conversationId: "weather-session",
+      agentName: "weather-agent",
+      requestProvider: "openai",
+      requestModel: "gpt-5",
+      contentCapture: "metadata_only",
     });
+    try {
+      tool.setResult({ arguments: { city }, result: { tempC: 18 } });
+    } catch (error) {
+      tool.setCallError(error);
+      throw error;
+    } finally {
+      tool.end();
+    }
+    generation.setResult({ output: [{ role: "assistant", content: "18°C in Paris" }] });
   }
 );
 ```
+
+The generation callback ends the generation automatically. The tool factory returns a recorder; call its `end()` yourself. Both recordings above omit content under `metadata_only`. Configure OpenTelemetry providers to retain the spans; explicit parentage does not create exporters.
+
+### Tracing skill loads, resource reads, and commands
+
+Set `ToolExecutionStart.executionKind` explicitly to `"load_skill"`, `"read_skill_resource"`, or `"command"`.
+The `ToolExecutionKind` type defines these values. The SDK does not infer execution kinds from tool names, paths, or arguments.
+Skill and process attributes follow [merged GenAI #498](https://github.com/open-telemetry/semantic-conventions-genai/pull/498), which remains in development.
+
+| Execution kind | Meaning | Applicable fields |
+| --- | --- | --- |
+| `"load_skill"` | Load skill instructions | `skillName`, `skillDescription`, `skillSourceURI` |
+| `"read_skill_resource"` | Read a skill resource | Skill fields above, `skillResourceName` |
+| `"command"` | Execute a command, optionally for a skill | Skill/resource fields above, `processExecutableName`, `processExecutablePath`; completion `processExitCode` |
+
+Unset or unrecognized execution kinds keep generic tool behavior and emit no skill or process attributes. The SDK ignores inapplicable fields.
+Skill fields emit `gen_ai.skill.name`, `gen_ai.skill.description`, `gen_ai.skill.source.uri`, and `gen_ai.skill.resource.name`.
+Process fields emit `process.executable.name`, `process.executable.path`, and `process.exit.code`.
+The SDK does not dual-write `agento11y.skill.name`.
+
+Span names start with `execute_tool <tool>` and use trimmed, nonblank identity:
+
+- `load_skill` appends the skill name, when present.
+- `read_skill_resource` appends `<skill> <resource>`, or just `<resource>` without a skill. Without a resource, it appends nothing.
+- `command` uses the same resource suffix, then falls back to the executable name, then no suffix.
+
+Skill resource reads and commands never use a skill-only suffix.
+The span name and applicable structural names are available to samplers at creation.
+Private fields and the completion exit code are excluded from sampler attributes.
+
+Process fields describe one directly executed process. Do not infer them from shell text, pipelines, or command batches.
+`ToolExecutionResult.processExitCode` is an optional integer-valued `number`: omission means unknown; zero records successful completion.
+Only safe integers are emitted. Booleans, strings, and fractional values are not coerced into exit codes.
+Exit codes are independent of recorded execution errors.
+For example, record a known completion code as follows:
+
+```ts
+await client.startToolExecution(
+  {
+    toolName: "exec",
+    executionKind: "command",
+    skillName: "review",
+    skillResourceName: "scripts/check.py",
+    processExecutableName: "python3",
+  },
+  async (recorder) => {
+    recorder.setResult({ processExitCode: 0 });
+  }
+);
+```
+
+`skillDescription`, `skillSourceURI`, and `processExecutablePath` are private content.
+The SDK omits them from spans under effective `"metadata_only"` or `"full_with_metadata_spans"`, after resolving overrides and the resolver.
+Core `"no_tool_content"` retains these private fields; arguments/results still require the existing content opt-in.
+Every exported skill source URI has userinfo, query, and fragment removed, even under `"full"`.
+Invalid or relative URIs are omitted without network or filesystem lookup.
+When debug history is enabled, capture modes do not sanitize tool snapshots: raw arguments, results, and error text remain there.
+
+Generic tool recording and `executeToolCalls` remain unchanged.
+For `load_skill`, `read_skill_resource`, and `command`, `gen_ai.client.operation.duration` adds `agento11y.tool.execution.kind`.
+It also includes a trimmed, nonblank `gen_ai.skill.name` when supplied, including failed attempts and reduced capture modes.
+No resource or process metric dimensions are added.
+See the [client metric contract](../docs/concepts/tool-call-vs-tool-execution.md#client-metrics).
 
 ## Provider Helpers
 
@@ -529,6 +630,10 @@ Each in-memory export queue holds 2,000 records by default. Set `AGENTO11Y_QUEUE
 
 Retries run in the background exporter. While an export is retrying, the in-memory queue can fill and newer generations can be dropped. Use a retry budget sized for a short, known interruption rather than a permanent multi-minute setting.
 
+Recorder `getError()` reports local recording errors, including queue overflow. Callback-based generation methods throw those errors. Neither signal acknowledges asynchronous delivery. The configured `logger` reports generation rejection, exhausted background retries, and shutdown loss. These signals do not detect every silent loss or establish recovery. The SDK has no durable export spool.
+
+The Pi integration converts observed failures into fixed warnings, deduplicated per client, independently of debug logging. It uses Pi UI or headless stderr and filters debug diagnostics independently of capture mode. See [Pi verification and diagnostics](../plugins/pi/README.md#3-verify). This notification policy belongs to the plugin, not every SDK consumer.
+
 ## Wiring custom env vars
 
 The SDK only auto-loads `AGENTO11Y_*` env vars (`AGENTO11Y_ENDPOINT`, `AGENTO11Y_PROTOCOL`, `AGENTO11Y_AUTH_MODE`, `AGENTO11Y_AUTH_TOKEN`, etc.) when you call `new Agento11yClient()`. For any other env var (for example one your secret manager exposes under a different name), read it in your app and pass the value into the config:
@@ -634,3 +739,8 @@ await experiment.withTrial(testCase, async (trial) => {
 See [`docs/experiments.md`](docs/experiments.md) for the full surface: score
 kinds, local judges, artifacts, reports, portable and stored suites, cross-process
 trials, and experimental OpenTelemetry trial telemetry.
+
+Promptfoo users can publish a completed eval through its `afterAll` hook with
+`createPromptfooExtension` from `@grafana/agento11y/promptfoo`. See the
+[`Promptfoo integration guide`](docs/integrations/promptfoo.md) and the
+[`runnable example`](../examples/experiments/promptfoo/README.md).

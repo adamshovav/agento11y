@@ -1,5 +1,107 @@
 # Changelog
 
+## [0.55.0] - 2026-10-30
+
+### Features
+
+- **plugins/agento11y**: export the coding agent guard packs for Cloud (#945)
+
+### Bug Fixes
+
+- **plugins/agento11y**: stop history imports recording live metrics (#997)
+
+## [0.54.0] - 2026-10-29
+
+### Features
+
+- **sdk**: add skill identity to tool execution metrics (#979)
+
+### Bug Fixes
+
+- **plugins/agento11y**: pin SDK to merged main commit (#986)
+
+## [0.53.0] - 2026-10-28
+
+### Features
+
+- **plugins/agento11y**: report skill loads from Copilot and Vibe (#973)
+- **plugins/agento11y**: add local skill analytics (#963)
+
+### Bug Fixes
+
+- **plugins/agento11y**: decode local OTLP JSON trace IDs (#974)
+- **plugins/agento11y**: move Claude Code installs off the legacy marketplace (#969)
+- **security/high/plugins/agento11y**: update dependency happy-dom to v21 [security] (#937)
+- **security/unknown/plugins/agento11y**: update module golang.org/x/net to v0.62.0 [security] (#960)
+- **plugins/agento11y**: mark Codex usage as input-inclusive (#949)
+
+## [0.52.0] - 2026-10-26
+
+### Features
+
+- trace tool context and skill loads across agents (#925)
+- **plugins/agento11y**: add experimental OTel generation export (#921)
+- **sdk**: trace skill loads, resource reads, and commands (#920)
+- **plugins/agento11y**: resolve coding agent identity locally (#916)
+- **plugins/agento11y**: support opencode v2 history (#890)
+- **plugins/opencode**: support opencode v2 (#876)
+
+### Bug Fixes
+
+- **plugins/agento11y**: preserve Codex metadata and deep Git roots (#917)
+- **plugins/agento11y**: export Claude Code subagent transcript usage (#918)
+- **plugins/agento11y**: Codex tenant-only export auth and live conversation titles (#893)
+- **agento11y**: omit usage stats from development builds (#889)
+- **lint**: check the errors golangci-lint v2.15.0 now flags (#885)
+
+## [0.51.0] - 2026-10-16
+
+### Features
+
+- **plugins**: wire anonymous CLI usage statistics (#877)
+
+## [0.50.0] - 2026-10-15
+
+### Features
+
+- **plugins/agento11y**: support Windows launcher and local mode (#634)
+- **python**: add Harbor live publishing and job import (#870)
+
+### Bug Fixes
+
+- **plugins/agento11y**: recognize more spellings of the local daemon (#875)
+- **plugins/pi**: preserve reasoning token counts (#872)
+
+### Documentation
+
+- **plugins**: document CLI usage statistics and the opt-out (#864)
+
+## [0.49.0] - 2026-10-13
+
+### Features
+
+- **plugins**: add CLI usage statistics library (#859)
+- **plugins**: add experimental Kiro CLI capture (#817)
+- **plugins**: import history across coding agents (#782)
+- **plugins**: require healthy Cloud export in doctor (#783)
+- **local**: add last 30 days time range (#785)
+- **plugins/agento11y**: move local guards to Security tab (#778)
+- **guards**: add local readiness controls (#777)
+
+### Bug Fixes
+
+- **plugins/agento11y**: only a local import answers the viewer's offer (#866)
+- **local**: wrap the history import banner and name the Cloud import (#857)
+- **plugins/agento11y**: keep a history import ledger per destination (#860)
+- **security**: resolve medium+ CVEs in Go and Python dependencies (#862)
+- **plugins/agento11y**: redact imported titles before cutting them (#856)
+- **plugins/agento11y**: give every imported Cursor turn the session's title (#834)
+- **plugins/agento11y**: title Claude Code sessions with Claude Code's own titles (#832)
+- **plugins/agento11y**: title Claude Code sessions from the typed prompt (#830)
+- **local**: price Cursor Grok slugs without the cursor- prefix (#818)
+- **local**: stop chart clicks from drawing a stretched focus oval (#800)
+- **local**: keep chart hover tooltips above KPI tiles (#798)
+
 ## [0.48.0] - 2026-09-17
 
 ### Bug Fixes

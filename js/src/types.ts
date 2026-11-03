@@ -262,6 +262,8 @@ export interface Agento11ySdkConfig {
    * own log-file plumbing on top of it.
    */
   debug?: boolean;
+  /** Maximum retained records per type across all conversations. Zero (default) disables history, independently of verbose debug logging. */
+  debugBufferSize?: number;
 }
 
 /** Partial SDK configuration passed by callers. */
@@ -285,6 +287,8 @@ export interface Agento11ySdkConfigInput {
   userId?: string;
   tags?: Record<string, string>;
   debug?: boolean;
+  /** See {@link Agento11ySdkConfig.debugBufferSize}. */
+  debugBufferSize?: number;
 }
 
 /** Provider/model identity. */
@@ -516,12 +520,21 @@ export interface WorkflowStep {
   metadata?: Record<string, unknown>;
 }
 
+export type ToolExecutionKind = 'load_skill' | 'read_skill_resource' | 'command';
+
 /** Tool execution start seed fields. */
 export interface ToolExecutionStart {
   toolName: string;
   toolCallId?: string;
   toolType?: string;
   toolDescription?: string;
+  executionKind?: ToolExecutionKind;
+  skillName?: string;
+  skillDescription?: string;
+  skillSourceURI?: string;
+  skillResourceName?: string;
+  processExecutableName?: string;
+  processExecutablePath?: string;
   conversationId?: string;
   conversationTitle?: string;
   agentName?: string;
@@ -559,6 +572,7 @@ export interface ExecuteToolCallsOptions {
 export interface ToolExecutionResult {
   arguments?: unknown;
   result?: unknown;
+  processExitCode?: number;
   completedAt?: Date;
 }
 
@@ -568,6 +582,14 @@ export interface ToolExecution {
   toolCallId?: string;
   toolType?: string;
   toolDescription?: string;
+  executionKind?: ToolExecutionKind;
+  skillName?: string;
+  skillDescription?: string;
+  skillSourceURI?: string;
+  skillResourceName?: string;
+  processExecutableName?: string;
+  processExecutablePath?: string;
+  processExitCode?: number;
   conversationId?: string;
   conversationTitle?: string;
   agentName?: string;
@@ -592,6 +614,12 @@ export interface EmbeddingRecorder {
 
 /** Recorder API for generation lifecycle. */
 export interface GenerationRecorder {
+  /**
+   * Starts a tool span parented to this generation without changing the active
+   * OTel context. Only trace parentage is bound; identity and content capture
+   * resolve as for client.startToolExecution. The caller must end the tool.
+   */
+  startToolExecution(start: ToolExecutionStart): ToolExecutionRecorder;
   setResult(result: GenerationResult): void;
   setCallError(error: unknown): void;
   setFirstTokenAt(firstTokenAt: Date): void;
@@ -602,6 +630,8 @@ export interface GenerationRecorder {
 
 /** Recorder API for tool execution lifecycle. */
 export interface ToolExecutionRecorder {
+  /** Binds only parentage; other options resolve at the child call. The caller must end the child. */
+  startToolExecution(start: ToolExecutionStart): ToolExecutionRecorder;
   setResult(result: ToolExecutionResult): void;
   setCallError(error: unknown): void;
   end(): void;
@@ -646,6 +676,13 @@ export interface HooksConfig {
    * caller can proceed with the LLM call. Defaults to true.
    */
   failOpen: boolean;
+  /** Invalid transforms must throw even when evaluator failures are allowed. Defaults to false. */
+  strictTransforms?: boolean;
+}
+
+export interface HookEvaluateOptions extends Partial<HooksConfig> {
+  /** Aborts the HTTP request and rejects with the signal's reason, even when `failOpen` is true. */
+  signal?: AbortSignal;
 }
 
 /** Identifies the upstream LLM call for hook rule matching. */

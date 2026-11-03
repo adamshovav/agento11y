@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -187,6 +188,105 @@ func TestProcess_GenerationWindowFromPrecedingLine(t *testing.T) {
 				if got := gens[i].Tags["subagent"] == "true"; got != want.sidechain {
 					t.Errorf("gen[%d] subagent = %v, want %v", i, got, want.sidechain)
 				}
+			}
+		})
+	}
+}
+
+func TestProcessGenerationSources(t *testing.T) {
+	reply := func(text string) transcript.Line {
+		return makeAssistantLine("claude", 10, []transcript.ContentBlock{{Type: "text", Text: text}}, "end_turn")
+	}
+	spawn := func(id string) transcript.Line {
+		return makeAssistantLine("claude", 10, []transcript.ContentBlock{{
+			Type: "tool_use", ID: id, Name: "Agent", Input: json.RawMessage(`{"subagent_type":"explorer"}`),
+		}}, "tool_use")
+	}
+	fragment := withAssistantMessageID(makeAssistantFragment("req-1", 2, []transcript.ContentBlock{{
+		Type: "tool_use", ID: "read", Name: "Read", Input: json.RawMessage(`{}`),
+	}}, ""), "msg-1")
+	finalFragment := withAssistantMessageID(reply("fragment end"), "msg-1")
+	tests := []struct {
+		name     string
+		lines    []transcript.Line
+		coalesce bool
+		wantGens int
+		want     map[int]int
+	}{
+		{name: "empty", want: map[int]int{}},
+		{
+			name: "reused generation IDs", lines: []transcript.Line{reply("first"), makeToolResultLine("other", "ok"), reply("second")},
+			wantGens: 2, want: map[int]int{0: 0, 1: 2},
+		},
+		{
+			name: "sidechains with reused IDs", lines: []transcript.Line{reply("main"), onSidechain(reply("child")), reply("main again")},
+			wantGens: 3, want: map[int]int{0: 0, 1: 1, 2: 2},
+		},
+		{
+			name: "coalesced fragments", lines: []transcript.Line{fragment, makeToolResultLine("read", "result"), finalFragment},
+			coalesce: true, wantGens: 1, want: map[int]int{0: 2},
+		},
+		{
+			name: "sidechain fragments", lines: []transcript.Line{onSidechain(fragment), onSidechain(makeToolResultLine("read", "result")), onSidechain(finalFragment)},
+			coalesce: true, wantGens: 1, want: map[int]int{0: 2},
+		},
+		{
+			name: "synthetic positions remain gaps", lines: []transcript.Line{
+				spawn("agent-1"), makeToolResultLine("agent-1", "summary one"), reply("between"),
+				spawn("agent-2"), makeToolResultLine("agent-2", "summary two"), reply("after"),
+			},
+			wantGens: 6, want: map[int]int{0: 0, 2: 2, 3: 3, 5: 5},
+		},
+		{
+			name: "skipped assistant lines do not consume positions", lines: []transcript.Line{
+				{Type: "assistant", Message: json.RawMessage(`{invalid`)},
+				makeAssistantLine("claude", 0, nil, "end_turn"), reply("real"),
+			},
+			wantGens: 1, want: map[int]int{0: 2},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for i := range tt.lines {
+				tt.lines[i].UUID = string(rune('a' + i))
+				tt.lines[i].StartOffset = int64(i * 100)
+				tt.lines[i].EndOffset = int64((i + 1) * 100)
+			}
+			lines := tt.lines
+			if tt.coalesce {
+				lines = CoalesceSession(lines)
+			}
+			sources := map[int]transcript.Line{}
+			gens, results := Process(lines, &state.Session{}, Options{SessionID: "sess-1", GenerationSources: sources}, nil)
+			if len(gens) != tt.wantGens || len(sources) != len(tt.want) {
+				t.Fatalf("got %d generations and %d sources, want %d and %d", len(gens), len(sources), tt.wantGens, len(tt.want))
+			}
+			for pos, rawIndex := range tt.want {
+				source, ok := sources[pos]
+				if !ok {
+					t.Fatalf("missing source at output position %d", pos)
+				}
+				want := tt.lines[rawIndex]
+				if tt.coalesce {
+					for _, line := range lines {
+						if line.Type == "assistant" && line.UUID == want.UUID {
+							want = line
+						}
+					}
+				}
+				if !reflect.DeepEqual(source, want) {
+					t.Errorf("source[%d] = %+v, want %+v", pos, source, want)
+				}
+				if gens[pos].ID != generationID(source) {
+					t.Errorf("source[%d] does not identify its generation", pos)
+				}
+			}
+			if len(gens) > 1 && gens[0].ID != gens[len(gens)-1].ID {
+				t.Fatal("fixture must reuse generation IDs to test position-based association")
+			}
+			withoutSources, withoutResults := Process(lines, &state.Session{}, Options{SessionID: "sess-1"}, nil)
+			if !reflect.DeepEqual(gens, withoutSources) || !reflect.DeepEqual(results, withoutResults) {
+				t.Fatal("source bookkeeping changed mapper output")
 			}
 		})
 	}
@@ -410,6 +510,61 @@ func TestProcess_ConversationTitle(t *testing.T) {
 				if gen.ConversationTitle != tt.wantConvTitle {
 					t.Errorf("gen[%d].ConversationTitle = %q, want %q", i, gen.ConversationTitle, tt.wantConvTitle)
 				}
+			}
+		})
+	}
+}
+
+// A metadata_only export drops the title, so Process does not redact a prompt
+// for it. The session state still records the title.
+func TestProcess_TitleDroppedTitlesWithTheSessionID(t *testing.T) {
+	st := state.Session{}
+	lines := []transcript.Line{
+		makeUserLine("fix the auth bug"),
+		makeAssistantLine("claude-sonnet-4-20250514", 10, []transcript.ContentBlock{
+			{Type: "text", Text: "ok"},
+		}, "end_turn"),
+	}
+	gens, _ := Process(lines, &st, Options{SessionID: "sess-1", TitleDropped: true}, nil)
+	if len(gens) != 1 {
+		t.Fatalf("got %d generations, want 1", len(gens))
+	}
+	if gens[0].ConversationTitle != "sess-1" {
+		t.Errorf("ConversationTitle = %q, want the session ID", gens[0].ConversationTitle)
+	}
+	if st.Title != "fix the auth bug" {
+		t.Errorf("state.Title = %q, want the first prompt", st.Title)
+	}
+}
+
+func TestSlashCommandTitle(t *testing.T) {
+	tests := []struct {
+		name   string
+		record string
+		want   string
+	}{
+		{
+			name:   "name and args",
+			record: "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>",
+			want:   "/model opus",
+		},
+		{
+			name:   "message before name, no args",
+			record: "<command-message>doctor</command-message>\n<command-name>/doctor</command-name>",
+			want:   "/doctor",
+		},
+		{
+			// Regression: an unclosed tag returned the rest of the record, so
+			// the sibling tags leaked into the title.
+			name:   "name not closed",
+			record: "<command-name>/foo\n<command-args>bar baz</command-args>",
+			want:   "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := slashCommandTitle(tt.record); got != tt.want {
+				t.Errorf("slashCommandTitle = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -971,6 +1126,194 @@ func TestCoalesce_MergesFragmentContent(t *testing.T) {
 	}
 }
 
+// TestCoalesce_MergesSameRequestAcrossToolResult is the split-response shape
+// Claude Code writes in subagent transcripts: one API call (same requestId
+// and message id) arrives as several assistant lines, and a tool_result from
+// a parallel tool call lands between them. Those fragments are one generation
+// whose usage is the last line's.
+func TestCoalesce_MergesSameRequestAcrossToolResult(t *testing.T) {
+	const messageID = "msg_split"
+	prompt := makeUserLine("inspect the repo")
+	prompt.EndOffset = 50
+	thinking := withAssistantMessageID(makeAssistantFragment("req-split", 2, []transcript.ContentBlock{
+		{Type: "thinking", Thinking: "plan the reads"},
+		{Type: "tool_use", ID: "tu_a", Name: "Read", Input: json.RawMessage(`{"file_path":"a.go"}`)},
+	}, ""), messageID)
+	thinking.EndOffset = 150
+	result := makeToolResultLine("tu_a", "package a")
+	result.EndOffset = 250
+	nextTool := withAssistantMessageID(makeAssistantFragment("req-split", 40, []transcript.ContentBlock{
+		{Type: "tool_use", ID: "tu_b", Name: "Read", Input: json.RawMessage(`{"file_path":"b.go"}`)},
+	}, ""), messageID)
+	nextTool.EndOffset = 350
+	lines := []transcript.Line{prompt, thinking, result, nextTool}
+
+	got, offset := Coalesce(lines)
+	if offset != 350 {
+		t.Fatalf("offset = %d, want 350 (end of the last fragment)", offset)
+	}
+	if len(got) != 3 {
+		t.Fatalf("Coalesce returned %d lines, want 3 (prompt + one merged assistant + the interleaved tool_result)", len(got))
+	}
+	var msg transcript.AssistantMessage
+	if err := json.Unmarshal(got[1].Message, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.ID != messageID {
+		t.Errorf("message id = %q, want %q", msg.ID, messageID)
+	}
+	if msg.Usage.OutputTokens != 40 {
+		t.Errorf("OutputTokens = %d, want 40 (last line's usage)", msg.Usage.OutputTokens)
+	}
+	if len(msg.Content) != 3 {
+		t.Fatalf("merged content blocks = %d, want thinking + two tool_use", len(msg.Content))
+	}
+	if msg.Content[0].Type != "thinking" || msg.Content[1].ID != "tu_a" || msg.Content[2].ID != "tu_b" {
+		t.Fatalf("merged content = %+v", msg.Content)
+	}
+
+	session := CoalesceSession(lines)
+	if len(session) != 3 {
+		t.Fatalf("CoalesceSession returned %d lines, want 3 (prompt + merged assistant + tool_result)", len(session))
+	}
+
+	gens, _ := Process(got, &state.Session{}, Options{SessionID: "sess-1"}, nil)
+	if len(gens) != 1 {
+		t.Fatalf("Process produced %d generations, want 1", len(gens))
+	}
+	if gens[0].Usage.OutputTokens != 40 {
+		t.Errorf("generation output tokens = %d, want 40", gens[0].Usage.OutputTokens)
+	}
+	if gens[0].Usage.InputTokens != 150 {
+		t.Errorf("generation input tokens = %d, want 150 (last line, not doubled)", gens[0].Usage.InputTokens)
+	}
+	if got[1].LegacyGroups != 2 {
+		t.Errorf("LegacyGroups = %d, want 2 (unmerged first part + second part)", got[1].LegacyGroups)
+	}
+}
+
+func TestCoalesceGrowing_HoldsOpenMessage(t *testing.T) {
+	const messageID = "msg_open"
+	prompt := makeUserLine("inspect the repo")
+	prompt.EndOffset = 50
+	first := withAssistantMessageID(makeAssistantFragment("req-split", 3, []transcript.ContentBlock{
+		{Type: "thinking", Thinking: "plan"},
+		{Type: "tool_use", ID: "tu_a", Name: "Read", Input: json.RawMessage(`{"file_path":"a.go"}`)},
+	}, ""), messageID)
+	first.EndOffset = 150
+	result := makeToolResultLine("tu_a", "package a")
+	result.EndOffset = 250
+
+	held, offset := CoalesceGrowing([]transcript.Line{prompt, first, result})
+	if len(held) != 0 || offset != 0 {
+		t.Fatalf("growing Coalesce exported %d lines at offset %d; want the open message held", len(held), offset)
+	}
+
+	live, liveOffset := Coalesce([]transcript.Line{prompt, first, result})
+	if len(live) != 2 || liveOffset != 150 {
+		t.Fatalf("live Coalesce = %d lines offset %d, want the answered tool_use exported", len(live), liveOffset)
+	}
+
+	last := withAssistantMessageID(makeAssistantFragment("req-split", 660, []transcript.ContentBlock{
+		{Type: "tool_use", ID: "tu_b", Name: "Read", Input: json.RawMessage(`{"file_path":"b.go"}`)},
+	}, ""), messageID)
+	last.EndOffset = 350
+	next := withAssistantMessageID(makeAssistantFragment("req-next", 9, []transcript.ContentBlock{
+		{Type: "text", Text: "done"},
+	}, "end_turn"), "msg_next")
+	next.EndOffset = 450
+
+	ready, readyOffset := CoalesceGrowing([]transcript.Line{prompt, first, result, last, next})
+	if readyOffset != 450 {
+		t.Fatalf("offset = %d, want 450 after the next message started", readyOffset)
+	}
+	gens, _ := Process(ready, &state.Session{}, Options{SessionID: "sess-1"}, nil)
+	if len(gens) != 2 {
+		t.Fatalf("got %d generations, want the finished message plus the next turn", len(gens))
+	}
+	if gens[0].Usage.OutputTokens != 660 {
+		t.Fatalf("first generation output = %d, want 660 (held until complete)", gens[0].Usage.OutputTokens)
+	}
+}
+
+// A subagent that dies on an API error ends its transcript with a <synthetic>
+// line that has no requestId. The response before it can no longer grow, so
+// growing Coalesce must export it instead of holding it forever.
+func TestCoalesceGrowing_ExportsResponseBeforeAPIError(t *testing.T) {
+	prompt := makeUserLine("inspect the repo")
+	prompt.EndOffset = 50
+	last := withAssistantMessageID(makeAssistantFragment("req-last", 16, []transcript.ContentBlock{
+		{Type: "tool_use", ID: "tu_a", Name: "Read", Input: json.RawMessage(`{"file_path":"a.go"}`)},
+	}, ""), "msg_last")
+	last.EndOffset = 150
+	result := makeToolResultLine("tu_a", "package a")
+	result.EndOffset = 250
+	raw, _ := json.Marshal(transcript.AssistantMessage{
+		Model:      "<synthetic>",
+		Content:    []transcript.ContentBlock{{Type: "text", Text: "API Error: Can't reach the API server"}},
+		StopReason: "stop_sequence",
+	})
+	apiError := transcript.Line{
+		Type:      "assistant",
+		SessionID: "sess-1",
+		Timestamp: "2025-06-01T12:00:00Z",
+		Version:   "1.0.0",
+		EndOffset: 350,
+		Message:   raw,
+	}
+
+	ready, offset := CoalesceGrowing([]transcript.Line{prompt, last, result, apiError})
+	if offset < 250 {
+		t.Fatalf("offset = %d, want at least 250 so the response before the API error is not held", offset)
+	}
+	gens, _ := Process(ready, &state.Session{}, Options{SessionID: "sess-1"}, nil)
+	var output int64
+	for _, gen := range gens {
+		output += gen.Usage.OutputTokens
+	}
+	if output != 16 {
+		t.Fatalf("exported output tokens = %d, want 16 from the response before the API error", output)
+	}
+}
+
+func TestCoalesce_SameRequestWithoutMessageIDStaysTwoTurns(t *testing.T) {
+	prompt := makeUserLine("inspect the repo")
+	prompt.EndOffset = 50
+	call := makeAssistantFragment("req-1", 25, []transcript.ContentBlock{
+		{Type: "tool_use", ID: "tu_1", Name: "Read", Input: json.RawMessage(`{"file_path":"x.go"}`)},
+	}, "")
+	call.EndOffset = 150
+	result := makeToolResultLine("tu_1", "package x")
+	result.EndOffset = 250
+	answer := makeAssistantFragment("req-1", 25, []transcript.ContentBlock{
+		{Type: "text", Text: "It is package x."},
+	}, "")
+	answer.EndOffset = 350
+
+	got := CoalesceSession([]transcript.Line{prompt, call, result, answer})
+	if len(got) != 4 {
+		t.Fatalf("got %d lines, want 4 (tool-call turn, result, answer stay separate without a message id)", len(got))
+	}
+	gens, _ := Process(got, &state.Session{}, Options{SessionID: "sess-1"}, nil)
+	if len(gens) != 2 {
+		t.Fatalf("Process produced %d generations, want 2", len(gens))
+	}
+}
+
+func withAssistantMessageID(line transcript.Line, id string) transcript.Line {
+	var msg transcript.AssistantMessage
+	if err := json.Unmarshal(line.Message, &msg); err != nil {
+		return line
+	}
+	msg.ID = id
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return line
+	}
+	line.Message = raw
+	return line
+}
+
 func TestCoalesce_PreservesContextWhenAssistantArrivesInLaterBatch(t *testing.T) {
 	user1 := makeUserLine("user1 prompt")
 	user1.EndOffset = 50
@@ -1079,6 +1422,89 @@ func TestProcess_ToolResultContentFormats(t *testing.T) {
 			content := gens[1].Input[0].Parts[0].ToolResult.Content
 			if !strings.Contains(content, tt.wantContain) {
 				t.Errorf("tool result content = %q, want to contain %q", content, tt.wantContain)
+			}
+		})
+	}
+}
+
+func TestToolInputJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "nil"},
+		{name: "empty", raw: json.RawMessage{}},
+		{name: "object", raw: json.RawMessage(`{"path":"file.go"}`)},
+		{name: "array", raw: json.RawMessage(`["a",1,true]`)},
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "invalid JSON", raw: json.RawMessage(`not JSON`)},
+		{name: "secret", raw: json.RawMessage(`{"token":"glc_abcdefghijklmnopqrstuvwx","api_key":"kR7fQ2wLmZ9xTb4vNc1JhY6s"}`)},
+		{name: "oversized UTF-8", raw: json.RawMessage(`"` + strings.Repeat("é", maxToolInputLen) + `"`)},
+		{name: "redact before truncation", raw: json.RawMessage(`{"text":"` + strings.Repeat("x", maxToolInputLen-20) + `glc_abcdefghijklmnopqrstuvwx"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, r := range []*redact.Redactor{nil, redact.New()} {
+				want := truncateJSON(tt.raw, maxToolInputLen, r)
+				got := ToolInputJSON(tt.raw, r)
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("ToolInputJSON differs from existing input redaction/truncation")
+				}
+				output := buildOutput([]transcript.ContentBlock{{Type: "tool_use", ID: "call", Input: tt.raw}}, r)
+				if !reflect.DeepEqual(output[0].Parts[0].ToolCall.InputJSON, got) {
+					t.Error("generation output and exported helper differ")
+				}
+			}
+		})
+	}
+}
+
+func TestToolResultContent(t *testing.T) {
+	large := strings.Repeat("é", mapperutil.MaxToolResultBytes/2+100)
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+		text string
+	}{
+		{name: "absent"},
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "string", raw: json.RawMessage(`"plain text"`), text: "plain text"},
+		{name: "blocks", raw: json.RawMessage(`[{"type":"text","text":"one"},{"type":"image"},{"type":"text","text":"two"}]`), text: "one\ntwo"},
+		{name: "object fallback", raw: json.RawMessage(`{"result":42}`), text: `{"result":42}`},
+		{name: "secret", raw: json.RawMessage(`"glc_abcdefghijklmnopqrstuvwx PASSWORD=hunter2"`), text: "glc_abcdefghijklmnopqrstuvwx PASSWORD=hunter2"},
+		{name: "oversized UTF-8", raw: json.RawMessage(`"` + large + `"`), text: large},
+		{
+			name: "redact before truncation", raw: json.RawMessage(`"` + strings.Repeat("x", mapperutil.MaxToolResultBytes-10) + `glc_abcdefghijklmnopqrstuvwx"`),
+			text: strings.Repeat("x", mapperutil.MaxToolResultBytes-10) + "glc_abcdefghijklmnopqrstuvwx",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, r := range []*redact.Redactor{nil, redact.New()} {
+				block := transcript.UserContentBlock{Type: "tool_result", ToolUseID: "call", RawContent: tt.raw, IsError: true}
+				want := tt.text
+				if r != nil {
+					want = r.ToolPayload(want)
+				}
+				want = mapperutil.BoundText(want, mapperutil.MaxToolResultBytes)
+				got := ToolResultContent(block, r)
+				if got != want {
+					t.Errorf("ToolResultContent differs from existing result redaction/truncation")
+				}
+				blocks, err := json.Marshal([]transcript.UserContentBlock{block})
+				if err != nil {
+					t.Fatal(err)
+				}
+				message, err := json.Marshal(transcript.UserMessage{Role: "user", Content: blocks})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var ctx userContext
+				processUserLine(transcript.Line{Message: message}, &ctx, &state.Session{}, r, Options{}, map[string]time.Time{})
+				result := ctx.toolResults[0].Parts[0].ToolResult
+				if result.Content != got || !result.IsError || result.ToolCallID != "call" {
+					t.Error("generation result and exported helper differ")
+				}
 			}
 		})
 	}

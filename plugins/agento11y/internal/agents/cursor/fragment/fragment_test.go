@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 )
 
 // withTempState points the package's state root at a fresh tempdir for one test.
@@ -321,5 +323,134 @@ func TestDelete_Idempotent(t *testing.T) {
 	// stop/sessionEnd retries don't error on each other.
 	if err := Delete("conv", "gen1"); err != nil {
 		t.Errorf("second delete should be idempotent; got %v", err)
+	}
+}
+
+// A closed Cursor chat can be reopened without another sessionStart, so
+// clearing a conversation at sessionEnd must keep its session file.
+func TestRemoveFragments_KeepsSession(t *testing.T) {
+	withTempState(t)
+	logger := newTestLogger()
+
+	if err := SaveSession(Session{ConversationID: "conv", UserEmail: "alice@example.com", ConversationTitle: "list go files"}); err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	if err := Save(&Fragment{ConversationID: "conv", GenerationID: "gen1"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := Save(&Fragment{ConversationID: "conv", GenerationID: "bad"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := Quarantine("conv", "bad"); err != nil {
+		t.Fatalf("Quarantine: %v", err)
+	}
+
+	if err := RemoveFragments("conv"); err != nil {
+		t.Fatalf("RemoveFragments: %v", err)
+	}
+
+	entries, err := os.ReadDir(ConversationDir("conv"))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != "session.json" {
+		t.Errorf("conversation dir holds %v; want only session.json", names)
+	}
+	got := LoadSession("conv", logger)
+	if got == nil || got.UserEmail != "alice@example.com" || got.ConversationTitle != "list go files" {
+		t.Errorf("session = %+v; want it unchanged", got)
+	}
+	if err := RemoveFragments("missing"); err != nil {
+		t.Errorf("RemoveFragments on a missing conversation: %v", err)
+	}
+}
+
+func TestPruneIdleConversations(t *testing.T) {
+	withTempState(t)
+	now := time.Now()
+	cutoff := now.Add(-IdleConversationAge)
+	old := cutoff.Add(-time.Hour)
+
+	seed := func(id string, withFragment bool, modTime time.Time) {
+		t.Helper()
+		if err := SaveSession(Session{ConversationID: id}); err != nil {
+			t.Fatalf("SaveSession: %v", err)
+		}
+		if withFragment {
+			if err := Save(&Fragment{ConversationID: id, GenerationID: "gen1"}); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+		}
+		if err := os.Chtimes(ConversationDir(id), modTime, modTime); err != nil {
+			t.Fatalf("Chtimes: %v", err)
+		}
+	}
+	seed("idle", false, old)
+	seed("recent", false, now)
+	seed("stranded", true, old)
+	seed("current", false, old)
+
+	PruneIdleConversations(cutoff, "current", newTestLogger())
+
+	for id, wantKept := range map[string]bool{
+		"idle":     false,
+		"recent":   true,
+		"stranded": true,
+		"current":  true,
+	} {
+		_, err := os.Stat(ConversationDir(id))
+		if kept := err == nil; kept != wantKept {
+			t.Errorf("%s kept = %v; want %v (stat err %v)", id, kept, wantKept, err)
+		}
+	}
+}
+
+func TestSessionTitle(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "trims", in: "  fix the bug \n", want: "fix the bug"},
+		{
+			name: "cuts at 100 bytes and trims what the cut leaves",
+			in:   strings.Repeat("a", 99) + " and then some",
+			want: strings.Repeat("a", 99),
+		},
+		{name: "keeps a rune whole", in: strings.Repeat("a", 99) + "é", want: strings.Repeat("a", 99)},
+		{
+			// Regression: the cut ran before redaction, so a secret it split
+			// no longer matched its pattern and its first part was kept.
+			name: "redacts a secret before the cut splits it",
+			in:   strings.Repeat("x", 70) + " ghp_" + strings.Repeat("A", 36) + " please",
+			want: strings.Repeat("x", 70) + " [REDACTED:github-pat] please",
+		},
+		{
+			name: "does not cut a redaction marker in half",
+			in:   strings.Repeat("x", 85) + " ghp_" + strings.Repeat("A", 36) + " please",
+			want: strings.Repeat("x", 85),
+		},
+		{
+			name: "does not leave the start of a redaction marker",
+			in:   strings.Repeat("x", 92) + " ghp_" + strings.Repeat("A", 36) + " please",
+			want: strings.Repeat("x", 92),
+		},
+		{
+			// Only the head is redacted; a secret near the start still is.
+			name: "redacts the head of a large paste",
+			in:   "token ghp_" + strings.Repeat("A", 36) + " " + strings.Repeat("y", 100<<10),
+			want: "token [REDACTED:github-pat] " + strings.Repeat("y", 100-len("token [REDACTED:github-pat] ")),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SessionTitle(tt.in); got != tt.want {
+				t.Errorf("SessionTitle() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

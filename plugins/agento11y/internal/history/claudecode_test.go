@@ -85,6 +85,12 @@ func claudeImporterAt(root string) *claudeImporter {
 	return &claudeImporter{roots: []string{root}}
 }
 
+// fromClaudeSubagentTranscript reports whether a turn's source is one of the
+// session's subagent transcripts, on either path separator.
+func fromClaudeSubagentTranscript(sourcePath string) bool {
+	return strings.Contains(filepath.ToSlash(sourcePath), "/subagents/")
+}
+
 func collectTurns(t *testing.T, imp Importer, sess SessionPreview) []HistoricalGeneration {
 	t.Helper()
 	var out []HistoricalGeneration
@@ -106,7 +112,7 @@ func TestClaudeRootsResolveFromConfigDir(t *testing.T) {
 	}
 
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	t.Setenv("HOME", "/home/tester")
+	setHomeDir(t, "/home/tester")
 	if got := imp.Roots(); !slices.Equal(got, []string{filepath.Join("/home/tester", ".claude", "projects")}) {
 		t.Fatalf("Roots() = %v, want the home fallback", got)
 	}
@@ -238,8 +244,22 @@ func TestClaudePreviewIsBounded(t *testing.T) {
 // what live capture would have produced for the same lines, not a second
 // mapping of the same transcript.
 func TestClaudeTurnsMatchTheLiveMapper(t *testing.T) {
+	envconfig.PinAliasEnvBlank(t)
+	home := t.TempDir()
+	setHomeDir(t, home)
+	profile := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", profile)
+	t.Setenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", "")
+	writeFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"emailAddress":"default@example.com"}}`)
+	writeFile(t, filepath.Join(profile, ".claude.json"), `{"oauthAccount":{"emailAddress":"selected@example.com"}}`)
 	root := t.TempDir()
 	path := writeClaudeSession(t, root, "-work-repo", "sess-a")
+	// Claude Code writes its own title for the session; both paths must use it.
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, claudeLine(map[string]any{"type": "ai-title", "aiTitle": "Build and tests", "sessionId": "sess-a"})+string(body))
 	imp := claudeImporterAt(root)
 
 	preview, ok, err := imp.Preview(context.Background(), path)
@@ -253,16 +273,22 @@ func TestClaudeTurnsMatchTheLiveMapper(t *testing.T) {
 
 	// The same lines through Coalesce and Process directly, the path the live
 	// hook runs.
-	lines, _, err := transcript.Read(path, 0)
+	lines, _, titles, err := transcript.ReadWithTitles(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, _ := mapper.Process(mapper.CoalesceSession(lines), &state.Session{}, mapper.Options{SessionID: preview.SessionID}, nil)
+	want, _ := mapper.Process(mapper.CoalesceSession(lines), &state.Session{}, mapper.Options{SessionID: preview.SessionID, Titles: titles}, nil)
 	if len(want) != len(turns) {
 		t.Fatalf("the importer produced %d turns, the live mapper %d", len(turns), len(want))
 	}
+	if want[0].ConversationTitle != "Build and tests" {
+		t.Fatalf("live mapper title = %q, want the ai-title", want[0].ConversationTitle)
+	}
 	for i := range want {
 		got := turns[i].Gen
+		if got.UserID != "selected@example.com" {
+			t.Fatalf("turn %d UserID = %q, want selected@example.com", i, got.UserID)
+		}
 		// The importer fills the user ID the live hook attaches separately.
 		got.UserID = want[i].UserID
 		// The generation ID is the import's own: the mapper derives it from
@@ -403,7 +429,7 @@ func TestClaudeSubagentTurnsLinkToTheirParent(t *testing.T) {
 					}
 				}
 			}
-		case strings.Contains(turn.Source.SourcePath, "/subagents/"):
+		case fromClaudeSubagentTranscript(turn.Source.SourcePath):
 			subagentTurns = append(subagentTurns, turn)
 		}
 	}
@@ -427,9 +453,95 @@ func TestClaudeSubagentTurnsLinkToTheirParent(t *testing.T) {
 	// The subagent has its own transcript, so the parent's one-line Agent
 	// summary must not also appear.
 	for _, turn := range turns {
-		if turn.Gen.AgentName == "claude-code/explorer" && !strings.Contains(turn.Source.SourcePath, "/subagents/") {
+		if turn.Gen.AgentName == "claude-code/explorer" && !fromClaudeSubagentTranscript(turn.Source.SourcePath) {
 			t.Fatalf("the parent transcript still produced a summary generation %q", turn.Gen.ID)
 		}
+	}
+}
+
+// Regression: each subagent transcript was mapped with a fresh state, so its
+// turns were titled with the prompt the subagent was given. They belong to the
+// session's conversation, and a store that keeps the latest title could rename
+// the whole conversation after a subagent's task.
+func TestClaudeImportTitlesEveryTurnWithTheSessionTitle(t *testing.T) {
+	tests := []struct {
+		name         string
+		aiTitle      string
+		parentPrompt string
+		want         string
+	}{
+		{name: "Claude Code's title", aiTitle: "Repo tour", parentPrompt: "explore the repo", want: "Repo tour"},
+		{name: "first prompt without a Claude Code title", parentPrompt: "explore the repo", want: "explore the repo"},
+		{
+			// The parent's only prompt is IDE context, so the session has no
+			// title at all; the subagent's task must not become one.
+			name:         "no session title",
+			parentPrompt: "<ide_opened_file>The user opened the file /work/repo/main.go in the IDE.</ide_opened_file>",
+			want:         "sess-title",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			sessionID := "sess-title"
+			project := filepath.Join(root, "-work-repo")
+			subDir := filepath.Join(project, sessionID, "subagents")
+			agentID := "a18f9a9d9f1f3d28e"
+
+			var parentBody string
+			if tt.aiTitle != "" {
+				parentBody = claudeLine(map[string]any{"type": "ai-title", "aiTitle": tt.aiTitle, "sessionId": sessionID})
+			}
+			parentBody += claudeUserLine(sessionID, "/work/repo", "2026-01-10T12:00:00Z", tt.parentPrompt) +
+				claudeAssistantLine(sessionID, "/work/repo", "2026-01-10T12:00:10Z", "req-1", "", []map[string]any{
+					{"type": "tool_use", "id": "tu_agent", "name": "Agent", "input": map[string]any{"subagent_type": "explorer"}},
+				}) +
+				claudeToolResultLine(sessionID, "tu_agent", "agentId: "+agentID+"\nTranscript dir: "+subDir+"\nfound three packages") +
+				claudeAssistantLine(sessionID, "/work/repo", "2026-01-10T12:02:00Z", "req-2", "Summarised.", nil)
+			parentPath := writeFile(t, filepath.Join(project, sessionID+".jsonl"), parentBody)
+
+			subBody := claudeLine(map[string]any{
+				"type":        "user",
+				"sessionId":   sessionID,
+				"isSidechain": true,
+				"agentId":     agentID,
+				"timestamp":   "2026-01-10T12:00:11Z",
+				"message":     map[string]any{"role": "user", "content": "list every package under internal/"},
+			}) + claudeLine(map[string]any{
+				"type":             "assistant",
+				"sessionId":        sessionID,
+				"isSidechain":      true,
+				"agentId":          agentID,
+				"attributionAgent": "explorer",
+				"timestamp":        "2026-01-10T12:00:20Z",
+				"requestId":        "req-side",
+				"message": map[string]any{
+					"model":       "claude-sonnet-4-20250514",
+					"stop_reason": "end_turn",
+					"usage":       map[string]any{"input_tokens": 10, "output_tokens": 7},
+					"content":     []map[string]any{{"type": "text", "text": "three packages"}},
+				},
+			})
+			writeFile(t, filepath.Join(subDir, "agent-"+agentID+".jsonl"), subBody)
+
+			imp := claudeImporterAt(root)
+			preview, ok, err := imp.Preview(context.Background(), parentPath)
+			if err != nil || !ok {
+				t.Fatalf("Preview: ok=%v err=%v", ok, err)
+			}
+			var sawSubagent bool
+			for _, turn := range collectTurns(t, imp, preview) {
+				if fromClaudeSubagentTranscript(turn.Source.SourcePath) {
+					sawSubagent = true
+				}
+				if turn.Gen.ConversationTitle != tt.want {
+					t.Errorf("%s turn title = %q, want %q", turn.Gen.AgentName, turn.Gen.ConversationTitle, tt.want)
+				}
+			}
+			if !sawSubagent {
+				t.Fatal("no subagent turn imported")
+			}
+		})
 	}
 }
 
@@ -661,7 +773,7 @@ func TestClaudeSubagentFinalAnswerIsImported(t *testing.T) {
 
 	var answers []string
 	for _, turn := range collectTurns(t, imp, preview) {
-		if !strings.Contains(turn.Source.SourcePath, "/subagents/") {
+		if !fromClaudeSubagentTranscript(turn.Source.SourcePath) {
 			continue
 		}
 		for _, msg := range turn.Gen.Output {
@@ -773,7 +885,7 @@ func TestClaudeSplitRequestKeepsParentLinks(t *testing.T) {
 		spawnID := claudeSpawnTurnID(t, turns, sessionID)
 		var sub []HistoricalGeneration
 		for _, turn := range turns {
-			if strings.Contains(turn.Source.SourcePath, "/subagents/") {
+			if fromClaudeSubagentTranscript(turn.Source.SourcePath) {
 				sub = append(sub, turn)
 			}
 		}
@@ -846,7 +958,7 @@ func TestClaudeSplitRequestKeepsParentLinks(t *testing.T) {
 		spawnID := claudeSpawnTurnID(t, turns, sessionID)
 		var sub []HistoricalGeneration
 		for _, turn := range turns {
-			if strings.Contains(turn.Source.SourcePath, "/subagents/") {
+			if fromClaudeSubagentTranscript(turn.Source.SourcePath) {
 				sub = append(sub, turn)
 			}
 		}
@@ -960,5 +1072,98 @@ func TestClaudeImportIgnoresTheAgentNameOverride(t *testing.T) {
 		if turn.Gen.AgentName != string(AgentClaudeCode) {
 			t.Errorf("turn %d AgentName = %q, want %q", i, turn.Gen.AgentName, AgentClaudeCode)
 		}
+	}
+}
+
+// TestClaudeReimportAfterMergeSendsNoNewTurns seeds a ledger the way main
+// numbered turns (unmerged split parts), then imports with the merge on the
+// same ledger. Unchanged turns keep their identities; the absorbed second
+// part is not a new turn.
+func TestClaudeReimportAfterMergeSendsNoNewTurns(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "sess-reimport"
+	path := filepath.Join(root, "-work-repo", sessionID+".jsonl")
+	asst := func(ts, requestID, messageID string, output int64, content []map[string]any) string {
+		return claudeLine(map[string]any{
+			"type": "assistant", "sessionId": sessionID, "cwd": "/work/repo",
+			"timestamp": ts, "requestId": requestID, "version": "2.1.22",
+			"message": map[string]any{
+				"id": messageID, "model": "claude-sonnet-4-20250514",
+				"stop_reason": nil,
+				"usage":       map[string]any{"input_tokens": 100, "output_tokens": output},
+				"content":     content,
+			},
+		})
+	}
+	body := claudeUserLine(sessionID, "/work/repo", "2026-01-10T12:00:00Z", "inspect the repo") +
+		asst("2026-01-10T12:00:05Z", "req-split", "msg_split", 3, []map[string]any{
+			{"type": "thinking", "thinking": "plan"},
+			{"type": "tool_use", "id": "tu_a", "name": "Read", "input": map[string]any{"file_path": "a.go"}},
+		}) +
+		claudeToolResultLine(sessionID, "tu_a", "package a") +
+		asst("2026-01-10T12:00:09Z", "req-split", "msg_split", 40, []map[string]any{
+			{"type": "tool_use", "id": "tu_b", "name": "Read", "input": map[string]any{"file_path": "b.go"}},
+		}) +
+		claudeUserLine(sessionID, "/work/repo", "2026-01-10T12:01:00Z", "thanks") +
+		asst("2026-01-10T12:01:05Z", "req-next", "msg_next", 9, []map[string]any{
+			{"type": "text", "text": "you are welcome"},
+		})
+	writeFile(t, path, body)
+
+	imp := claudeImporterAt(root)
+	preview, ok, err := imp.Preview(context.Background(), path)
+	if err != nil || !ok {
+		t.Fatalf("Preview: ok=%v err=%v", ok, err)
+	}
+
+	raw, _, err := transcript.Read(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyGens, _ := mapper.Process(mapper.CoalesceUnmerged(raw), &state.Session{}, mapper.Options{SessionID: preview.SessionID}, nil)
+	if len(legacyGens) != 3 {
+		t.Fatalf("unmerged generations = %d, want 3 (split parts + later turn)", len(legacyGens))
+	}
+
+	current := collectTurns(t, imp, preview)
+	if len(current) != 2 {
+		t.Fatalf("merged generations = %d, want 2", len(current))
+	}
+	if current[0].Source.TurnIndex != 0 {
+		t.Fatalf("merged turn TurnIndex = %d, want 0 (first part)", current[0].Source.TurnIndex)
+	}
+	if current[1].Source.TurnIndex != 2 {
+		t.Fatalf("later turn TurnIndex = %d, want 2 (unmerged numbering)", current[1].Source.TurnIndex)
+	}
+
+	ledger := testLedger(t)
+	for i, gen := range legacyGens {
+		turnID := gen.ResponseID
+		if turnID == "" {
+			turnID = gen.ID
+		}
+		src := SourceRef{
+			Agent: AgentClaudeCode, SessionID: preview.SessionID,
+			SourcePath: path, TurnIndex: i, TurnID: turnID,
+		}
+		if err := ledger.Mark(src.Identity(), StatusExported, src.GenerationID(), "", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	exp := &recordingExporter{}
+	result, err := RunImport(context.Background(), ImportOptions{
+		Agent:    AgentClaudeCode,
+		Importer: imp,
+		Sessions: []SessionPreview{preview},
+		Exporter: exp,
+		Ledger:   ledger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Imported != 0 || len(exp.got) != 0 {
+		t.Fatalf("re-import sent %d new turns (imported=%d skipped=%d); want 0",
+			len(exp.got), result.Imported, result.Skipped)
 	}
 }

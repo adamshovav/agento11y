@@ -12,6 +12,7 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/vibe/meta"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/vibe/state"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/vibe/toolevents"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 )
 
 func discardLogger() *log.Logger { return log.New(io.Discard, "", 0) }
@@ -30,32 +31,35 @@ func TestPreTool_GuardsDisabledPassesThrough(t *testing.T) {
 }
 
 func TestPreTool_FailClosedDeniesOnMissingCreds(t *testing.T) {
-	t.Setenv("SIGIL_GUARDS_ENABLED", "true")
-	t.Setenv("SIGIL_GUARDS_FAIL_OPEN", "false")
-	t.Setenv("SIGIL_ENDPOINT", "")
-	t.Setenv("SIGIL_AUTH_TENANT_ID", "")
-	t.Setenv("SIGIL_AUTH_TOKEN", "")
+	for _, protocol := range []string{"", "http", "otel", "invalid"} {
+		t.Run("generation protocol="+protocol, func(t *testing.T) {
+			envconfig.PinAliasEnvBlank(t)
+			t.Setenv("AGENTO11Y_PROTOCOL", protocol)
+			t.Setenv("SIGIL_GUARDS_ENABLED", "true")
+			t.Setenv("SIGIL_GUARDS_FAIL_OPEN", "false")
 
-	var out bytes.Buffer
-	PreTool(context.Background(), &out, Payload{
-		HookEventName:  "pre_tool",
-		SessionID:      "s",
-		ToolNameValue:  "bash",
-		ToolInputValue: json.RawMessage(`{"command":"ls"}`),
-	}, discardLogger())
+			var out bytes.Buffer
+			PreTool(context.Background(), &out, Payload{
+				HookEventName:  "pre_tool",
+				SessionID:      "s",
+				ToolNameValue:  "bash",
+				ToolInputValue: json.RawMessage(`{"command":"ls"}`),
+			}, discardLogger())
 
-	var resp struct {
-		Decision string `json:"decision"`
-		Reason   string `json:"reason"`
-	}
-	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
-		t.Fatalf("stdout is not a JSON deny response: %v (got %q)", err, out.String())
-	}
-	if resp.Decision != "deny" {
-		t.Errorf("decision = %q, want deny (fail-closed with no creds)", resp.Decision)
-	}
-	if resp.Reason == "" {
-		t.Error("deny reason is empty")
+			var resp struct {
+				Decision string `json:"decision"`
+				Reason   string `json:"reason"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+				t.Fatalf("stdout is not a JSON deny response: %v (got %q)", err, out.String())
+			}
+			if resp.Decision != "deny" {
+				t.Errorf("decision = %q, want deny (fail-closed with no creds)", resp.Decision)
+			}
+			if resp.Reason == "" {
+				t.Error("deny reason is empty")
+			}
+		})
 	}
 }
 
@@ -188,7 +192,7 @@ func TestPostTool_RecordsEventWhenOTelConfigured(t *testing.T) {
 		ToolCallIDValue: "tc-1",
 		ToolStatusValue: "failure",
 		ToolErrorValue:  json.RawMessage(`"exit 1"`),
-		DurationMsValue: ptr(1234.0),
+		DurationMsValue: new(1234.0),
 	}, discardLogger())
 
 	events := toolevents.Load("sess-after")
@@ -207,6 +211,46 @@ func TestPostTool_RecordsEventWhenOTelConfigured(t *testing.T) {
 	}
 }
 
+func TestPostToolSkillIdentity(t *testing.T) {
+	for _, mode := range []string{"full", "no_tool_content", "full_with_metadata_spans", "metadata_only"} {
+		for _, event := range []string{"after_tool", "post_tool"} {
+			for _, tt := range []struct{ name, tool, input, status, want string }{
+				{"success", "skill", `{"name":"effective","private":"private-input"}`, "success", "effective"},
+				{"failure", "skill", `{"name":"effective"}`, "failure", "effective"},
+				{"cancelled", "skill", `{"name":"effective"}`, "cancelled", "effective"},
+				{"read", "read", `{"name":"effective"}`, "success", ""},
+				{"unified harness", "skill.read", `{"name":"effective"}`, "success", ""},
+				{"unsafe", "skill", `{"name":"/private/review"}`, "success", ""},
+				{"secret", "skill", `{"name":"glc_abcdefghijklmnopqrstuvwxyz"}`, "success", ""},
+				{"missing", "skill", ``, "success", ""},
+			} {
+				t.Run(mode+"/"+event+"/"+tt.name, func(t *testing.T) {
+					t.Setenv("XDG_STATE_HOME", t.TempDir())
+					t.Setenv("AGENTO11Y_CONTENT_CAPTURE_MODE", mode)
+					t.Setenv("AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")
+					PostTool(Payload{HookEventName: event, SessionID: "sess", ToolCallIDValue: "call-1",
+						ToolNameValue: tt.tool, ToolInputValue: json.RawMessage(tt.input), ToolStatusValue: tt.status,
+						DurationMsValue: new(1234.0)}, discardLogger())
+					events := toolevents.Load("sess")
+					if len(events) != 1 || events["call-1"].SkillName != tt.want {
+						t.Fatalf("events = %+v, want name %q", events, tt.want)
+					}
+					if events["call-1"].Status != tt.status || events["call-1"].DurationMs != 1234 {
+						t.Fatalf("changed event: %+v", events["call-1"])
+					}
+					data, err := json.Marshal(events)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if strings.Contains(string(data), "private-input") {
+						t.Fatal("persisted raw arguments")
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestPostTool_NoOpWithoutOTel(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("SIGIL_OTEL_EXPORTER_OTLP_ENDPOINT", "")
@@ -216,6 +260,8 @@ func TestPostTool_NoOpWithoutOTel(t *testing.T) {
 		HookEventName:   "post_tool",
 		SessionID:       "sess-noop",
 		ToolCallIDValue: "tc-1",
+		ToolNameValue:   "skill",
+		ToolInputValue:  json.RawMessage(`{"name":"review"}`),
 		ToolStatusValue: "success",
 	}, discardLogger())
 
@@ -223,5 +269,3 @@ func TestPostTool_NoOpWithoutOTel(t *testing.T) {
 		t.Errorf("recorded %d events without an OTel exporter, want 0", len(events))
 	}
 }
-
-func ptr[T any](v T) *T { return &v }

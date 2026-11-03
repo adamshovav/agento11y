@@ -84,6 +84,7 @@ export const defaultHooksConfig: HooksConfig = {
   phases: ['preflight'],
   timeoutMs: 15_000,
   failOpen: true,
+  strictTransforms: false,
 };
 
 export const defaultLogger: Agento11yLogger = {
@@ -107,6 +108,7 @@ export function defaultConfig(): Agento11ySdkConfig {
     embeddingCapture: cloneEmbeddingCaptureConfig(defaultEmbeddingCaptureConfig),
     hooks: cloneHooksConfig(defaultHooksConfig),
     contentCapture: defaultContentCaptureMode,
+    debugBufferSize: 0,
   };
 }
 
@@ -152,6 +154,7 @@ export function mergeConfig(
     userId: overlaid.userId,
     tags: overlaid.tags ? { ...overlaid.tags } : undefined,
     debug: overlaid.debug,
+    debugBufferSize: resolveDebugBufferSize(overlaid.debugBufferSize, logger),
   };
 }
 
@@ -333,6 +336,15 @@ function parseCsvKv(raw: string): Record<string, string> {
   return out;
 }
 
+function resolveDebugBufferSize(value: number | undefined, logger: Agento11yLogger): number {
+  if (value === undefined) return 0;
+  if (Number.isInteger(value) && value >= 0 && value <= maxEnvInteger) return value;
+  logger.warn?.(
+    `agento11y: ignoring invalid debugBufferSize: ${String(value)}; expected a whole number from 0 through ${maxEnvInteger}; debug history disabled`,
+  );
+  return 0;
+}
+
 function mergeGenerationExportConfig(
   config: Partial<GenerationExportConfig> | undefined,
   logger: Agento11yLogger,
@@ -414,6 +426,7 @@ function mergeHooksConfig(config: Partial<HooksConfig> | undefined): HooksConfig
       Array.isArray(config?.phases) && config.phases.length > 0 ? [...config.phases] : [...defaultHooksConfig.phases],
     timeoutMs: config?.timeoutMs ?? defaultHooksConfig.timeoutMs,
     failOpen: config?.failOpen ?? defaultHooksConfig.failOpen,
+    strictTransforms: config?.strictTransforms ?? defaultHooksConfig.strictTransforms,
   };
 }
 

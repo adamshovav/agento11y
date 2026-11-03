@@ -16,6 +16,7 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/copilot/config"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/copilot/fragment"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/copilot/mapper"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/copilot/skilldetect"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/copilot/transcript"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/guard"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/autotag"
@@ -23,6 +24,7 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/otel"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/redact"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/skillidentity"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/timeutil"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/useragent"
 )
@@ -313,9 +315,30 @@ func PostToolUse(p Payload, cfg config.Config, logger *log.Logger, failed bool) 
 			errorMessage = redactor().RedactJSONForText(p.Error())
 		}
 		idx := findPendingToolIndex(f.Tools, p.ToolName())
+		pending := 0
+		for _, tool := range f.Tools {
+			if tool.ToolName == p.ToolName() && tool.CompletedAt == "" {
+				pending++
+			}
+		}
+		if pending > 1 && p.ToolName() == "skill" {
+			// Hooks have no call IDs. Later completions cannot repair this association.
+			for i := range f.Tools {
+				if f.Tools[i].ToolName == p.ToolName() && f.Tools[i].CompletedAt == "" {
+					f.Tools[i].SkillAttributionAmbiguous = true
+					f.Tools[i].SkillName = ""
+				}
+			}
+		}
+		skillName := ""
+		// CLI failure hooks can reuse arguments cached before another hook rewrote them.
+		if !failed && p.Surface() == surfaceCopilotCLI && (idx < 0 || !f.Tools[idx].SkillAttributionAmbiguous) {
+			skillName, _ = skilldetect.Detect(p.ToolName(), p.ToolInput())
+		}
 		if idx < 0 {
 			f.NextToolIndex++
 			f.Tools = append(f.Tools, fragment.ToolRecord{
+				SkillName:    skillName,
 				ToolName:     p.ToolName(),
 				ToolUseID:    fmt.Sprintf("%s-tool-%03d", turnID, f.NextToolIndex),
 				Cwd:          p.CWD,
@@ -328,6 +351,7 @@ func PostToolUse(p Payload, cfg config.Config, logger *log.Logger, failed bool) 
 			})
 			return
 		}
+		f.Tools[idx].SkillName = skillName
 		f.Tools[idx].Status = status
 		f.Tools[idx].CompletedAt = p.ResolvedTimestamp()
 		f.Tools[idx].DurationMs = p.DurationMs()
@@ -450,8 +474,6 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 		f.StopReason = firstNonEmpty(p.StopReason(), p.Reason(), "end_turn")
 	}); err != nil {
 		logger.Printf("stop: update turn: %v", err)
-		clearActiveTurn = true
-		_ = fragment.ClearActiveTurn(sessionID, turnID, logger)
 		return
 	}
 	defer func() {
@@ -463,8 +485,15 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 		}
 	}()
 
-	envconfig.ApplyLocalAuthPlaceholders()
-	if !config.HasCredentials() {
+	protocol, err := envconfig.ResolveGenerationTransport()
+	if err != nil {
+		logger.Printf("stop: generation transport: %v", err)
+		return
+	}
+	if protocol == agento11y.GenerationExportProtocolHTTP {
+		envconfig.ApplyLocalAuthPlaceholders()
+	}
+	if protocol == agento11y.GenerationExportProtocolHTTP && !config.HasCredentials() {
 		logger.Print("stop: missing SIGIL_ENDPOINT/SIGIL_AUTH_TENANT_ID/SIGIL_AUTH_TOKEN; discarding fragment")
 		clearActiveTurn = true
 		if err := fragment.Delete(sessionID, turnID); err != nil {
@@ -486,14 +515,22 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 	providers := emit.SetupOTel(ctx, sessionID, logger)
 	if providers != nil {
 		defer func() {
-			if err := providers.Shutdown(ctx); err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			if err := providers.Shutdown(cleanupCtx); err != nil {
 				logger.Printf("otel: shutdown: %v", err)
 			}
 		}()
 	}
-	client := buildClient(cfg, frag.Cwd, providers, logger)
+	client, err := buildClient(cfg, frag.Cwd, providers, logger)
+	if err != nil {
+		logger.Printf("stop: build client: %v", err)
+		return
+	}
 	defer func() {
-		_ = client.Shutdown(ctx)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_ = client.Shutdown(cleanupCtx)
 	}()
 	mapped := mapper.Map(mapper.Inputs{
 		Fragment:            frag,
@@ -713,9 +750,9 @@ func shouldPreferTranscriptSnapshot(current transcript.Snapshot, haveCurrent boo
 // and token to the SDK's automatic SIGIL_* env resolution, so it only needs the
 // shared HTTP/basic-auth export defaults plus the OTel wiring. cwd is the
 // turn's working directory, which auto-tags resolve the repository and branch
-// from; copilot payloads carry no user identity, so that falls back to the
-// configured AGENTO11Y_USER_ID or the OS account name.
-func buildClient(cfg config.Config, cwd string, providers *otel.Providers, logger *log.Logger) *agento11y.Client {
+// from; copilot payloads carry no user identity, so the user tag comes only
+// from a configured AGENTO11Y_USER_ID.
+func buildClient(cfg config.Config, cwd string, providers *otel.Providers, logger *log.Logger) (*agento11y.Client, error) {
 	return emit.NewClient(emit.ClientOptions{
 		InstrumentationName: otelInstrumentationName,
 		ContentCapture:      cfg.ContentCapture,
@@ -748,7 +785,7 @@ func emitToolSpans(ctx context.Context, client *agento11y.Client, frag *fragment
 			continue
 		}
 		startedAt, completedAt := toolSpanWindow(*t, gen.CompletedAt)
-		_, toolRec := client.StartToolExecution(ctx, agento11y.ToolExecutionStart{
+		start := agento11y.ToolExecutionStart{
 			ToolName:        t.ToolName,
 			ToolCallID:      t.ToolUseID,
 			ToolType:        "function",
@@ -759,7 +796,14 @@ func emitToolSpans(ctx context.Context, client *agento11y.Client, frag *fragment
 			RequestProvider: gen.Model.Provider,
 			StartedAt:       startedAt,
 			ContentCapture:  mappedContentCapture(gen),
-		})
+		}
+		if frag.Surface == surfaceCopilotCLI && t.ToolName == "skill" && t.Status == "completed" && !t.SkillAttributionAmbiguous {
+			if name, ok := skillidentity.Validate(t.SkillName); ok {
+				start.ExecutionKind = agento11y.ToolExecutionKindLoadSkill
+				start.SkillName = name
+			}
+		}
+		_, toolRec := client.StartToolExecution(ctx, start)
 
 		end := agento11y.ToolExecutionEnd{CompletedAt: completedAt}
 		if len(t.ToolInput) > 0 {

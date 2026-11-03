@@ -35,10 +35,28 @@ type Line struct {
 	// example "general-purpose". The mapper appends it to the agent name so a
 	// subagent turn is distinguishable from a main-thread one.
 	AttributionAgent string `json:"attributionAgent"`
+	// IsMeta marks a user line Claude Code wrote itself rather than one the
+	// user typed: the caveat in front of a local command such as /model, or
+	// the expanded body of a slash command or skill.
+	IsMeta bool `json:"isMeta"`
+	// AITitle and CustomTitle are set on Claude Code's "ai-title" and
+	// "custom-title" lines, which ReadWithTitles returns as Titles rather than
+	// as lines.
+	AITitle     string `json:"aiTitle"`
+	CustomTitle string `json:"customTitle"`
 
-	// EndOffset is the byte position after this line in the transcript file.
-	// Set by Read(), not deserialized from JSON.
-	EndOffset int64 `json:"-"`
+	// StartOffset and EndOffset bound this record in the transcript file,
+	// including its line ending. Readers set them; JSON does not carry them.
+	StartOffset int64 `json:"-"`
+	EndOffset   int64 `json:"-"`
+	// LegacyGroups is how many pre-merge assistant generations this line
+	// represents. Coalesce sets it; 1 is a normal turn, 2+ means fragments of
+	// one message were merged across a tool_result. History import uses it so
+	// a merged turn keeps its first part's TurnIndex.
+	LegacyGroups int `json:"-"`
+	// AssistantSources preserves raw scope and source ranges through coalescing.
+	// It is transient; persisted tool state never includes these messages.
+	AssistantSources []Line `json:"-"`
 }
 
 // AssistantMessage is the decoded message for type="assistant" lines.
@@ -132,21 +150,74 @@ func ParseUserContent(raw json.RawMessage) (text string, blocks []UserContentBlo
 // tests can lower it.
 var maxLineBytes = 10 * 1024 * 1024
 
+// Titles holds the newest title records Claude Code wrote in a read range.
+type Titles struct {
+	// AI is the title Claude Code generates for the session (an "ai-title"
+	// line). Claude Code writes it once the session has something to
+	// summarise, before or after the first answer, and rewrites it as the
+	// session goes on. A session of one trivial prompt may never get one.
+	AI string
+	// Custom is the name the user gave the session, with /rename or in the
+	// IDE (a "custom-title" line).
+	Custom string
+}
+
+// note records the title an "ai-title" or "custom-title" line carries, and
+// ignores every other kind. An empty title changes nothing.
+func (t *Titles) note(line Line) {
+	switch line.Type {
+	case "ai-title":
+		if v := strings.TrimSpace(line.AITitle); v != "" {
+			t.AI = v
+		}
+	case "custom-title":
+		if v := strings.TrimSpace(line.CustomTitle); v != "" {
+			t.Custom = v
+		}
+	}
+}
+
 // Read reads JSONL lines from path starting at the given byte offset.
 // Returns parsed lines, the new byte offset, and any I/O error.
 // Lines other than user and assistant turns, unparseable lines, and lines
 // longer than maxLineBytes are skipped; the returned offset always advances
 // past them.
 func Read(path string, offset int64) ([]Line, int64, error) {
+	lines, pos, _, err := ReadWithTitles(path, offset)
+	return lines, pos, err
+}
+
+// ReadWithTitles is Read that also returns the newest title records in the
+// range. The title records are not returned as lines, for the same reason no
+// other non-turn line is.
+func ReadWithTitles(path string, offset int64) ([]Line, int64, Titles, error) {
+	return readWithTitles(path, offset, false)
+}
+
+// ReadComplete is Read for a growing transcript. An unterminated final record
+// stays unread, even when it is invalid or oversized, until its newline arrives.
+func ReadComplete(path string, offset int64) ([]Line, int64, error) {
+	lines, pos, _, err := ReadCompleteWithTitles(path, offset)
+	return lines, pos, err
+}
+
+// ReadCompleteWithTitles is ReadComplete with the newest complete title records.
+// An unterminated title does not change the returned titles or cursor.
+func ReadCompleteWithTitles(path string, offset int64) ([]Line, int64, Titles, error) {
+	return readWithTitles(path, offset, true)
+}
+
+func readWithTitles(path string, offset int64, completeOnly bool) ([]Line, int64, Titles, error) {
+	var titles Titles
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, offset, err
+		return nil, offset, titles, err
 	}
 	defer func() { _ = f.Close() }()
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return nil, offset, err
+			return nil, offset, titles, err
 		}
 	}
 
@@ -156,13 +227,14 @@ func Read(path string, offset int64) ([]Line, int64, error) {
 	pos := offset
 
 	for {
-		data, consumed, tooLong, err := readLine(r, maxLineBytes)
+		data, consumed, tooLong, err := readLine(r, maxLineBytes, completeOnly)
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return lines, pos, err
+			return lines, pos, titles, err
 		}
+		start := pos
 		pos += consumed
 		if tooLong {
 			continue
@@ -178,14 +250,16 @@ func Read(path string, offset int64) ([]Line, int64, error) {
 		// them would let one sit at the tail of a read, where the Stop settle
 		// read mistakes it for a turn still landing.
 		if line.Type != "user" && line.Type != "assistant" {
+			titles.note(line)
 			continue
 		}
 
+		line.StartOffset = start
 		line.EndOffset = pos
 		lines = append(lines, line)
 	}
 
-	return lines, pos, nil
+	return lines, pos, titles, nil
 }
 
 // readLine returns the next line without its trailing newline, and the bytes
@@ -193,8 +267,9 @@ func Read(path string, offset int64) ([]Line, int64, error) {
 // streams past, never buffered, and reported through tooLong, so one oversized
 // line costs itself and nothing after it. This is the behavior bufio.Scanner
 // cannot give: its ErrTooLong is terminal and abandons the rest of the file.
-// io.EOF is returned only when nothing remains.
-func readLine(r *bufio.Reader, max int) (line []byte, consumed int64, tooLong bool, err error) {
+// With completeOnly, io.EOF also leaves an unterminated final record unread.
+// Otherwise, io.EOF is returned only when nothing remains.
+func readLine(r *bufio.Reader, max int, completeOnly bool) (line []byte, consumed int64, tooLong bool, err error) {
 	var buf []byte
 	for {
 		chunk, rerr := r.ReadSlice('\n')
@@ -214,8 +289,8 @@ func readLine(r *bufio.Reader, max int) (line []byte, consumed int64, tooLong bo
 			continue
 		}
 		if errors.Is(rerr, io.EOF) {
-			if consumed == 0 {
-				return nil, 0, false, io.EOF
+			if consumed == 0 || completeOnly {
+				return nil, consumed, tooLong, io.EOF
 			}
 			break
 		}

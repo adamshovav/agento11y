@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -17,10 +18,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/opencode/sessiondb/sessiondbtest"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/history"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/local"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/login"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/xdg"
 )
 
 // historyFixedNow pins the clock so the 90-day default boundary is checkable.
@@ -355,6 +358,260 @@ func TestHistoryDryRunReportsThePlan(t *testing.T) {
 	}
 }
 
+func TestHistoryOpenCodeLayouts(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		opts       []sessiondbtest.Option
+		legacy     bool
+		v2         bool
+		marker     string
+		claimed    bool
+		wantTurns  int
+		wantReason string
+	}{
+		{name: "v1", legacy: true, wantTurns: 1},
+		{
+			name: "v1 with incidental session_message", legacy: true, wantTurns: 1,
+			opts: []sessiondbtest.Option{sessiondbtest.WithSessionMessage()},
+		},
+		{
+			name: "native v2 without migration marker or events", v2: true, wantTurns: 1,
+			opts: []sessiondbtest.Option{sessiondbtest.WithoutV1(), sessiondbtest.WithSessionV2()},
+		},
+		{
+			name: "completed mixed uses only v2", legacy: true, v2: true, wantTurns: 1,
+			opts:   []sessiondbtest.Option{sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState()},
+			marker: `{"phase":"completed"}`,
+		},
+		{
+			name: "completed mixed never restores deleted v2 sessions", legacy: true,
+			opts:   []sessiondbtest.Option{sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState()},
+			marker: `{"phase":"completed"}`,
+		},
+		{
+			name: "old durable claim", v2: true, claimed: true,
+			opts: []sessiondbtest.Option{sessiondbtest.WithoutV1(), sessiondbtest.WithSessionV2()},
+		},
+		{
+			name: "mixed migration in progress", legacy: true, v2: true,
+			opts:       []sessiondbtest.Option{sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState()},
+			marker:     `{"phase":"sessions","cursor":"secret-migration-cursor"}`,
+			wantReason: "v1-v2 migration is in progress",
+		},
+		{
+			name: "native layout with migration in progress", v2: true,
+			opts:   []sessiondbtest.Option{sessiondbtest.WithoutV1(), sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState()},
+			marker: `{"phase":"sessions"}`, wantReason: "v1-v2 migration is in progress",
+		},
+		{
+			name: "mixed without migration table", legacy: true, v2: true,
+			opts:       []sessiondbtest.Option{sessiondbtest.WithSessionV2()},
+			wantReason: "legacy session rows require a completed v1-v2 migration",
+		},
+		{
+			name: "mixed without migration marker", legacy: true, v2: true,
+			opts:       []sessiondbtest.Option{sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState()},
+			wantReason: "legacy session rows require a completed v1-v2 migration",
+		},
+		{
+			name: "mixed with invalid migration state", legacy: true, v2: true,
+			opts:       []sessiondbtest.Option{sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState()},
+			marker:     `{"phase":"secret-migration-state"`,
+			wantReason: "legacy session rows require a completed v1-v2 migration",
+		},
+		{
+			name: "incomplete v2 never falls back to v1", legacy: true, v2: true,
+			opts:       []sessiondbtest.Option{sessiondbtest.WithSessionV2(), sessiondbtest.WithoutColumn("session_v2", "time_suspended")},
+			wantReason: "table session_v2 is missing column time_suspended",
+		},
+		{
+			name:       "unsupported preview layout",
+			opts:       []sessiondbtest.Option{sessiondbtest.WithoutV1(), sessiondbtest.WithSessionMessage()},
+			wantReason: "missing OpenCode v1",
+		},
+	} {
+		for _, dryRun := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/dry-run=%t", tt.name, dryRun), func(t *testing.T) {
+				withHistoryNow(t)
+				isolateDotenvHome(t)
+				t.Setenv("XDG_DATA_HOME", t.TempDir())
+				db := sessiondbtest.New(t, tt.opts...)
+				t.Setenv("OPENCODE_DB", db.Path)
+				created := historyFixedNow.Add(-25 * time.Hour).UnixMilli()
+				updated := historyFixedNow.Add(-24 * time.Hour).UnixMilli()
+				if tt.legacy {
+					db.AddSession("legacy", "", "secret-legacy-title", "/work/repo", created, updated)
+					db.AddMessage("legacy-assistant", "legacy", created, updated,
+						fmt.Sprintf(`{"role":"assistant","time":{"created":%d,"completed":%d}}`, created, updated))
+					db.AddPart("legacy-text", "legacy-assistant", "legacy", created, updated,
+						`{"type":"text","text":"secret-legacy-output"}`)
+				}
+				if tt.v2 {
+					db.AddSessionV2("current", "secret-v2-title", "/work/repo", created, updated)
+					db.AddV2Message("current-user", "current", "user", 1, created, created,
+						`{"text":"secret-user-prompt","metadata":{"private":"secret-user-metadata"}}`)
+					db.AddV2Message("current-assistant", "current", "assistant", 3, created, updated,
+						fmt.Sprintf(`{"model":{"id":"test-model","providerID":"test-provider"},"time":{"created":%d,"completed":%d},"content":[{"type":"text","text":"secret-assistant-output"},{"type":"reasoning","text":"secret-reasoning"},{"type":"tool","id":"call","name":"read","state":{"status":"completed","input":{"path":"secret-tool-argument"},"content":[{"type":"text","text":"secret-tool-result"}]}}],"metadata":{"private":"secret-assistant-metadata"},"providerState":{"private":"secret-provider-state"}}`, created, updated))
+					if tt.claimed {
+						db.SetV2Claim("current", &created)
+					}
+				}
+				if tt.marker != "" {
+					db.SetMigrationState(tt.marker)
+				}
+
+				exported := 0
+				if dryRun || tt.wantTurns == 0 {
+					prevLocal, prevExporter := historyEnsureLocal, historyNewExporter
+					t.Cleanup(func() { historyEnsureLocal, historyNewExporter = prevLocal, prevExporter })
+					historyEnsureLocal = func(context.Context) (string, error) {
+						t.Fatal("dry run or empty plan started a local receiver")
+						return "", errors.New("unexpected receiver")
+					}
+					historyNewExporter = func(context.Context, history.Target, *log.Logger) (history.TurnExporter, func(context.Context) error, error) {
+						t.Fatal("dry run or empty plan constructed an exporter")
+						return nil, nil, errors.New("unexpected exporter")
+					}
+				} else {
+					withStubHistoryExporter(t, &exported)
+				}
+				withStubLoginRun(t, func(context.Context, login.RunOpts) (login.Result, error) {
+					t.Fatal("local import or dry run started login")
+					return login.Result{}, nil
+				})
+
+				args := []string{"history", "import", "opencode", "--local", "--all", "--yes"}
+				if dryRun {
+					args = append(args, "--dry-run")
+				}
+				stdout, stderr, code := runHistory(t, args...)
+				if code != nil {
+					t.Fatalf("exit = %d, stdout=%q stderr=%q", *code, stdout, stderr)
+				}
+				if want := fmt.Sprintf("planned: %d sessions, %d turns", tt.wantTurns, tt.wantTurns); !strings.Contains(stdout, want) {
+					t.Fatalf("stdout = %q, want %q", stdout, want)
+				}
+				if strings.Contains(stdout+stderr, "secret-") {
+					t.Fatal("CLI output contains source content")
+				}
+				if tt.wantReason != "" {
+					for _, want := range []string{"warning:", db.Path, tt.wantReason, "no sessions were read"} {
+						if !strings.Contains(stdout+stderr, want) {
+							t.Errorf("output = %q, want diagnostic %q", stdout+stderr, want)
+						}
+					}
+				} else if strings.Contains(stdout+stderr, "warning:") {
+					t.Fatalf("supported layout produced a warning: %s%s", stdout, stderr)
+				}
+				if tt.claimed && !strings.Contains(stdout, "active") {
+					t.Fatalf("old execution claim was not reported as active: %s", stdout)
+				}
+				if dryRun || tt.wantTurns == 0 {
+					if exported != 0 {
+						t.Fatalf("exported = %d, want 0", exported)
+					}
+					if _, err := os.Stat(filepath.Join(xdg.AppStateRoot(), "history")); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("dry run or empty plan created history state: %v", err)
+					}
+					if dryRun && !strings.Contains(stdout, "Dry run: nothing was decoded, exported, or stored.") {
+						t.Fatalf("dry-run guarantee missing: %s", stdout)
+					}
+					return
+				}
+				if exported != tt.wantTurns || !strings.Contains(stdout, "Imported 1 turns from 1 sessions") {
+					t.Fatalf("exported = %d, stdout=%q stderr=%q", exported, stdout, stderr)
+				}
+				stdout, stderr, code = runHistory(t, args...)
+				if code != nil || exported != tt.wantTurns || !strings.Contains(stdout, "1 already imported, 0 failed") {
+					t.Fatalf("rerun exit=%v exported=%d stdout=%q stderr=%q", code, exported, stdout, stderr)
+				}
+			})
+		}
+	}
+}
+
+func TestHistoryOpenCodeSelectedSourceChanges(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		change func(*testing.T, *sessiondbtest.Builder)
+		reason string
+	}{
+		{
+			name: "migration starts",
+			change: func(_ *testing.T, db *sessiondbtest.Builder) {
+				db.SetMigrationState(`{"phase":"sessions","cursor":"secret-migration-cursor"}`)
+			},
+			reason: "v1-v2 migration is in progress",
+		},
+		{
+			name: "schema becomes unsupported",
+			change: func(t *testing.T, db *sessiondbtest.Builder) {
+				if _, err := db.DB.Exec(`alter table session_message drop column seq`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			reason: "table session_message is missing column seq",
+		},
+		{
+			name: "session becomes claimed",
+			change: func(_ *testing.T, db *sessiondbtest.Builder) {
+				claim := historyFixedNow.UnixMilli()
+				db.SetV2Claim("current", &claim)
+			},
+			reason: "session has an unresolved execution claim",
+		},
+		{
+			name: "session is deleted",
+			change: func(t *testing.T, db *sessiondbtest.Builder) {
+				if _, err := db.DB.Exec(`delete from session_v2 where id = 'current'`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			reason: "session no longer exists",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			withHistoryNow(t)
+			isolateDotenvHome(t)
+			t.Setenv("XDG_DATA_HOME", t.TempDir())
+			db := sessiondbtest.New(t, sessiondbtest.WithoutV1(), sessiondbtest.WithSessionV2(), sessiondbtest.WithMigrationState())
+			t.Setenv("OPENCODE_DB", db.Path)
+			at := historyFixedNow.Add(-24 * time.Hour).UnixMilli()
+			db.AddSessionV2("current", "secret-v2-title", "/work/repo", at, at)
+			db.AddV2Message("assistant", "current", "assistant", 1, at, at,
+				fmt.Sprintf(`{"time":{"created":%d,"completed":%d},"content":[{"type":"text","text":"secret-assistant-output"}]}`, at, at))
+			exported := 0
+			withStubHistoryExporter(t, &exported)
+			prevSelect := historySelect
+			t.Cleanup(func() { historySelect = prevSelect })
+			historySelect = func(sessions []history.SessionPreview) ([]history.SessionPreview, error) {
+				if len(sessions) != 1 || sessions[0].SessionID != "current" {
+					t.Fatalf("offered sessions = %+v, want current", sessions)
+				}
+				tt.change(t, db)
+				return sessions, nil
+			}
+
+			var stdout, stderr bytes.Buffer
+			err := historyImport(historyImportOptions{
+				Agent: history.AgentOpenCode, Local: true, Yes: true,
+				Since: historyFixedNow.Add(-history.DefaultSinceWindow),
+			}, true, &stdout, &stderr)
+			if err == nil || exported != 0 || !strings.Contains(stdout.String(), "1 failed") {
+				t.Fatalf("import error=%v exported=%d stdout=%q stderr=%q", err, exported, stdout.String(), stderr.String())
+			}
+			for _, want := range []string{"warning:", "current", db.Path, tt.reason} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr = %q, want %q", stderr.String(), want)
+				}
+			}
+			if strings.Contains(stdout.String()+stderr.String()+err.Error(), "secret-") {
+				t.Fatal("changed-source diagnostic contains source content")
+			}
+		})
+	}
+}
+
 func TestHistoryAutoDryRunDiscoversEveryRegisteredAgent(t *testing.T) {
 	withHistoryNow(t)
 	writeClaudeHistory(t, "sess-recent", 24*time.Hour)
@@ -425,6 +682,10 @@ func TestHistoryResolveDestination(t *testing.T) {
 		localEnvKey     string
 		endpoint        string
 		credentials     bool
+		protocol        string
+		optIn           string
+		collector       string
+		tenantOnly      bool
 		interactive     bool
 		loginResult     login.Result
 		loginErr        error
@@ -460,6 +721,42 @@ func TestHistoryResolveDestination(t *testing.T) {
 			name:        "saved credentials select Cloud",
 			credentials: true,
 			interactive: true,
+		},
+		{
+			name:        "OTel Cloud identity needs no HTTP token",
+			endpoint:    "https://127.0.0.1:8765",
+			protocol:    "otel",
+			optIn:       "true",
+			collector:   "http://127.0.0.1:4318",
+			tenantOnly:  true,
+			interactive: true,
+		},
+		{
+			name:        "OTel missing ledger identity does not ask for an HTTP token",
+			protocol:    "otel",
+			optIn:       "true",
+			collector:   "http://127.0.0.1:4318",
+			interactive: true,
+		},
+		{
+			name:        "OTel without opt-in does not prompt or fall back",
+			protocol:    "otel",
+			collector:   "http://127.0.0.1:4318",
+			interactive: true,
+			wantErr:     "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=true",
+		},
+		{
+			name:        "OTel without collector does not prompt or fall back",
+			protocol:    "otel",
+			optIn:       "true",
+			interactive: true,
+			wantErr:     "OTLP base endpoint",
+		},
+		{
+			name:        "invalid protocol does not prompt or fall back",
+			protocol:    "unsupported",
+			interactive: true,
+			wantErr:     "expected http or otel",
 		},
 		{
 			name:        "loopback endpoint needs no setup",
@@ -549,6 +846,13 @@ func TestHistoryResolveDestination(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			isolateDotenvHome(t)
+			t.Setenv("AGENTO11Y_PROTOCOL", tt.protocol)
+			t.Setenv("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES", tt.optIn)
+			t.Setenv("AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT", tt.collector)
+			t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+			if tt.tenantOnly {
+				t.Setenv("AGENTO11Y_AUTH_TENANT_ID", "test-tenant")
+			}
 			localKey := tt.localEnvKey
 			if localKey == "" {
 				localKey = envconfig.PreferredKey("LOCAL")
@@ -866,7 +1170,7 @@ func TestHistoryImportNonInteractiveMissingCredentialsDoesNotPrompt(t *testing.T
 	if code == nil || *code != 1 {
 		t.Fatalf("exit = %v, want 1 (stderr=%q)", code, stderr)
 	}
-	want := "history: no credentials configured for import (run `agento11y login` or use --local)"
+	want := "history: no credentials configured for import (Cloud requires tenant identity; HTTP also requires an API token; run `agento11y login` or use --local)"
 	if !strings.Contains(stderr, want) {
 		t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
 	}
@@ -902,6 +1206,15 @@ func TestHistoryImportLoopbackEndpointSkipsSetup(t *testing.T) {
 	}
 	if exported != 1 {
 		t.Fatalf("exported %d turns to the configured endpoint, want 1", exported)
+	}
+	// The endpoint is the local daemon, so the import answers the viewer's
+	// offer although --local was not passed.
+	offer, err := history.ShouldOfferPrompt(history.AgentClaudeCode)
+	if err != nil {
+		t.Fatalf("ShouldOfferPrompt: %v", err)
+	}
+	if offer {
+		t.Error("an import into the daemon through AGENTO11Y_ENDPOINT left the viewer's import offer")
 	}
 }
 
@@ -1219,4 +1532,100 @@ func newCountingIngest(t *testing.T, exported *int) string {
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
+}
+
+// acceptingExporter takes every turn, so a test can run an import into Grafana
+// Cloud without a network.
+type acceptingExporter struct{ exported *int }
+
+func (e acceptingExporter) ExportHistoricalGeneration(context.Context, history.HistoricalGeneration) error {
+	*e.exported++
+	return nil
+}
+
+func (acceptingExporter) Flush(context.Context) error { return nil }
+
+// withStubCloudExporter replaces the export pipeline for an import into
+// Grafana Cloud, and fails the test if the import goes to the local store.
+func withStubCloudExporter(t *testing.T, exported *int) {
+	t.Helper()
+	prev := historyNewExporter
+	t.Cleanup(func() { historyNewExporter = prev })
+	historyNewExporter = func(_ context.Context, target history.Target, _ *log.Logger) (history.TurnExporter, func(context.Context) error, error) {
+		if target.Local() {
+			t.Error("the import went to the local store, want Grafana Cloud")
+		}
+		return acceptingExporter{exported: exported}, func(context.Context) error { return nil }, nil
+	}
+}
+
+// Regression: an import into Grafana Cloud answered the viewer's one-time
+// offer, so the banner stopped offering sessions the local store still lacked.
+func TestHistoryCloudImportLeavesTheViewerOffer(t *testing.T) {
+	for _, agent := range []string{"claude-code", "auto"} {
+		t.Run(agent, func(t *testing.T) {
+			withHistoryNow(t)
+			isolateDotenvHome(t)
+			writeClaudeHistory(t, "sess-recent", 24*time.Hour)
+			setHistoryCloudCredentials(t, "https://agento11y.example.com")
+			exported := 0
+			withStubCloudExporter(t, &exported)
+
+			_, stderr, code := runHistory(t, "history", "import", agent, "--all", "--yes")
+			if code != nil {
+				t.Fatalf("exit = %d (stderr=%q)", *code, stderr)
+			}
+			if exported != 1 {
+				t.Fatalf("exported %d turns to Grafana Cloud, want 1", exported)
+			}
+			offer, err := history.ShouldOfferPrompt(history.AgentClaudeCode)
+			if err != nil {
+				t.Fatalf("ShouldOfferPrompt: %v", err)
+			}
+			if !offer {
+				t.Error("an import into Grafana Cloud answered the viewer's import offer")
+			}
+		})
+	}
+}
+
+func TestHistoryLocalImportAnswersTheViewerOffer(t *testing.T) {
+	for _, agent := range []string{"claude-code", "auto"} {
+		t.Run(agent, func(t *testing.T) {
+			withHistoryNow(t)
+			isolateDotenvHome(t)
+			writeClaudeHistory(t, "sess-recent", 24*time.Hour)
+			exported := 0
+			withStubHistoryExporter(t, &exported)
+
+			_, stderr, code := runHistory(t, "history", "import", agent, "--local", "--all", "--yes")
+			if code != nil {
+				t.Fatalf("exit = %d (stderr=%q)", *code, stderr)
+			}
+			offer, err := history.ShouldOfferPrompt(history.AgentClaudeCode)
+			if err != nil {
+				t.Fatalf("ShouldOfferPrompt: %v", err)
+			}
+			if offer {
+				t.Error("a completed import into the local store left the viewer's import offer")
+			}
+		})
+	}
+}
+
+// Regression: the first-run setup check read AGENTO11Y_ENDPOINT raw, so a
+// daemon address without a scheme and AGENTO11Y_INSECURE asked for Cloud
+// credentials although the import goes to the local daemon and needs none.
+func TestHistoryDestinationConfiguredReadsTheEndpointAsTheImportDoes(t *testing.T) {
+	isolateDotenvHome(t)
+	envconfig.PinAliasEnvBlank(t)
+	t.Setenv(envconfig.PreferredKey("ENDPOINT"), "127.0.0.1:8765")
+	t.Setenv(envconfig.PreferredKey("INSECURE"), "true")
+	if !historyDestinationConfigured() {
+		t.Error("a daemon address without a scheme, with AGENTO11Y_INSECURE, still asks for setup")
+	}
+	t.Setenv(envconfig.PreferredKey("INSECURE"), "")
+	if historyDestinationConfigured() {
+		t.Error("an https endpoint without credentials skipped setup")
+	}
 }

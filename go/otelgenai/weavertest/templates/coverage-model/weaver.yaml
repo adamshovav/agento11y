@@ -1,0 +1,61 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Base signals define shared expectations. Keep selected tool execution kinds in a
+# separate map so their attributes do not become requirements for generic tools.
+# Provider-specific conventions remain excluded.
+templates:
+  - template: "coverage-model.json.j2"
+    application_mode: single
+    filter: |
+      def level: if type == "object" then (keys[0] + "_conditional") else . end;
+
+      def attributes:
+        [.attributes[]? | {key: .key, value: (.requirement_level | level)}]
+        | from_entries;
+
+      def enums:
+        [
+          .registry.attributes[]? | select(.type | type == "object" and .members) | {
+             key: .key,
+             value: [.type.members[]?.value]
+          }
+        ] | from_entries;
+
+      def entity_identity:
+        [.identity[]? | {key: .key, value: (.requirement_level | level)}]
+        | from_entries;
+
+      def entity_description:
+        [.description[]? | {key: .key, value: (.requirement_level | level)}]
+        | from_entries;
+
+      {
+        spans: ([.refinements.spans[]? | select(.id == .type)] | map({
+          key: .type,
+          value: {kind: .kind, attributes: attributes},
+        }) | from_entries),
+        tool_execution_kinds: ([.refinements.spans[]? | select(.id ==
+          "gen_ai.execute_tool.load_skill.internal" or .id ==
+          "gen_ai.execute_tool.read_skill_resource.internal" or .id ==
+          "gen_ai.execute_tool.command.internal")] | map({
+          key: .id,
+          value: {type: .type, kind: .kind, attributes: attributes},
+        }) | from_entries),
+        events: ([.refinements.events[]? | select(.id == .name)] | map({
+          key: .name,
+          value: {attributes: attributes},
+        }) | from_entries),
+        metrics: ([.refinements.metrics[]? | select(.id == .name)] | map({
+          key: .name,
+          value: {attributes: attributes},
+        }) | from_entries),
+        enums: enums,
+        entities: ([.refinements.entities[]? | select(.id == .type)] | map({
+          key: .type,
+          value: {
+            identity: entity_identity,
+            description: entity_description,
+          },
+        }) | from_entries),
+      }

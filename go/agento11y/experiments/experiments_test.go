@@ -22,7 +22,51 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-func boolPointer(value bool) *bool { return &value }
+func TestWithExperimentParentsTrialAndAgentSpans(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	previous := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	defer func() {
+		otel.SetTracerProvider(previous)
+		_ = provider.Shutdown(context.Background())
+	}()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/scores:export" {
+			_, _ = w.Write([]byte(`{"accepted":1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientOptions{Endpoint: server.URL, IngestToken: "token", UseExperimentalOTel: new(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Shutdown(context.Background()) }()
+	_, err = WithExperiment(context.Background(), client, ExperimentOptions{Name: "live"}, func(ctx context.Context, exp *Experiment) error {
+		return exp.WithTrial(ctx, TestCase{TestCaseID: "case"}, func(ctx context.Context, trial *Trial) error {
+			_, span := otel.Tracer("agent").Start(ctx, "invoke_agent")
+			span.End()
+			_, err := trial.FinalScore(true, ScoreOptions{})
+			return err
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans := recorder.Ended()
+	if len(spans) != 3 {
+		t.Fatalf("expected agent/trial/suite spans, got %d", len(spans))
+	}
+	if spans[1].InstrumentationScope().Name != instrumentationName || spans[2].InstrumentationScope().Name != instrumentationName {
+		t.Fatalf("unexpected experiment instrumentation scopes: %q, %q", spans[1].InstrumentationScope().Name, spans[2].InstrumentationScope().Name)
+	}
+	if spans[0].Parent().SpanID() != spans[1].SpanContext().SpanID() || spans[1].Parent().SpanID() != spans[2].SpanContext().SpanID() {
+		t.Fatal("agent/trial/suite ancestry was lost")
+	}
+}
 
 func TestPortableSuiteYAMLAliasesAndRoundTrip(t *testing.T) {
 	suite, err := ParseSuite([]byte(`
@@ -141,7 +185,7 @@ func TestWithTrialEnterFailureReleasesClaimForRetry(t *testing.T) {
 
 	client, err := NewClient(ClientOptions{
 		Endpoint: server.URL, IngestToken: "token",
-		UseExperimentalOTel: boolPointer(false),
+		UseExperimentalOTel: new(false),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +269,7 @@ func TestExperimentLifecycleContractAndStableOccurrences(t *testing.T) {
 
 	client, err := NewClient(ClientOptions{
 		Endpoint: server.URL, TenantID: "123", IngestToken: "token",
-		UseExperimentalOTel: boolPointer(false),
+		UseExperimentalOTel: new(false),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +295,7 @@ func TestExperimentLifecycleContractAndStableOccurrences(t *testing.T) {
 	if err := trial.Enter(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	first, err := trial.CheckScore("verifier", true, ScoreOptions{})
+	first, err := trial.CheckScore("verifier", true, ScoreOptions{ReportRole: ReportRoleDiagnostic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,13 +306,19 @@ func TestExperimentLifecycleContractAndStableOccurrences(t *testing.T) {
 	if first.ScoreID == second.ScoreID {
 		t.Fatalf("repeated verifier score IDs must be occurrence-aware: %q", first.ScoreID)
 	}
-	if _, err := trial.FinalScore(true, ScoreOptions{}); err != nil {
+	if first.ReportRole != ReportRoleDiagnostic || second.ReportRole != "" {
+		t.Fatalf("unexpected report roles: first=%q second=%q", first.ReportRole, second.ReportRole)
+	}
+	if _, err := trial.FinalScore(true, ScoreOptions{ReportRole: ReportRolePrimaryVerdict}); err != nil {
 		t.Fatal(err)
 	}
 	// The test response only accounts for two records; flush the two verifier
 	// scores separately, then leave the final score to close.
 	trial.mu.Lock()
 	final := trial.buffer[len(trial.buffer)-1]
+	if final.ReportRole != ReportRolePrimaryVerdict {
+		t.Fatalf("unexpected final report role: %q", final.ReportRole)
+	}
 	trial.buffer = trial.buffer[:2]
 	trial.mu.Unlock()
 	if _, err := trial.Flush(context.Background()); err != nil {
@@ -571,7 +621,7 @@ func TestExperimentOTelIsOptInAndRedactsEventExplanation(t *testing.T) {
 	if err := trial.Enter(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	const secret = "glc_abcdefghijklmnopqrstuvwxyz123456"
+	const secret = "glc_abcdefghijklmnopqrstuvwxyz123456" // trufflehog:ignore
 	if _, err := trial.FinalScore(true, ScoreOptions{Explanation: secret}); err != nil {
 		t.Fatal(err)
 	}
@@ -731,7 +781,7 @@ func (s *trialEvaluationServer) newClient(t *testing.T, enableExperimentalFeatur
 	}
 	client, err := NewClient(ClientOptions{
 		Endpoint: s.server.URL, TenantID: "123", IngestToken: "token",
-		UseExperimentalOTel:        boolPointer(false),
+		UseExperimentalOTel:        new(false),
 		EnableExperimentalFeatures: experimentalOverride,
 	})
 	if err != nil {
@@ -744,7 +794,7 @@ func (s *trialEvaluationServer) newClient(t *testing.T, enableExperimentalFeatur
 func TestClientForwardsTrialEvaluationCalls(t *testing.T) {
 	clearExperimentalGate(t)
 	server := newTrialEvaluationServer(t, "queued")
-	client := server.newClient(t, boolPointer(true))
+	client := server.newClient(t, new(true))
 
 	evaluation, err := client.TriggerTrialEvaluation(context.Background(), "exp-1", "trial-1", TriggerTrialEvaluationRequest{
 		EvaluatorID: "helpfulness", EvaluatorVersion: "v3",
@@ -827,7 +877,7 @@ func indexOfRequest(requests []capturedRequest, match func(capturedRequest) bool
 func TestTrialEvaluatePersistsConversationAndClosesCompleted(t *testing.T) {
 	clearExperimentalGate(t)
 	server := newTrialEvaluationServer(t, "queued", "claimed", "success")
-	_, trial := newCloudEvaluatedTrial(t, server, boolPointer(true))
+	_, trial := newCloudEvaluatedTrial(t, server, new(true))
 	trial.BindConversation("conv-1").RecordIO(RecordIOOptions{Input: "2+2", Output: "4"})
 
 	evaluation, err := trial.Evaluate(context.Background(), "helpfulness", EvaluateOptions{
@@ -1127,9 +1177,9 @@ func clearExperimentalGate(t *testing.T) {
 func TestCloudTrialEvaluationBlockedWithoutTheGate(t *testing.T) {
 	t.Setenv(agento11y.EnvEnableExperimentalFeatures, "true")
 	server := newTrialEvaluationServer(t, "success")
-	_, trial := newCloudEvaluatedTrial(t, server, boolPointer(false))
+	_, trial := newCloudEvaluatedTrial(t, server, new(false))
 	trial.BindConversation("conv-1")
-	client := server.newClient(t, boolPointer(false))
+	client := server.newClient(t, new(false))
 	before := len(server.captured())
 
 	if _, err := trial.Evaluate(context.Background(), "helpfulness"); !errors.Is(err, agento11y.ErrExperimentalFeatureDisabled) {
@@ -1287,5 +1337,30 @@ func TestExperimentalGateHasNoLegacySpelling(t *testing.T) {
 	t.Setenv("SIGIL_ENABLE_EXPERIMENTAL_FEATURES", "1")
 	if agento11y.ExperimentalFeaturesEnabled() {
 		t.Fatal("SIGIL_ENABLE_EXPERIMENTAL_FEATURES must not open the gate; the name postdates the rename")
+	}
+}
+
+func TestPrimaryVerdictLifecycleParity(t *testing.T) {
+	trial := newTrial(&Client{}, TrialRef{ExperimentID: "run", TestCaseID: "case"}, nil, nil, nil, nil, nil, false)
+	passed, failed := true, false
+	if _, err := trial.FinalScore(true, ScoreOptions{Passed: &passed}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trial.Score("quality", 0.2, ScoreOptions{Passed: &failed, ReportRole: ReportRolePrimaryVerdict}); err != nil {
+		t.Fatal(err)
+	}
+	if !trial.hasPrimaryVerdict || trial.primaryPassed == nil || *trial.primaryPassed {
+		t.Fatalf("primary verdict did not override legacy final: %#v", trial.primaryPassed)
+	}
+	if _, err := trial.Score("safety", 1, ScoreOptions{Passed: &passed, ReportRole: ReportRolePrimaryVerdict}); err == nil {
+		t.Fatal("expected duplicate primary verdict to fail")
+	}
+
+	diagnostic := newTrial(&Client{}, TrialRef{ExperimentID: "run", TestCaseID: "diagnostic"}, nil, nil, nil, nil, nil, false)
+	if _, err := diagnostic.FinalScore(true, ScoreOptions{ReportRole: ReportRoleDiagnostic}); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.hasFinal {
+		t.Fatal("diagnostic final must not become a lifecycle verdict")
 	}
 }

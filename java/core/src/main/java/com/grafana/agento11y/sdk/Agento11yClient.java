@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -78,6 +79,13 @@ public final class Agento11yClient implements AutoCloseable {
     static final String SPAN_ATTR_TOOL_DESCRIPTION = "gen_ai.tool.description";
     static final String SPAN_ATTR_TOOL_CALL_ARGUMENTS = "gen_ai.tool.call.arguments";
     static final String SPAN_ATTR_TOOL_CALL_RESULT = "gen_ai.tool.call.result";
+    static final String SPAN_ATTR_SKILL_NAME = "gen_ai.skill.name";
+    static final String SPAN_ATTR_SKILL_DESCRIPTION = "gen_ai.skill.description";
+    static final String SPAN_ATTR_SKILL_SOURCE_URI = "gen_ai.skill.source.uri";
+    static final String SPAN_ATTR_SKILL_RESOURCE_NAME = "gen_ai.skill.resource.name";
+    static final String SPAN_ATTR_PROCESS_EXECUTABLE_NAME = "process.executable.name";
+    static final String SPAN_ATTR_PROCESS_EXECUTABLE_PATH = "process.executable.path";
+    static final String SPAN_ATTR_PROCESS_EXIT_CODE = "process.exit.code";
     static final String SPAN_ATTR_TAG_PREFIX = "agento11y.tag.";
     private static final int MAX_RATING_CONVERSATION_ID_LEN = 255;
     private static final int MAX_RATING_ID_LEN = 128;
@@ -112,6 +120,7 @@ public final class Agento11yClient implements AutoCloseable {
             65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0, 67108864.0);
 
     private static final Pattern STATUS_CODE_PATTERN = Pattern.compile("\\b([1-5][0-9][0-9])\\b");
+    private static final Pattern SKILL_SOURCE_URI_PADDING_PATTERN = Pattern.compile("^\\p{IsWhite_Space}+|\\p{IsWhite_Space}+$");
     private static final String INSTRUMENTATION_NAME = "github.com/grafana/agento11y/sdks/java";
     static final String DEFAULT_EMBEDDING_OPERATION_NAME = "embeddings";
     static final String TOOL_EXECUTION_OPERATION_NAME = "execute_tool";
@@ -131,10 +140,11 @@ public final class Agento11yClient implements AutoCloseable {
     private final EmbeddingCaptureConfig embeddingCaptureConfig;
     private final Logger logger;
     private final Clock clock;
+    private final int debugBufferSize;
     private final HttpClient ratingHttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
-    private final List<Generation> generations = new ArrayList<>();
-    private final List<ToolExecution> toolExecutions = new ArrayList<>();
+    private final ArrayDeque<Generation> generations = new ArrayDeque<>();
+    private final ArrayDeque<ToolExecution> toolExecutions = new ArrayDeque<>();
     private final Object debugLock = new Object();
 
     private final Object queueLock = new Object();
@@ -175,6 +185,11 @@ public final class Agento11yClient implements AutoCloseable {
         this.logger = config.getLogger();
         this.clock = config.getClock();
         Agento11yEnvConfig.logWarnings(this.logger, envResult.warnings());
+        int requestedDebugBufferSize = config.getDebugBufferSize();
+        if (requestedDebugBufferSize < 0) {
+            logWarn("agento11y: ignoring negative debugBufferSize " + requestedDebugBufferSize + "; using 0 (disabled)", null);
+        }
+        this.debugBufferSize = Math.max(0, requestedDebugBufferSize);
         this.embeddingCaptureConfig = normalizeEmbeddingCaptureConfig(config.getEmbeddingCapture());
 
         GenerationExportConfig exportConfig = config.getGenerationExport();
@@ -380,12 +395,18 @@ public final class Agento11yClient implements AutoCloseable {
         @SuppressWarnings("deprecation")
         boolean legacyIncludeContent = seed.isIncludeContent();
 
-        Span span = tracer.spanBuilder(toolSpanName(seed.getToolName()))
+        Span span = tracer.spanBuilder(toolSpanName(seed))
                 .setSpanKind(SpanKind.INTERNAL)
                 .setStartTimestamp(startedAt)
+                .setAllAttributes(toolStructuralAttributes(seed))
                 .startSpan();
         setToolSpanAttributes(span, seed);
         span.setAllAttributes(clientTagAttributes());
+        boolean includeSkillProcessContent = resolvedToolMode != ContentCaptureMode.METADATA_ONLY
+                && resolvedToolMode != ContentCaptureMode.FULL_WITH_METADATA_SPANS;
+        if (includeSkillProcessContent) {
+            setToolSkillProcessContentAttributes(span, seed);
+        }
 
         return new ToolExecutionRecorder(this, seed, span, startedAt, resolvedToolMode, legacyIncludeContent);
     }
@@ -612,7 +633,8 @@ public final class Agento11yClient implements AutoCloseable {
     /** Returns an in-memory snapshot of recorded generations, tool executions, and queue size. */
     public Agento11yDebugSnapshot debugSnapshot() {
         synchronized (debugLock) {
-            return new Agento11yDebugSnapshot(generations, toolExecutions, pendingGenerations.size());
+            return new Agento11yDebugSnapshot(
+                    new ArrayList<>(generations), new ArrayList<>(toolExecutions), pendingGenerations.size());
         }
     }
 
@@ -654,14 +676,28 @@ public final class Agento11yClient implements AutoCloseable {
     }
 
     void recordGeneration(Generation generation) {
+        if (debugBufferSize == 0) {
+            return;
+        }
         synchronized (debugLock) {
-            generations.add(generation.copy());
+            Generation copy = generation.copy();
+            if (generations.size() == debugBufferSize) {
+                generations.removeFirst();
+            }
+            generations.addLast(copy);
         }
     }
 
     void recordToolExecution(ToolExecution toolExecution) {
+        if (debugBufferSize == 0) {
+            return;
+        }
         synchronized (debugLock) {
-            toolExecutions.add(toolExecution.copy());
+            ToolExecution copy = toolExecution.copy();
+            if (toolExecutions.size() == debugBufferSize) {
+                toolExecutions.removeFirst();
+            }
+            toolExecutions.addLast(copy);
         }
     }
 
@@ -1094,8 +1130,105 @@ public final class Agento11yClient implements AutoCloseable {
         return DEFAULT_EMBEDDING_OPERATION_NAME + " " + modelName;
     }
 
-    static String toolSpanName(String toolName) {
-        return "execute_tool " + toolName;
+    static String toolSpanName(ToolExecutionStart seed) {
+        String name = "execute_tool " + seed.getToolName();
+        ToolExecutionKind executionKind = seed.getExecutionKind();
+        if (executionKind == null) {
+            return name;
+        }
+        String skill = seed.getSkillName().trim();
+        String resource = seed.getSkillResourceName().trim();
+        String executable = seed.getProcessExecutableName().trim();
+        if (executionKind == ToolExecutionKind.LOAD_SKILL) {
+            return skill.isBlank() ? name : name + " " + skill;
+        }
+        if (!resource.isBlank()) {
+            return name + " " + (skill.isBlank() ? "" : skill + " ") + resource;
+        }
+        if (executionKind == ToolExecutionKind.COMMAND && !executable.isBlank()) {
+            return name + " " + executable;
+        }
+        return name;
+    }
+
+    // Only structural identity is supplied before startSpan: private content and
+    // completion fields must never be visible to a creation-time sampler.
+    private static Attributes toolStructuralAttributes(ToolExecutionStart seed) {
+        AttributesBuilder attributes = Attributes.builder()
+                .put(SPAN_ATTR_SDK_NAME, SDK_NAME)
+                .put(SPAN_ATTR_OPERATION_NAME, TOOL_EXECUTION_OPERATION_NAME);
+        attributes.put(SPAN_ATTR_TOOL_NAME, seed.getToolName());
+        if (!seed.getToolCallId().isBlank()) {
+            attributes.put(SPAN_ATTR_TOOL_CALL_ID, seed.getToolCallId());
+        }
+        if (!seed.getToolType().isBlank()) {
+            attributes.put(SPAN_ATTR_TOOL_TYPE, seed.getToolType());
+        }
+        ToolExecutionKind executionKind = seed.getExecutionKind();
+        if (executionKind != null) {
+            putToolAttribute(attributes, SPAN_ATTR_SKILL_NAME, seed.getSkillName());
+            if (executionKind != ToolExecutionKind.LOAD_SKILL) {
+                putToolAttribute(attributes, SPAN_ATTR_SKILL_RESOURCE_NAME, seed.getSkillResourceName());
+            }
+            if (executionKind == ToolExecutionKind.COMMAND) {
+                putToolAttribute(attributes, SPAN_ATTR_PROCESS_EXECUTABLE_NAME, seed.getProcessExecutableName());
+            }
+        }
+        return attributes.build();
+    }
+
+    private static void putToolAttribute(AttributesBuilder attributes, String key, String value) {
+        if (!value.isBlank()) {
+            attributes.put(key, value.trim());
+        }
+    }
+
+    private static void setToolSkillProcessContentAttributes(Span span, ToolExecutionStart seed) {
+        if (seed.getExecutionKind() == null) {
+            return;
+        }
+        AttributesBuilder attributes = Attributes.builder();
+        putToolAttribute(attributes, SPAN_ATTR_SKILL_DESCRIPTION, seed.getSkillDescription());
+        putToolAttribute(attributes, SPAN_ATTR_SKILL_SOURCE_URI, scrubSkillSourceURI(seed.getSkillSourceURI()));
+        if (seed.getExecutionKind() == ToolExecutionKind.COMMAND) {
+            putToolAttribute(attributes, SPAN_ATTR_PROCESS_EXECUTABLE_PATH, seed.getProcessExecutablePath());
+        }
+        span.setAllAttributes(attributes.build());
+    }
+
+    private static String scrubSkillSourceURI(String source) {
+        source = SKILL_SOURCE_URI_PADDING_PATTERN.matcher(source).replaceAll("");
+        if (source.codePoints().anyMatch(c -> Character.isWhitespace(c)
+                || Character.isSpaceChar(c) || Character.isISOControl(c))) {
+            return "";
+        }
+        try {
+            URI uri = new URI(source).parseServerAuthority();
+            if (!uri.isAbsolute() || uri.isOpaque()) {
+                return "";
+            }
+            boolean file = "file".equalsIgnoreCase(uri.getScheme());
+            String path = uri.getRawPath();
+            String authority = uri.getRawAuthority();
+            if (file && (path == null || !path.startsWith("/"))) {
+                return "";
+            }
+            if (authority == null) {
+                if (!file) {
+                    return "";
+                }
+                authority = "";
+            } else {
+                if (uri.getHost() == null || uri.getPort() > 65535 || authority.endsWith(":")) {
+                    return "";
+                }
+                authority = authority.substring(authority.lastIndexOf('@') + 1);
+            }
+            // Preserve escaped paths and canonicalize hostless absolute file URIs.
+            return new URI(uri.getScheme() + "://" + authority + path).toString();
+        } catch (java.net.URISyntaxException exception) {
+            return "";
+        }
     }
 
     static String defaultOperationName(GenerationMode mode) {
@@ -1225,8 +1358,6 @@ public final class Agento11yClient implements AutoCloseable {
     }
 
     static void setToolSpanAttributes(Span span, ToolExecutionStart seed) {
-        span.setAttribute(SPAN_ATTR_SDK_NAME, SDK_NAME);
-        span.setAttribute(SPAN_ATTR_OPERATION_NAME, TOOL_EXECUTION_OPERATION_NAME);
         if (!seed.getConversationId().isBlank()) {
             span.setAttribute(SPAN_ATTR_CONVERSATION_ID, seed.getConversationId());
         }
@@ -1244,15 +1375,6 @@ public final class Agento11yClient implements AutoCloseable {
         }
         if (!seed.getRequestModel().isBlank()) {
             span.setAttribute(SPAN_ATTR_REQUEST_MODEL, seed.getRequestModel());
-        }
-        if (!seed.getToolName().isBlank()) {
-            span.setAttribute(SPAN_ATTR_TOOL_NAME, seed.getToolName());
-        }
-        if (!seed.getToolCallId().isBlank()) {
-            span.setAttribute(SPAN_ATTR_TOOL_CALL_ID, seed.getToolCallId());
-        }
-        if (!seed.getToolType().isBlank()) {
-            span.setAttribute(SPAN_ATTR_TOOL_TYPE, seed.getToolType());
         }
         if (!seed.getToolDescription().isBlank()) {
             span.setAttribute(SPAN_ATTR_TOOL_DESCRIPTION, seed.getToolDescription());
@@ -1418,16 +1540,43 @@ public final class Agento11yClient implements AutoCloseable {
             errorCategory = errorCategoryFromThrowable(finalError, true);
         }
 
-        operationDurationHistogram.record(
-                durationSeconds,
-                metricIdentityAttributes(seed.getRequestProvider(), seed.getRequestModel(), seed.getAgentName(), seed.getAgentVersion())
-                        .put(SPAN_ATTR_OPERATION_NAME, TOOL_EXECUTION_OPERATION_NAME)
-                        .put(SPAN_ATTR_TOOL_NAME, seed.getToolName().trim())
-                        .putAll(clientTagAttributes())
-                        .put(SPAN_ATTR_ERROR_TYPE, errorType)
-                        .put(SPAN_ATTR_ERROR_CATEGORY, errorCategory)
-                        .build()
-        );
+        AttributesBuilder attributes = metricIdentityAttributes(
+                seed.getRequestProvider(), seed.getRequestModel(), seed.getAgentName(), seed.getAgentVersion())
+                .put(SPAN_ATTR_OPERATION_NAME, TOOL_EXECUTION_OPERATION_NAME)
+                .put(SPAN_ATTR_TOOL_NAME, seed.getToolName().trim())
+                .putAll(clientTagAttributes())
+                .put(SPAN_ATTR_ERROR_TYPE, errorType)
+                .put(SPAN_ATTR_ERROR_CATEGORY, errorCategory);
+        String executionKind = seed.getExecutionKind() == null ? null : switch (seed.getExecutionKind()) {
+            case LOAD_SKILL -> "load_skill";
+            case READ_SKILL_RESOURCE -> "read_skill_resource";
+            case COMMAND -> "command";
+            default -> null;
+        };
+        if (executionKind != null) {
+            attributes.put("agento11y.tool.execution.kind", executionKind);
+            String skillName = trimUnicodeWhitespace(seed.getSkillName());
+            if (!skillName.isEmpty()) {
+                attributes.put(SPAN_ATTR_SKILL_NAME, skillName);
+            }
+        }
+        operationDurationHistogram.record(durationSeconds, attributes.build());
+    }
+
+    private static String trimUnicodeWhitespace(String value) {
+        int start = 0;
+        int end = value.length();
+        while (start < end && isUnicodeWhitespace(value.charAt(start))) {
+            start++;
+        }
+        while (end > start && isUnicodeWhitespace(value.charAt(end - 1))) {
+            end--;
+        }
+        return value.substring(start, end);
+    }
+
+    private static boolean isUnicodeWhitespace(char value) {
+        return value <= ' ' || Character.isWhitespace(value) || Character.isSpaceChar(value) || value == '\u0085';
     }
 
     static String errorCategoryFromThrowable(Throwable error, boolean fallbackSdk) {

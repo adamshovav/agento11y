@@ -1149,16 +1149,24 @@ class ContentCaptureModeTest {
     void strippedModes_toolSpan_omitsContentAttrs(StrippedMode mode) {
         // The full set of content-bearing attributes the tool span path can
         // carry. Under either stripped mode none of them should appear.
-        try (ContentCaptureTestEnv env = ContentCaptureTestEnv.builder(mode.mode).build()) {
+        try (ContentCaptureTestEnv env = ContentCaptureTestEnv.builder(mode.mode).debugBufferSize(1).build()) {
             try (ToolExecutionRecorder rec = env.client.startToolExecution(new ToolExecutionStart()
                     .setToolName("weather")
                     .setToolCallId("call_1")
                     .setConversationTitle("Sensitive tool title")
                     .setToolDescription("Get weather: free-form provider-supplied text")
+                    .setExecutionKind(ToolExecutionKind.COMMAND)
+                    .setSkillName("review")
+                    .setSkillDescription("Private review instructions")
+                    .setSkillSourceURI("https://user:secret@skills.example/review?token=secret#part")
+                    .setSkillResourceName("check.py")
+                    .setProcessExecutableName("python3")
+                    .setProcessExecutablePath("/private/python3")
                     .setIncludeContent(true))) {
                 rec.setResult(new ToolExecutionResult()
                         .setArguments(Map.of("city", "Paris"))
-                        .setResult(Map.of("temp_c", 18)));
+                        .setResult(Map.of("temp_c", 18))
+                        .setProcessExitCode(0L));
             }
 
             SpanData toolSpan = env.toolSpan();
@@ -1166,8 +1174,25 @@ class ContentCaptureModeTest {
             assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey("gen_ai.tool.call.result"))).isNull();
             assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey("agento11y.conversation.title"))).isNull();
             assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey("gen_ai.tool.description"))).isNull();
+            for (String key : List.of("gen_ai.skill.description", "gen_ai.skill.source.uri", "process.executable.path")) {
+                assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey(key))).as(key).isNull();
+            }
             // Identity attributes still emitted.
+            assertThat(toolSpan.getName()).isEqualTo("execute_tool weather review check.py");
             assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey("gen_ai.tool.name"))).isEqualTo("weather");
+            assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey("gen_ai.skill.name"))).isEqualTo("review");
+            assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey("gen_ai.skill.resource.name"))).isEqualTo("check.py");
+            assertThat(toolSpan.getAttributes().get(AttributeKey.stringKey("process.executable.name"))).isEqualTo("python3");
+            assertThat(toolSpan.getAttributes().get(AttributeKey.longKey("process.exit.code"))).isEqualTo(0L);
+            // Completed debug snapshots are raw local records, not sanitized spans.
+            ToolExecution snapshot = env.client.debugSnapshot().getToolExecutions().get(0);
+            assertThat(snapshot.getExecutionKind()).isEqualTo(ToolExecutionKind.COMMAND);
+            assertThat(snapshot.getSkillDescription()).isEqualTo("Private review instructions");
+            assertThat(snapshot.getSkillSourceURI()).isEqualTo("https://user:secret@skills.example/review?token=secret#part");
+            assertThat(snapshot.getProcessExecutablePath()).isEqualTo("/private/python3");
+            assertThat(snapshot.getArguments()).isEqualTo(Map.of("city", "Paris"));
+            assertThat(snapshot.getResult()).isEqualTo(Map.of("temp_c", 18));
+            assertThat(snapshot.copy()).usingRecursiveComparison().isEqualTo(snapshot);
         }
     }
 
@@ -1177,7 +1202,7 @@ class ContentCaptureModeTest {
         // Tools have no proto export — the raw provider error must not echo
         // on the span path under either stripped mode.
         String rawError = "provider returned HTTP 400: blocked content '" + LEAK_MARKER + "'";
-        try (ContentCaptureTestEnv env = ContentCaptureTestEnv.builder(mode.mode).build()) {
+        try (ContentCaptureTestEnv env = ContentCaptureTestEnv.builder(mode.mode).debugBufferSize(1).build()) {
             try (ToolExecutionRecorder rec = env.client.startToolExecution(new ToolExecutionStart()
                     .setToolName("weather")
                     .setToolCallId("call_1")
@@ -1189,6 +1214,39 @@ class ContentCaptureModeTest {
             }
 
             assertSpanErrorRedacted(env.toolSpan(), "tool_execution_error");
+            ToolExecution snapshot = env.client.debugSnapshot().getToolExecutions().get(0);
+            assertThat(snapshot.getCallError()).isEqualTo(rawError);
+            assertThat(snapshot.getArguments()).isEqualTo(Map.of("city", "Paris"));
+            assertThat(snapshot.getResult()).isEqualTo(Map.of("temp_c", 18));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ContentCaptureMode.class)
+    @SuppressWarnings("deprecation")
+    void skillProcessPrivateContentFollowsEffectiveMode(ContentCaptureMode mode) {
+        for (boolean legacy : List.of(false, true)) {
+            try (ContentCaptureTestEnv env = ContentCaptureTestEnv.builder(mode).build()) {
+                try (ToolExecutionRecorder recorder = env.client.startToolExecution(new ToolExecutionStart()
+                        .setToolName("exec")
+                        .setExecutionKind(ToolExecutionKind.COMMAND)
+                        .setSkillDescription(" private instructions ")
+                        .setSkillSourceURI("https://user:secret@skills.example/review?token=secret#part")
+                        .setProcessExecutablePath(" /private/python3 ")
+                        .setIncludeContent(legacy))) {
+                    recorder.setResult(new ToolExecutionResult().setProcessExitCode(0L));
+                }
+                boolean include = mode != ContentCaptureMode.METADATA_ONLY
+                        && mode != ContentCaptureMode.FULL_WITH_METADATA_SPANS;
+                SpanData span = env.toolSpan();
+                assertThat(span.getAttributes().get(AttributeKey.stringKey("gen_ai.skill.description")))
+                        .isEqualTo(include ? "private instructions" : null);
+                assertThat(span.getAttributes().get(AttributeKey.stringKey("gen_ai.skill.source.uri")))
+                        .isEqualTo(include ? "https://skills.example/review" : null);
+                assertThat(span.getAttributes().get(AttributeKey.stringKey("process.executable.path")))
+                        .isEqualTo(include ? "/private/python3" : null);
+                assertThat(span.getAttributes().get(AttributeKey.longKey("process.exit.code"))).isEqualTo(0L);
+            }
         }
     }
 

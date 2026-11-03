@@ -10,7 +10,7 @@
           "name": "claude-sonnet-4-pi"
         },
         "response_id": "resp-pi-1",
-        "response_model": "claude-sonnet-4-pi",
+        "response_model": "claude-sonnet-4-physical",
         "mode": "STREAM",
         "operation_name": "streamText",
         "stop_reason": "end_turn",
@@ -138,7 +138,7 @@
           "total_tokens": 57,
           "cache_read_input_tokens": 5,
           "cache_write_input_tokens": 6,
-          "reasoning_tokens": 0
+          "reasoning_tokens": 7
         },
         "started_at": "${STARTED_AT}",
         "completed_at": "${COMPLETED_AT}",

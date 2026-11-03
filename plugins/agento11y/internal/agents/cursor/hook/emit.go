@@ -3,6 +3,8 @@ package hook
 import (
 	"context"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/grafana/agento11y/go/agento11y"
 
@@ -32,30 +34,73 @@ func setupOTelIfConfigured(ctx context.Context, instanceID string, logger *log.L
 	return emit.SetupOTel(ctx, instanceID, logger)
 }
 
-// buildClient constructs the agento11y client. Endpoint, tenant ID, and token
-// come from the SDK's automatic SIGIL_* env resolution (config.ApplyEnv has
-// already injected dotenv values into the OS env). The plugin only owns the
-// pieces the SDK can't infer: HTTP protocol, the `/api/v1/generations:export`
-// path suffix, basic-auth mode, and the OTel tracer/meter wiring. cursor does
-// not pass a logger, so the SDK client stays silent.
+// Cursor leaves the SDK logger unset to keep hook output silent.
 //
-// The auto-tag inputs are the first workspace root and the signed-in user's
-// email, the same values mapper.MapFragment reads for git.branch and the
-// generation user id. Cursor sends both on sessionStart, and the stop and
-// sessionEnd payloads that emit telemetry carry neither, so the session
+// The auto-tag inputs are the first workspace root and the configured user ID
+// or, if unset, the signed-in user's email.
+// The resolved identity also supplies the client's default user ID.
+// Cursor sends workspace roots and email on sessionStart, and the stop and sessionEnd payloads
+// that emit telemetry carry neither, so the session
 // sessionStart saved is the primary source and the live payload is the
 // fallback for a conversation whose session file was never written.
-func buildClient(p Payload, session *fragment.Session, cfg config.Config, providers *otel.Providers, logger *log.Logger) *agento11y.Client {
-	return emit.NewClient(emit.ClientOptions{
+func buildClient(p Payload, session *fragment.Session, cfg config.Config, providers *otel.Providers, logger *log.Logger) (*agento11y.Client, error) {
+	return emit.NewClient(clientOptions(p, session, cfg, providers, logger))
+}
+
+// buildClientWithoutMetrics builds the client sessionEnd sends a generation
+// through when an earlier hook already delivered its metrics.
+func buildClientWithoutMetrics(p Payload, session *fragment.Session, cfg config.Config, providers *otel.Providers, logger *log.Logger) (*agento11y.Client, error) {
+	opts := clientOptions(p, session, cfg, providers, logger)
+	opts.WithoutMetrics = true
+	return emit.NewClient(opts)
+}
+
+func clientOptions(p Payload, session *fragment.Session, cfg config.Config, providers *otel.Providers, logger *log.Logger) emit.ClientOptions {
+	userID := strings.TrimSpace(cfg.UserIDOverride)
+	if userID == "" {
+		userID = autoTagUserEmail(p, session)
+	}
+	return emit.ClientOptions{
 		InstrumentationName: otelInstrumentationName,
 		ContentCapture:      cfg.ContentCapture,
 		Providers:           providers,
 		UserAgent:           useragent.For("cursor"),
+		UserID:              userID,
 		Tags: autotag.FromEnv(autotag.Inputs{
 			Cwd:    autoTagWorkspaceRoot(p, session),
-			UserID: autoTagUserEmail(p, session),
+			UserID: userID,
 		}, logger),
-	})
+	}
+}
+
+// recordedFragment is a fragment this hook recorded, and when its recorder
+// ended, which is when its metrics were recorded.
+type recordedFragment struct {
+	frag *fragment.Fragment
+	at   time.Time
+}
+
+// rememberDeliveredMetrics notes on fragments kept for a retry that their
+// metrics were delivered, so sessionEnd does not count those turns again. A
+// fragment counts as delivered when an export collected after its record
+// reached the collector, even if a later export failed. Otherwise nothing is
+// noted and the retry records its metrics.
+func rememberDeliveredMetrics(providers *otel.Providers, recorded []recordedFragment, logger *log.Logger) {
+	// Without OTel providers no metrics were recorded.
+	if len(recorded) == 0 || providers == nil {
+		return
+	}
+	_ = providers.FlushMetrics()
+	deliveredAt := providers.MetricsDeliveredAt()
+	for _, r := range recorded {
+		if r.frag.MetricsRecorded || r.at.After(deliveredAt) {
+			continue
+		}
+		r.frag.MetricsRecorded = true
+		if err := fragment.Save(r.frag); err != nil {
+			logger.Printf("save recorded metrics gen=%s: %v", r.frag.GenerationID, err)
+		}
+	}
 }
 
 func autoTagWorkspaceRoot(p Payload, session *fragment.Session) string {
@@ -68,10 +113,12 @@ func autoTagWorkspaceRoot(p Payload, session *fragment.Session) string {
 }
 
 func autoTagUserEmail(p Payload, session *fragment.Session) string {
-	if session != nil && session.UserEmail != "" {
-		return session.UserEmail
+	if session != nil {
+		if email := strings.TrimSpace(session.UserEmail); email != "" {
+			return email
+		}
 	}
-	return p.UserEmail
+	return strings.TrimSpace(p.UserEmail)
 }
 
 func firstWorkspaceRoot(roots []string) string {

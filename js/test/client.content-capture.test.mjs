@@ -451,6 +451,18 @@ test('tool execution content capture modes', async () => {
       legacy: true,
       wantContent: false,
     },
+    {
+      name: 'client no_tool_content uses legacy inclusion',
+      clientMode: 'no_tool_content',
+      legacy: true,
+      wantContent: true,
+    },
+    {
+      name: 'client metadata spans suppress content',
+      clientMode: 'full_with_metadata_spans',
+      legacy: true,
+      wantContent: false,
+    },
     // Per-tool overrides.
     {
       name: 'tool full overrides client metadata_only',
@@ -466,65 +478,202 @@ test('tool execution content capture modes', async () => {
       legacy: true,
       wantContent: false,
     },
+    {
+      name: 'tool metadata spans override client full',
+      clientMode: 'full',
+      toolMode: 'full_with_metadata_spans',
+      legacy: true,
+      wantContent: false,
+    },
   ];
 
   for (const tc of cases) {
-    const harness = newHarness({ contentCapture: tc.clientMode });
+    for (const depth of [0, 1, 2]) {
+      const harness = newHarness({ contentCapture: tc.clientMode });
+      const parents = [];
+      try {
+        let source = harness.client;
+        for (let index = 0; index < depth; index++) {
+          source = source.startToolExecution({
+            toolName: `parent-${index}`,
+            contentCapture: tc.wantContent ? 'metadata_only' : 'full',
+            agentName: 'parent-agent',
+            conversationId: 'parent-conversation',
+            requestModel: 'parent-model',
+            includeContent: !tc.legacy,
+          });
+          parents.push(source);
+        }
+        const recorder = source.startToolExecution({
+          toolName: 'test_tool',
+          contentCapture: tc.toolMode,
+          includeContent: tc.legacy,
+        });
+        recorder.setResult({
+          arguments: { city: 'Paris' },
+          result: { temp: 18 },
+        });
+        recorder.end();
+        assert.equal(recorder.getError(), undefined, `case "${tc.name}", depth=${depth}: unexpected error`);
 
-    try {
-      const recorder = harness.client.startToolExecution({
-        toolName: 'test_tool',
-        contentCapture: tc.toolMode,
-        includeContent: tc.legacy,
-      });
-      recorder.setResult({
-        arguments: { city: 'Paris' },
-        result: { temp: 18 },
-      });
-      recorder.end();
-      assert.equal(recorder.getError(), undefined, `case "${tc.name}": unexpected error`);
-
-      const span = singleToolSpan(harness.spanExporter);
-      const hasArgs = 'gen_ai.tool.call.arguments' in span.attributes;
-      assert.equal(
-        hasArgs,
-        tc.wantContent,
-        `case "${tc.name}": tool arguments present=${hasArgs}, want=${tc.wantContent}`,
-      );
-
-      assert.ok('gen_ai.tool.name' in span.attributes, `case "${tc.name}": tool name always present`);
-    } finally {
-      await shutdownHarness(harness);
+        const span = singleToolSpan(harness.spanExporter);
+        for (const key of ['gen_ai.tool.call.arguments', 'gen_ai.tool.call.result']) {
+          assert.equal(key in span.attributes, tc.wantContent, `${tc.name}, depth=${depth}, ${key}`);
+        }
+        assert.equal(span.attributes['gen_ai.tool.name'], 'test_tool');
+        for (const key of ['gen_ai.agent.name', 'gen_ai.conversation.id', 'gen_ai.request.model']) {
+          assert.equal(span.attributes[key], undefined, `${tc.name}, depth=${depth}, ${key}`);
+        }
+      } finally {
+        for (const parent of parents.reverse()) parent.end();
+        await shutdownHarness(harness);
+      }
     }
   }
 });
 
-test('tool execution with resolver overriding client mode', async () => {
-  const harness = newHarness({
-    contentCapture: 'full',
-    contentCaptureResolver: () => 'metadata_only',
+for (const tc of [
+  { name: 'legacy default', clientMode: 'default', expectedPrivate: true },
+  { name: 'no_tool_content', clientMode: 'no_tool_content', expectedPrivate: true },
+  { name: 'full', clientMode: 'full', expectedPrivate: true },
+  { name: 'metadata_only', clientMode: 'metadata_only', expectedPrivate: false },
+  { name: 'metadata spans', clientMode: 'full_with_metadata_spans', expectedPrivate: false },
+  {
+    name: 'resolver metadata overrides full',
+    clientMode: 'full',
+    resolver: () => 'metadata_only',
+    expectedPrivate: false,
+  },
+  {
+    name: 'resolver metadata spans overrides full',
+    clientMode: 'full',
+    resolver: () => 'full_with_metadata_spans',
+    expectedPrivate: false,
+  },
+  {
+    name: 'per-tool full overrides resolver',
+    clientMode: 'metadata_only',
+    resolver: () => 'metadata_only',
+    toolMode: 'full',
+    expectedPrivate: true,
+  },
+  {
+    name: 'per-tool metadata overrides full',
+    clientMode: 'full',
+    toolMode: 'metadata_only',
+    expectedPrivate: false,
+  },
+  {
+    name: 'per-tool metadata spans overrides full',
+    clientMode: 'full',
+    toolMode: 'full_with_metadata_spans',
+    expectedPrivate: false,
+  },
+  {
+    name: 'resolver failure closes privacy',
+    clientMode: 'full',
+    resolver: () => {
+      throw new Error('resolver failed');
+    },
+    expectedPrivate: false,
+  },
+]) {
+  test(`private skill and process fields use effective mode: ${tc.name}`, async () => {
+    const harness = newHarness({ contentCapture: tc.clientMode, contentCaptureResolver: tc.resolver });
+    const fields = {
+      executionKind: 'command',
+      skillName: 'review',
+      skillResourceName: 'check.py',
+      skillDescription: 'Private instructions',
+      skillSourceURI: 'https://user:secret@skills.example.com/review?token=secret#private',
+      processExecutableName: 'python3',
+      processExecutablePath: '/private/bin/python3',
+    };
+    try {
+      const recorder = harness.client.startToolExecution({
+        toolName: 'run',
+        ...fields,
+        contentCapture: tc.toolMode,
+        includeContent: true,
+      });
+      const rawArguments = { private: 'raw args' };
+      const rawResult = { private: 'raw result' };
+      recorder.setResult({ arguments: rawArguments, result: rawResult, processExitCode: 0 });
+      recorder.setCallError(new Error('raw execution error'));
+      recorder.end();
+
+      const span = singleToolSpan(harness.spanExporter);
+      assert.equal(span.name, 'execute_tool run review check.py');
+      assert.equal(span.attributes['gen_ai.skill.name'], 'review');
+      assert.equal(span.attributes['gen_ai.skill.resource.name'], 'check.py');
+      assert.equal(span.attributes['process.executable.name'], 'python3');
+      assert.equal(span.attributes['process.exit.code'], 0);
+      assert.equal(
+        span.attributes['gen_ai.skill.description'],
+        tc.expectedPrivate ? fields.skillDescription : undefined,
+      );
+      assert.equal(
+        span.attributes['gen_ai.skill.source.uri'],
+        tc.expectedPrivate ? 'https://skills.example.com/review' : undefined,
+      );
+      assert.equal(
+        span.attributes['process.executable.path'],
+        tc.expectedPrivate ? fields.processExecutablePath : undefined,
+      );
+      assert.equal(
+        span.attributes['gen_ai.tool.call.arguments'],
+        tc.expectedPrivate ? JSON.stringify(rawArguments) : undefined,
+      );
+      assert.equal(
+        span.attributes['gen_ai.tool.call.result'],
+        tc.expectedPrivate ? JSON.stringify(rawResult) : undefined,
+      );
+      if (!tc.expectedPrivate) {
+        assertSpanErrorRedacted(span, 'tool_execution_error');
+      }
+
+      // Capture modes do not sanitize completed-tool debug snapshots.
+      const execution = harness.client.debugSnapshot().toolExecutions[0];
+      for (const [key, value] of Object.entries(fields)) {
+        assert.equal(execution[key], value, key);
+      }
+      assert.equal(execution.processExitCode, 0);
+      assert.deepEqual(execution.arguments, rawArguments);
+      assert.deepEqual(execution.result, rawResult);
+      assert.equal(execution.callError, 'raw execution error');
+    } finally {
+      await shutdownHarness(harness);
+    }
   });
+}
 
-  try {
-    const recorder = harness.client.startToolExecution({
-      toolName: 'test_tool',
-      includeContent: true,
+test('tool execution uses the call-time resolver rather than its parent mode', async () => {
+  for (const [before, atCall] of [
+    ['full', 'metadata_only'],
+    ['metadata_only', 'full'],
+  ]) {
+    let mode = before;
+    const harness = newHarness({
+      contentCapture: 'full',
+      contentCaptureResolver: () => mode,
     });
-    recorder.setResult({
-      arguments: 'args',
-      result: 'result',
-    });
-    recorder.end();
-    assert.equal(recorder.getError(), undefined);
+    const parent = harness.client.startToolExecution({ toolName: 'parent' });
+    try {
+      mode = atCall;
+      const recorder = parent.startToolExecution({
+        toolName: 'test_tool',
+        includeContent: true,
+      });
+      recorder.setResult({ arguments: 'args', result: 'result' });
+      recorder.end();
+      assert.equal(recorder.getError(), undefined);
 
-    const span = singleToolSpan(harness.spanExporter);
-    assert.equal(
-      'gen_ai.tool.call.arguments' in span.attributes,
-      false,
-      'resolver metadata_only should suppress tool content',
-    );
-  } finally {
-    await shutdownHarness(harness);
+      const span = singleToolSpan(harness.spanExporter);
+      assert.equal('gen_ai.tool.call.arguments' in span.attributes, atCall === 'full', `${before} to ${atCall}`);
+    } finally {
+      parent.end();
+      await shutdownHarness(harness);
+    }
   }
 });
 
@@ -1021,9 +1170,16 @@ function newHarness(overrides = {}) {
   const generationExporter = new CapturingExporter();
   const defaults = defaultConfig();
 
-  const { contentCapture, contentCaptureResolver, embeddingCapture, ...exportOverrides } = overrides;
+  const {
+    contentCapture,
+    contentCaptureResolver,
+    embeddingCapture,
+    debugBufferSize = 64,
+    ...exportOverrides
+  } = overrides;
 
   const client = new Agento11yClient({
+    debugBufferSize,
     tracer,
     generationExport: {
       ...defaults.generationExport,

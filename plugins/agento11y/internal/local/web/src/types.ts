@@ -42,6 +42,7 @@ export interface ConversationSummary {
 }
 
 export interface ConversationListResponse {
+  applied_skill?: string;
   conversations: ConversationSummary[];
   total_conversations: number;
 }
@@ -98,6 +99,7 @@ export interface ConversationMetricsAggregate {
 }
 
 export interface ConversationMetricsResponse {
+  applied_skill?: string;
   aggregate: ConversationMetricsAggregate;
   conversations: ConversationSummary[];
   matched_conversations: number;
@@ -245,8 +247,17 @@ export interface ToolAnalytics {
   coverage: ToolAnalyticsCoverage;
 }
 
+export interface SkillAnalyticsTotals extends Omit<ToolAnalyticsTotals, 'tools'> {
+  skills: number;
+}
+
+export interface SkillAnalytics extends Omit<ToolAnalytics, 'totals'> {
+  totals: SkillAnalyticsTotals;
+}
+
 export interface SkillsToolsMetricsResponse {
   tools: ToolAnalytics;
+  skills?: SkillAnalytics;
 }
 
 /** SearchHit in search.go: one row of GET /api/v1/search. */
@@ -310,7 +321,8 @@ export interface Settings {
 }
 
 /** forwardFailure in forward.go: one forward attempt that did not deliver. */
-interface ForwardFailure {
+export interface ForwardFailure {
+  destination?: string;
   at: string;
   label: string;
   detail: string;
@@ -318,13 +330,32 @@ interface ForwardFailure {
 
 /** forwardLeg in forward.go: one forwarding leg's latest outcomes. */
 export interface ForwardLeg {
+  attempted?: number;
+  succeeded?: number;
+  failed?: number;
+  dropped?: number;
   lastSuccessAt?: string;
   lastFailureAt?: string;
   lastFailureDetail?: string;
 }
 
+/** httpGenerations and otlp stay true for configured routes even when global forwarding is off. */
+export interface ForwardDestination {
+  name: string;
+  endpoint: string;
+  otlpEndpoint: string;
+  httpGenerations: boolean;
+  otlp: boolean;
+  revision: number;
+  legs?: Record<string, ForwardLeg>;
+  failures?: ForwardFailure[];
+}
+
 /** forwardStatus in forward.go: what the daemon would actually send to Cloud. */
 export interface ForwardStatus {
+  destinations?: ForwardDestination[];
+  forwardingPath?: string;
+  forwardingError?: string;
   enabled: boolean;
   /** "off", "metadata_only" or "full". */
   mode: string;
@@ -433,6 +464,7 @@ export interface ImportRun {
   started_at: string;
   finished_at?: string;
   error?: string;
+  warnings?: string[];
 }
 
 /**

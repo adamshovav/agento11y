@@ -37,6 +37,10 @@ func TestRenderHumanGolden(t *testing.T) {
 		{name: "probed", report: goldenProbedReport()},
 		{name: "redirected", report: goldenRedirectedReport()},
 		{name: "broken-config", report: brokenConfigReport()},
+		{name: "otel", report: goldenOTelReport()},
+		{name: "forwarding-extra-only", report: goldenExtraOnlyForwardingReport()},
+		{name: "forwarding-unavailable", report: goldenUnavailableForwardingReport()},
+		{name: "forwarding-failures", report: goldenFailingForwardingReport()},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -84,9 +88,8 @@ func assertOneTrailerPerRow(t *testing.T, report string) {
 	}
 }
 
-// goldenHealthyReport is a fully configured install. It opts into local
-// forwarding so the two longest keys ("local forwarding", "local guard
-// checks") are rendered and the column is as wide as it gets.
+// goldenHealthyReport includes the daemon's forwarding snapshot and the
+// primary Cloud pipelines. Its runtime rows exercise the widest column.
 func goldenHealthyReport() *Report {
 	osEnv := map[string]string{
 		"AGENTO11Y_ENDPOINT":                    "https://sigil.example",
@@ -96,9 +99,10 @@ func goldenHealthyReport() *Report {
 	}
 	conversations := collectConversations(osEnv, nil)
 	return &Report{
-		Binary:        BinarySection{Version: "v0.22.0"},
-		Conversations: conversations,
-		Analytics:     collectAnalytics(osEnv, nil, conversations.configured()),
+		Binary:          BinarySection{Version: "v0.22.0"},
+		LocalForwarding: goldenForwardingSection(),
+		Conversations:   conversations,
+		Analytics:       collectAnalytics(osEnv, nil, conversations.configured()),
 		Config: ConfigSection{
 			Path: "/home/u/.config/agento11y/config.env", Exists: true,
 			ContentCaptureMode: "full",
@@ -130,13 +134,43 @@ func goldenHealthyReport() *Report {
 	}
 }
 
-// goldenMinimalReport is a fresh install with nothing configured. It renders
-// no tags and no local forwarding, so its widest key is shorter than the
-// healthy report's: the two files together pin the column to the widest key
-// rendered rather than to a constant.
+func goldenOTelReport() *Report {
+	r := goldenMinimalReport()
+	env := map[string]string{
+		"AGENTO11Y_PROTOCOL":                     "otel",
+		"AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES": "true",
+		"OTEL_EXPORTER_OTLP_ENDPOINT":            "http://127.0.0.1:9000/otlp",
+		"AGENTO11Y_AUTH_TENANT_ID":               "12345",
+		"AGENTO11Y_OTEL_AUTH_TOKEN":              "glc_secret",
+	}
+	r.Conversations = collectConversations(env, nil)
+	r.Conversations.Probe = &ProbeResult{URL: "http://127.0.0.1:9000/otlp/v1/traces", StatusCode: 200, OK: true}
+	r.Conversations.LocalCapability = &ProbeResult{OK: true}
+	r.Conversations.Messages = append(r.Conversations.Messages, "OTLP transport/authentication verified; generation storage is not verified")
+	r.HTTPAPIs = collectHTTPAPIs(env, nil)
+	r.Analytics = collectAnalytics(env, nil, true)
+	r.Analytics.Probe = &AnalyticsProbe{
+		Metrics: &ProbeResult{URL: "http://127.0.0.1:9000/otlp/v1/metrics", StatusCode: 200, OK: true},
+		Traces:  r.Conversations.Probe,
+	}
+	r.Config.GenerationProtocol = resolveFamily("PROTOCOL", env, nil).envValue()
+	r.Config.ExperimentalFeatures = resolveEnv("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES", env, nil).envValue()
+	r.Config.ExperimentalEnabled = true
+	r.Agents = []AgentStatus{{Name: "pi", OnPath: true, Install: InstallStateInstalled, Health: HealthOK}, {Name: "opencode", OnPath: true, Install: InstallStateInstalled, Health: HealthOK}}
+	diagnoseIndependentPlugins(r)
+	return r
+}
+
+// goldenMinimalReport has no configured targets or running daemon. Its shorter
+// keys keep the column width tied to rendered rows rather than a constant.
 func goldenMinimalReport() *Report {
 	return &Report{
-		Binary:        BinarySection{Version: "v0.22.0"},
+		Binary: BinarySection{Version: "v0.22.0"},
+		LocalForwarding: &LocalForwardingSection{
+			Path: "/home/u/.config/agento11y/forwarding.toml", Health: HealthOK,
+			Delivery: "not_checked", DeliveryError: "local daemon unavailable",
+			Destinations: []local.ForwardDestinationInfo{},
+		},
 		Conversations: collectConversations(nil, nil),
 		Analytics:     collectAnalytics(nil, nil, false),
 		Config: ConfigSection{
@@ -167,7 +201,12 @@ func goldenBrokenReport() *Report {
 		map[string]string{"AGENTO11Y_AUTH_TENANT_ID": "12345", "SIGIL_AUTH_TOKEN": "glc_secret"},
 	)
 	return &Report{
-		Binary:        BinarySection{Version: "dev"},
+		Binary: BinarySection{Version: "dev"},
+		LocalForwarding: &LocalForwardingSection{
+			Path: "/home/u/.config/agento11y/forwarding.toml", Health: HealthWarn,
+			Error: "forwarding.toml is invalid", Delivery: "not_checked", DeliveryError: "local daemon unavailable",
+			Destinations: []local.ForwardDestinationInfo{},
+		},
 		Conversations: conversations,
 		Analytics:     collectAnalytics(nil, nil, conversations.configured()),
 		Config: ConfigSection{
@@ -267,6 +306,51 @@ func goldenRedirectedReport() *Report {
 	r.Analytics.Probe = &AnalyticsProbe{
 		Metrics: &ProbeResult{URL: "https://otlp.example/otlp/v1/metrics", StatusCode: 200, OK: true},
 		Traces:  &ProbeResult{URL: "https://otlp.example/otlp/v1/traces", StatusCode: 200, OK: true},
+	}
+	return r
+}
+
+func goldenForwardingSection() *LocalForwardingSection {
+	primary := local.ForwardDestinationInfo{Name: "primary", Endpoint: "https://sigil.example/api/v1/generations:export", OTLPEndpoint: "https://otlp.example/otlp", HTTPGenerations: true, OTLP: true}
+	return &LocalForwardingSection{
+		Path: "/home/u/.config/agento11y/forwarding.toml", Health: HealthOK,
+		Delivery: "available", Destinations: []local.ForwardDestinationInfo{primary},
+		ForwardStatus: &ForwardStatus{
+			Enabled: true, Mode: "full", Generations: true, OTLP: true, Hooks: true,
+			Destinations: []ForwardDestinationStatus{{ForwardDestinationInfo: primary, Revision: 1}},
+		},
+	}
+}
+
+func goldenExtraOnlyForwardingReport() *Report {
+	r := goldenMinimalReport()
+	extra := local.ForwardDestinationInfo{Name: "archive", OTLPEndpoint: "https://collector.example.test/otlp", OTLP: true}
+	r.LocalForwarding.Destinations = []local.ForwardDestinationInfo{extra}
+	r.LocalForwarding.Delivery, r.LocalForwarding.DeliveryError = "available", ""
+	r.LocalForwarding.ForwardStatus = &ForwardStatus{
+		Enabled: true, Mode: "metadata_only", Generations: true, OTLP: true,
+		Destinations: []ForwardDestinationStatus{{ForwardDestinationInfo: extra, Revision: 2}},
+	}
+	return r
+}
+
+func goldenUnavailableForwardingReport() *Report {
+	r := goldenHealthyReport()
+	r.LocalForwarding.ForwardStatus = nil
+	r.LocalForwarding.Health = HealthWarn
+	r.LocalForwarding.Delivery = "unavailable"
+	r.LocalForwarding.DeliveryError = "daemon delivery status is unavailable; update the daemon or retry doctor"
+	return r
+}
+
+func goldenFailingForwardingReport() *Report {
+	r := goldenHealthyReport()
+	st := liveForwardStatus()
+	r.LocalForwarding.Health = HealthWarn
+	r.LocalForwarding.ForwardStatus = &st
+	r.LocalForwarding.Destinations = nil
+	for _, destination := range st.Destinations {
+		r.LocalForwarding.Destinations = append(r.LocalForwarding.Destinations, destination.ForwardDestinationInfo)
 	}
 	return r
 }

@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/grafana/agento11y/go/agento11y"
 
@@ -15,9 +14,6 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/guard"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 )
-
-// maxTitleLen caps the conversation title derived from the first user prompt.
-const maxTitleLen = 100
 
 // beforeSubmitDeny is Cursor's response for blocking a submitted prompt.
 // UserMessage is shown to the user; the model is not called.
@@ -60,17 +56,15 @@ func BeforeSubmit(ctx context.Context, stdout io.Writer, p Payload, cfg config.C
 // content into the fragment file (mode 0600 — but avoidable disk-residency is
 // avoidable disk-residency).
 //
-// The conversation title is session-scoped, so it is stamped even when
-// generation_id is missing: first prompt wins, and a later sessionStart must
-// not wipe it.
+// The conversation title and the rest of the session are conversation-scoped,
+// so they are recorded even when generation_id is missing: first prompt wins
+// the title, and a later sessionStart must not wipe it.
 func capturePrompt(p Payload, cfg config.Config, logger *log.Logger) {
 	if p.ConversationID == "" {
 		logger.Print("beforeSubmitPrompt: missing conversation_id — skipping")
 		return
 	}
-	if p.Prompt != "" {
-		setConversationTitle(p.ConversationID, p.Prompt, logger)
-	}
+	recordSession(p, logger)
 	if p.GenerationID == "" {
 		logger.Print("beforeSubmitPrompt: no generation_id yet — skipping fragment")
 		return
@@ -94,31 +88,38 @@ func capturePrompt(p Payload, cfg config.Config, logger *log.Logger) {
 	logger.Printf("beforeSubmitPrompt: captured gen=%s promptLen=%d", p.GenerationID, len(p.Prompt))
 }
 
-// setConversationTitle sets the session's ConversationTitle to a truncated
-// version of prompt, but only when the title is not already set (first
-// prompt wins). A missing session file is created so a beforeSubmit that
-// races ahead of sessionStart still leaves a title for stop to load.
-// UpdateSession holds the session lock so this write cannot replace a
-// sessionStart that landed between load and save.
-func setConversationTitle(conversationID, prompt string, logger *log.Logger) {
-	title := strings.TrimSpace(prompt)
-	if title == "" {
-		return
-	}
-	if len(title) > maxTitleLen {
-		title = title[:maxTitleLen]
-		for !utf8.ValidString(title) {
-			title = title[:len(title)-1]
+// recordSession sets the session's ConversationTitle to fragment.SessionTitle
+// of the prompt, but only when the title is not already set (first prompt
+// wins). The title is built only then, so a later prompt with a large paste
+// does not pay for its redaction. It also fills in the workspace roots, user
+// email and Cursor version the session lacks, which every hook payload
+// carries. sessionStart normally saves them first, but a reopened chat whose
+// session file is gone gets no second sessionStart. A missing session file is
+// created so a beforeSubmit that races ahead of sessionStart still leaves a
+// title for stop to load. UpdateSession holds the session lock so this write
+// cannot replace a sessionStart that landed between load and save.
+func recordSession(p Payload, logger *log.Logger) {
+	err := fragment.UpdateSession(p.ConversationID, logger, func(s *fragment.Session) bool {
+		changed := false
+		if s.ConversationTitle == "" && strings.TrimSpace(p.Prompt) != "" {
+			s.ConversationTitle = fragment.SessionTitle(p.Prompt)
+			changed = s.ConversationTitle != ""
 		}
-	}
-	err := fragment.UpdateSession(conversationID, logger, func(s *fragment.Session) bool {
-		if s.ConversationTitle != "" {
-			return false
+		if len(s.WorkspaceRoots) == 0 && len(p.WorkspaceRoots) > 0 {
+			s.WorkspaceRoots = p.WorkspaceRoots
+			changed = true
 		}
-		s.ConversationTitle = title
-		return true
+		if s.UserEmail == "" && p.UserEmail != "" {
+			s.UserEmail = p.UserEmail
+			changed = true
+		}
+		if s.CursorVersion == "" && p.CursorVersion != "" {
+			s.CursorVersion = p.CursorVersion
+			changed = true
+		}
+		return changed
 	})
 	if err != nil {
-		logger.Printf("beforeSubmitPrompt: save session title: %v", err)
+		logger.Printf("beforeSubmitPrompt: save session: %v", err)
 	}
 }

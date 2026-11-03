@@ -19,6 +19,33 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+func TestToolExecutionResultCopy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code *int64
+	}{
+		{name: "absent"},
+		{name: "zero", code: new(int64(0))},
+		{name: "nonzero", code: new(int64(2))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &ToolExecutionRecorder{}
+			r.SetResult(ToolExecutionEnd{ProcessExitCode: tc.code})
+			if tc.code == nil {
+				if r.result.ProcessExitCode != nil {
+					t.Fatal("absent code became present")
+				}
+				return
+			}
+			want := *tc.code
+			*tc.code = 99
+			if r.result.ProcessExitCode == tc.code || *r.result.ProcessExitCode != want {
+				t.Fatal("result retains caller-owned code")
+			}
+		})
+	}
+}
+
 func TestDefaultConfigGenerationExportMessageAndPayloadLimits(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -608,11 +635,11 @@ func TestGenerationRecorderEndSetsGenAIAttributes(t *testing.T) {
 			Provider: "anthropic",
 			Name:     "claude-sonnet-4-5",
 		},
-		MaxTokens:       int64Ptr(1024),
-		Temperature:     float64Ptr(0.25),
-		TopP:            float64Ptr(0.9),
-		ToolChoice:      stringPtr("auto"),
-		ThinkingEnabled: boolPtr(true),
+		MaxTokens:       new(int64(1024)),
+		Temperature:     new(0.25),
+		TopP:            new(0.9),
+		ToolChoice:      new("auto"),
+		ThinkingEnabled: new(true),
 	})
 
 	generationRecorder.SetResult(Generation{
@@ -621,11 +648,11 @@ func TestGenerationRecorderEndSetsGenAIAttributes(t *testing.T) {
 		ResponseID:      "resp-7",
 		ResponseModel:   "claude-sonnet-4-5-20260201",
 		StopReason:      "end_turn",
-		MaxTokens:       int64Ptr(256),
-		Temperature:     float64Ptr(0.1),
-		TopP:            float64Ptr(0.8),
-		ToolChoice:      stringPtr("required"),
-		ThinkingEnabled: boolPtr(false),
+		MaxTokens:       new(int64(256)),
+		Temperature:     new(0.1),
+		TopP:            new(0.8),
+		ToolChoice:      new("required"),
+		ThinkingEnabled: new(false),
 		Metadata: map[string]any{
 			"agento11y.gen_ai.request.thinking.budget_tokens": int64(4096),
 		},
@@ -867,14 +894,14 @@ func TestStartEmbeddingSetsSpanAttributesAndDoesNotEnqueueGeneration(t *testing.
 		Model:          ModelRef{Provider: "openai", Name: "text-embedding-3-small"},
 		AgentName:      "agent-embed",
 		AgentVersion:   "v-embed",
-		Dimensions:     int64Ptr(256),
+		Dimensions:     new(int64(256)),
 		EncodingFormat: "float",
 	})
 	embeddingRecorder.SetResult(EmbeddingResult{
 		InputCount:    2,
 		InputTokens:   120,
 		ResponseModel: "text-embedding-3-small",
-		Dimensions:    int64Ptr(256),
+		Dimensions:    new(int64(256)),
 	})
 	embeddingRecorder.End()
 

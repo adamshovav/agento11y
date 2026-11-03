@@ -21,6 +21,14 @@ func writeFile(t *testing.T, path, content string) string {
 	return path
 }
 
+// setHomeDir points os.UserHomeDir at dir: it reads HOME on unix and
+// USERPROFILE on Windows, so both are set.
+func setHomeDir(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+}
+
 func setModTime(t *testing.T, path string, at time.Time) {
 	t.Helper()
 	if err := os.Chtimes(path, at, at); err != nil {
@@ -96,7 +104,7 @@ func TestDiscoverExpandsMultiSessionSources(t *testing.T) {
 		stubImporter: &stubImporter{roots: []string{path}},
 		previews: func(context.Context, string) ([]SessionPreview, error) {
 			return []SessionPreview{
-				{SessionID: "session-b", LastActivityAt: old},
+				{SessionID: "session-b", LastActivityAt: old, Active: true},
 				{SessionID: "session-a", LastActivityAt: old},
 				{SessionID: "session-active", LastActivityAt: now.Add(-time.Minute), SizeBytes: 7},
 			}, nil
@@ -124,8 +132,8 @@ func TestDiscoverExpandsMultiSessionSources(t *testing.T) {
 		if sess.SizeBytes != 0 {
 			t.Fatalf("session %q inherited shared file size %d", sess.SessionID, sess.SizeBytes)
 		}
-		if sess.Active {
-			t.Fatalf("old session %q inherited the shared file activity", sess.SessionID)
+		if sess.Active != (sess.SessionID == "session-b") {
+			t.Fatalf("old session %q activity = %v", sess.SessionID, sess.Active)
 		}
 	}
 

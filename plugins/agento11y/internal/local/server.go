@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,9 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/dotenv"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/guardeval"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/localhealth"
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // Maximum body sizes accepted by the receiver. These guard against
@@ -31,7 +35,8 @@ import (
 // realistic LLM transcripts.
 const (
 	maxGenerationBodyBytes  = 64 * 1024 * 1024 // 64 MiB
-	maxOTLPBodyBytes        = 16 * 1024 * 1024 // 16 MiB
+	maxOTLPBodyBytes        = 16 * 1024 * 1024 // 16 MiB (metrics)
+	maxOTLPTraceBodyBytes   = 64 * 1024 * 1024 // 64 MiB (compressed and expanded)
 	maxHookBodyBytes        = 4 * 1024 * 1024  // 4 MiB
 	maxBranchMergeBodyBytes = 256 * 1024
 	maxBranchMergeRows      = 500
@@ -61,6 +66,7 @@ type Server struct {
 	mux          *http.ServeMux
 	forward      *forwardLoader
 	hub          *eventHub
+	shutdown     func()
 	// eventPingInterval overrides defaultEventPingInterval for tests; zero
 	// uses the default.
 	eventPingInterval time.Duration
@@ -72,7 +78,7 @@ type Server struct {
 	warmOnce  sync.Once
 
 	// importMu guards the history-import fields below. One import runs at a
-	// time: two would write the same per-agent ledger and race on it.
+	// time: two would write the same ledger and race on it.
 	importMu sync.Mutex
 	// localEndpoint is this daemon's own address, which an import exports to.
 	// Serve sets it once the listener has a port.
@@ -129,6 +135,12 @@ func (s *Server) Close() {
 	s.hub.closeAll()
 }
 
+// SetShutdown sets the function the shutdown endpoint calls after accepting a
+// request. Serve uses it to cancel the daemon's serving context.
+func (s *Server) SetShutdown(shutdown func()) {
+	s.shutdown = shutdown
+}
+
 // WarmSummariesOnFirstRead arms the background summary-cache warm. The warm
 // starts once the first viewer read has answered, and stops when ctx is
 // done. Nothing warms before that read. Several commands start a daemon
@@ -165,6 +177,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /assets/vendor/{file}", s.handleVendorAsset)
 	mux.HandleFunc("GET /assets/fonts/{file}", s.handleFontAsset)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("POST /api/v1/shutdown", s.handleShutdown)
 	mux.HandleFunc("GET /api/v1/conversations", s.handleListConversations)
 	mux.HandleFunc("GET /api/v1/search", s.handleSearch)
 	mux.HandleFunc("GET /api/v1/search/capabilities", s.handleSearchCapabilities)
@@ -357,7 +370,17 @@ func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request, dir, ext, c
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "ok",
+		"capabilities": []string{localhealth.OTelGenerationCapability},
+	})
+}
+
+func (s *Server) handleShutdown(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusAccepted)
+	if s.shutdown != nil {
+		go s.shutdown()
+	}
 }
 
 // generationsRequest mirrors the proto-JSON ExportGenerationsRequest
@@ -416,23 +439,50 @@ func (s *Server) handleGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp, accepted, err := s.persistGenerations(req.Generations)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errJSONLRecordTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	// HTTP generation forwarding remains best effort and follows local storage.
+	// OTel ingest deliberately does not use this HTTP forwarding branch.
+	if len(accepted) > 0 && !isForwardedRequest(r) {
+		s.forward.dispatchGenerations(s.forward.load(), accepted)
+	}
+	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// Validate the complete batch before opening files. HTTP reports storage failures
+// per record; OTLP must reject the request if any result is not accepted.
+func (s *Server) persistGenerations(generations []json.RawMessage) (generationsResponse, []json.RawMessage, error) {
 	receivedAt := s.now().Format(time.RFC3339Nano)
-	resp := generationsResponse{Results: make([]generationResult, len(req.Generations))}
+	resp := generationsResponse{Results: make([]generationResult, len(generations))}
 
 	// Group the request by conversation so each conversation file is opened
 	// once, however many generations the batch carries for it. Results stay
 	// indexed by request position: grouping does not reorder them.
 	var order []string
 	groups := map[string][]pendingGeneration{}
-	stored := make([]json.RawMessage, len(req.Generations))
-	for i, raw := range req.Generations {
+	stored := make([]json.RawMessage, len(generations))
+	for i, raw := range generations {
 		var gen storedGeneration
 		if err := json.Unmarshal(raw, &gen); err != nil {
-			resp.Results[i] = generationResult{Accepted: false, Error: "decode generation: " + err.Error()}
+			// Retain the HTTP endpoint's per-entry decode rejection. The
+			// validation pass still finishes before any append. Marked OTel
+			// generations were already validated as a whole by generationSpans.
+			resp.Results[i] = generationResult{Error: "decode generation: " + err.Error()}
 			continue
 		}
 		// json.Unmarshal allocates a fresh slice per RawMessage element, so
 		// raw is private to this request and needs no copy.
+		if !validConversationID(gen.ConversationID) {
+			return resp, nil, fmt.Errorf("invalid conversation_id")
+		}
 		stored[i] = raw
 		if _, ok := groups[gen.ConversationID]; !ok {
 			order = append(order, gen.ConversationID)
@@ -449,6 +499,16 @@ func (s *Server) handleGenerations(w http.ResponseWriter, r *http.Request) {
 			// the stamp costs no extra decode.
 			activity: recordActivity(gen.summaryGeneration, receivedAt),
 		})
+	}
+
+	// Check final encoded records, not raw generation sizes: RawMessage HTML
+	// escaping and the wrapper can grow a record beyond the reader's limit.
+	for _, pending := range groups {
+		for _, p := range pending {
+			if _, err := encodeJSONLRecord(p.record); err != nil {
+				return resp, nil, fmt.Errorf("generation %d: %w", p.index, err)
+			}
+		}
 	}
 
 	// One change event per conversation the request wrote to. The viewer
@@ -497,74 +557,125 @@ func (s *Server) handleGenerations(w http.ResponseWriter, r *http.Request) {
 		s.hub.broadcast(ev)
 	}
 
-	accepted := make([]json.RawMessage, 0, len(req.Generations))
+	accepted := make([]json.RawMessage, 0, len(generations))
 	for _, raw := range stored {
 		if raw != nil {
 			accepted = append(accepted, raw)
 		}
 	}
 
-	// Best-effort Cloud forwarding runs after the local store so a Cloud
-	// failure can never affect the JSONL write or the ack below. Off by
-	// default: when forwarding is disabled load() returns enabled=false and we
-	// spawn nothing.
-	if len(accepted) > 0 && !isForwardedRequest(r) {
-		if cfg := s.forward.load(); cfg.enabled {
-			gens := accepted
-			s.forward.enqueue(forwardLabelGenerations, func() { s.forward.forwardGenerations(cfg, gens) })
-		}
-	}
-
-	s.writeJSON(w, http.StatusOK, resp)
+	return resp, accepted, nil
 }
 
 // handleOTLP accepts local OTLP exporter traffic so local mode does not
-// leak spans or metrics to a user-configured global collector. It retains a
-// metadata-only projection of execute_tool spans for local analytics and
-// otherwise drains the signal.
+// leak spans or metrics to a user-configured global collector. It retains
+// generation records and a metadata-only projection of execute_tool spans for
+// local analytics. Generation persistence must succeed before acknowledging.
 //
 // When Cloud forwarding is enabled the payload is also relayed to the
 // configured Cloud OTLP endpoint.
 func (s *Server) handleOTLP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxOTLPBodyBytes+1))
+	limit := maxOTLPBodyBytes
+	if r.URL.Path == otlpTracesPath {
+		limit = maxOTLPTraceBodyBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(limit)+1))
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(body) > maxOTLPBodyBytes {
+	if len(body) > limit {
 		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
 	contentType := r.Header.Get("Content-Type")
 	contentEncoding := r.Header.Get("Content-Encoding")
+	decoded := body
+	if isGzipEncoding(contentEncoding) {
+		decoded, err = gunzipLimited(body, int64(limit))
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, errExpandedOTLPTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			http.Error(w, "decode body: "+err.Error(), status)
+			return
+		}
+	} else if strings.TrimSpace(contentEncoding) != "" && !strings.EqualFold(strings.TrimSpace(contentEncoding), "identity") {
+		http.Error(w, "unsupported content encoding", http.StatusUnsupportedMediaType)
+		return
+	}
+	hasGenerations := false
+	var response []byte
 	if r.URL.Path == otlpTracesPath {
-		if spans, projectErr := projectToolSpans(body, contentType, contentEncoding); projectErr != nil {
-			s.logger.Printf("local: project tool spans: %v", projectErr)
-		} else if changed, appendErr := s.storage.appendToolSpans(spans); appendErr != nil {
+		request, decodeErr := decodeTracePayload(decoded, contentType)
+		if decodeErr != nil {
+			http.Error(w, "decode traces: "+decodeErr.Error(), http.StatusBadRequest)
+			return
+		}
+		// Generation ingestion currently supports only protobuf.
+		if strings.Contains(strings.ToLower(contentType), "json") && traceHasGenerationMarker(request) {
+			http.Error(w, "generation traces require protobuf", http.StatusBadRequest)
+			return
+		}
+		generations, partial := generationSpans(request)
+		if partial != nil {
+			response, err = proto.Marshal(&coltracepb.ExportTraceServiceResponse{PartialSuccess: partial})
+			if err != nil {
+				http.Error(w, "encode trace response", http.StatusInternalServerError)
+				return
+			}
+			body, err = proto.Marshal(request)
+			if err != nil {
+				http.Error(w, "encode accepted traces", http.StatusInternalServerError)
+				return
+			}
+			contentEncoding = ""
+		}
+		hasGenerations = len(generations) > 0
+		resp, _, persistErr := s.persistGenerations(generations)
+		if persistErr != nil {
+			status := http.StatusBadRequest
+			if errors.Is(persistErr, errJSONLRecordTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			http.Error(w, persistErr.Error(), status)
+			return
+		}
+		for _, result := range resp.Results {
+			if !result.Accepted {
+				http.Error(w, "persist generation: "+result.Error, http.StatusInternalServerError)
+				return
+			}
+		}
+		// Tool projection must not fail generation confirmation.
+		changed, appendErr := s.storage.appendToolSpans(toolSpanRecords(request))
+		if appendErr != nil {
 			s.logger.Printf("local: append tool spans: %v", appendErr)
-			for _, conversationID := range changed {
-				s.hub.broadcast(changeEvent{ConversationID: conversationID})
-			}
-		} else {
-			for _, conversationID := range changed {
-				s.hub.broadcast(changeEvent{ConversationID: conversationID})
-			}
+		}
+		for _, conversationID := range changed {
+			s.hub.broadcast(changeEvent{ConversationID: conversationID})
 		}
 	}
 
-	// Best-effort Cloud forwarding: metrics relay unchanged, trace content is
-	// stripped under a reduced content mode inside forwardOTLP.
+	// Best-effort forwarding: metrics relay unchanged; recipients share
+	// the trace copy, reduced only outside full capture mode.
 	if signal := otlpSignalFromPath(r.URL.Path); signal != "" && !isForwardedRequest(r) {
-		if cfg := s.forward.load(); cfg.enabled {
-			s.forward.enqueue(otlpForwardLabel(signal), func() { s.forward.forwardOTLP(cfg, signal, contentType, contentEncoding, body) })
+		label := otlpForwardLabel(signal)
+		if hasGenerations {
+			label = forwardLabelOTLPGenerations
 		}
+		s.forward.dispatchOTLP(s.forward.load(), signal, contentType, contentEncoding, body, label)
 	}
 
-	// OTLP/HTTP collectors return an empty protobuf message on success;
-	// 200 + empty body is accepted by the otlphttp exporter.
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
+	if strings.Contains(strings.ToLower(contentType), "json") {
+		w.Header().Set("Content-Type", wire.ContentTypeJSON)
+		_, _ = w.Write([]byte("{}"))
+		return
+	}
+	w.Header().Set("Content-Type", wire.ContentTypeProto)
+	_, _ = w.Write(response)
 }
 
 // handleHookEvaluate answers the guard check before or after a tool call. The
@@ -982,7 +1093,7 @@ const conversationListLimit = 200
 
 // handleListConversations returns the aggregated conversation list as JSON.
 // The response is newest-first. ?limit= caps matching rows. Exact time,
-// workspace, and tool filters, plus the ?agent=, ?model=, ?status= and
+// workspace, and tool/skill filters, plus the ?agent=, ?model=, ?status= and
 // ?subagents= facets, are applied to each decoded candidate before it counts
 // toward that cap; see ConversationListOptions.
 //
@@ -999,7 +1110,10 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	tool := toolParam(r)
+	tool, skill, ok := conversationExecutionParams(w, r)
+	if !ok {
+		return
+	}
 	facets, ok := conversationFacetParams(w, r)
 	if !ok {
 		return
@@ -1007,9 +1121,9 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 	_, hasBefore := r.URL.Query()["before"]
 	// A since-only request without facets is the normal ranged list and uses last
 	// activity. Facets still use period-clipped summaries.
-	exact := hasBefore || workspace != nil || tool != nil
+	exact := hasBefore || workspace != nil || tool != nil || skill != nil
 	facets.Limit, facets.Since, facets.Before = limit, since, before
-	facets.Workspace, facets.Tool, facets.Exact = workspace, tool, exact
+	facets.Workspace, facets.Tool, facets.Skill, facets.Exact = workspace, tool, skill, exact
 	convs, total, err := s.storage.ListConversations(facets)
 	if err != nil {
 		s.logger.Printf("local: list conversations: %v", err)
@@ -1022,10 +1136,14 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 		// guarding.
 		convs = []ConversationSummary{}
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"conversations":       convs,
 		"total_conversations": total,
-	})
+	}
+	if skill != nil {
+		response["applied_skill"] = *skill
+	}
+	s.writeJSON(w, http.StatusOK, response)
 	s.warmSummariesInBackground()
 }
 
@@ -1041,6 +1159,21 @@ func toolParam(r *http.Request) *string {
 		value = toolNameKey(values[0])
 	}
 	return &value
+}
+
+// Echo the requested skill as applied_skill so clients can confirm filter support.
+// Normalize only in storage.
+func conversationExecutionParams(w http.ResponseWriter, r *http.Request) (tool, skill *string, ok bool) {
+	tool = toolParam(r)
+	if r.URL.Query().Has("skill") {
+		value := r.URL.Query().Get("skill")
+		skill = &value
+	}
+	if tool != nil && skill != nil {
+		http.Error(w, "tool and skill filters are mutually exclusive", http.StatusBadRequest)
+		return nil, nil, false
+	}
+	return tool, skill, true
 }
 
 // conversationFacetParams reads ?agent=, ?model=, ?status= and ?subagents=
@@ -1167,6 +1300,7 @@ func (s *Server) handleTokenMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	points, used, err := s.storage.TokenUsagePoints(TokenUsageOptions{
 		Since: since, Before: before, Workspace: workspace, Interval: interval,
+		Agent: r.URL.Query().Get("agent"),
 	})
 	if err != nil {
 		s.logger.Printf("local: token metrics: %v", err)
@@ -1201,13 +1335,17 @@ func (s *Server) handleConversationMetrics(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	tool, skill, ok := conversationExecutionParams(w, r)
+	if !ok {
+		return
+	}
 	order := r.URL.Query().Get("order")
 	if order != "" && order != "tokens" {
 		http.Error(w, `order must be "tokens"`, http.StatusBadRequest)
 		return
 	}
 	facets.Limit, facets.Since, facets.Before = limit, since, before
-	facets.Workspace, facets.Tool, facets.Order = workspace, toolParam(r), order
+	facets.Workspace, facets.Tool, facets.Skill, facets.Order = workspace, tool, skill, order
 	rows, matched, aggregate, err := s.storage.ConversationMetrics(facets)
 	if err != nil {
 		s.logger.Printf("local: conversation metrics: %v", err)
@@ -1217,11 +1355,15 @@ func (s *Server) handleConversationMetrics(w http.ResponseWriter, r *http.Reques
 	if rows == nil {
 		rows = []ConversationSummary{}
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"aggregate":             aggregate,
 		"conversations":         rows,
 		"matched_conversations": matched,
-	})
+	}
+	if skill != nil {
+		response["applied_skill"] = *skill
+	}
+	s.writeJSON(w, http.StatusOK, response)
 	s.warmSummariesInBackground()
 }
 
@@ -1308,7 +1450,7 @@ func (s *Server) handleSkillsToolsMetrics(w http.ResponseWriter, r *http.Request
 		}
 		interval = time.Duration(seconds) * time.Second
 	}
-	tools, err := s.storage.ToolAnalytics(ToolAnalyticsOptions{
+	metrics, err := s.storage.SkillsToolsMetrics(ToolAnalyticsOptions{
 		Since: since, Before: before, Workspace: workspace, Interval: interval,
 	})
 	if err != nil {
@@ -1316,7 +1458,7 @@ func (s *Server) handleSkillsToolsMetrics(w http.ResponseWriter, r *http.Request
 		http.Error(w, "skills-tools metrics: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, SkillsToolsMetricsResponse{Tools: tools})
+	s.writeJSON(w, http.StatusOK, metrics)
 	s.warmSummariesInBackground()
 }
 

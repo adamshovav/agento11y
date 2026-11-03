@@ -36,6 +36,51 @@ func sampleReport() *Report {
 	}
 }
 
+func TestWriteSummary(t *testing.T) {
+	recovered := goldenFailingForwardingReport()
+	recovered.LocalForwarding.Health = HealthOK
+	recovered.LocalForwarding.ForwardStatus.Failures = nil
+	for i := range recovered.LocalForwarding.ForwardStatus.Destinations {
+		recovered.LocalForwarding.ForwardStatus.Destinations[i].Failures = nil
+	}
+	broken := goldenFailingForwardingReport()
+	broken.Analytics.Health = HealthError
+	invalid := goldenHealthyReport()
+	invalid.LocalForwarding.Health = HealthWarn
+	invalid.LocalForwarding.Error = "forwarding.toml is invalid"
+	for _, tc := range []struct {
+		name   string
+		report *Report
+		want   string
+		exit   int
+	}{
+		{name: "healthy", report: goldenHealthyReport(), want: "no problems detected"},
+		{name: "delivery failures", report: goldenFailingForwardingReport(), want: "local forwarding has warnings; see Local forwarding above"},
+		{name: "unavailable", report: goldenUnavailableForwardingReport(), want: "local forwarding has warnings; see Local forwarding above"},
+		{name: "invalid forwarding file", report: invalid, want: "local forwarding has warnings; see Local forwarding above"},
+		{name: "recovered with historical failures", report: recovered, want: "no problems detected"},
+		{name: "primary and forwarding failures", report: broken, want: "1 problem(s): analytics misconfigured\n! local forwarding has warnings; see Local forwarding above", exit: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body reportBody
+			writeSummary(&body, palette{}, tc.report)
+			got := body.flush(palette{})
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("summary = %q, want %q", got, tc.want)
+			}
+			if tc.want != "no problems detected" && strings.Contains(got, "no problems detected") {
+				t.Fatalf("forwarding warning reported as healthy: %q", got)
+			}
+			if tc.report.exitCode() != tc.exit {
+				t.Fatal("summary changed exit semantics")
+			}
+			if tc.report.exitCodeFor(Options{RequireCloud: true}) != tc.exit {
+				t.Fatal("summary changed require-cloud semantics")
+			}
+		})
+	}
+}
+
 func TestRenderJSON_ValidAndNoToken(t *testing.T) {
 	r := sampleReport()
 	var buf bytes.Buffer
@@ -163,6 +208,18 @@ func TestRenderHuman_NoColorIsPlain(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("human output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderHumanShowsSeparateCLIUsageStatistics(t *testing.T) {
+	r := sampleReport()
+	r.UsageStats = UsageStatsSection{Mode: "disabled", Endpoint: "https://stats.grafana.org/agento11y-usage-report"}
+	var out bytes.Buffer
+	renderHuman(&out, r, false)
+	for _, want := range []string{"CLI usage statistics", "reporting:        disabled", "AGENTO11Y_ANONYMOUS_USAGE_STATS=disabled"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("doctor missing %q:\n%s", want, out.String())
 		}
 	}
 }

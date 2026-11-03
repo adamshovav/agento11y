@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/grafana/agento11y/plugins/agento11y/internal/clihelp"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/local"
 )
 
 // mergeEnv returns the union of the given env maps, later entries winning.
@@ -58,12 +60,13 @@ func isolateEnv(t *testing.T) string {
 // tests stay hermetic.
 func stubSeams(t *testing.T) {
 	t.Helper()
-	prevAgents, prevConv, prevOTLP, prevReceiverSupported := collectAgents, probeConversationsFn, probeOTLPFn, receiverSupported
+	prevAgents, prevConv, prevOTLP, prevReceiverSupported, prevStatus := collectAgents, probeConversationsFn, probeOTLPFn, receiverSupported, loadLocalStatus
 	t.Cleanup(func() {
-		collectAgents, probeConversationsFn, probeOTLPFn, receiverSupported = prevAgents, prevConv, prevOTLP, prevReceiverSupported
+		collectAgents, probeConversationsFn, probeOTLPFn, receiverSupported, loadLocalStatus = prevAgents, prevConv, prevOTLP, prevReceiverSupported, prevStatus
 	})
+	loadLocalStatus = func(string) (*local.Status, error) { return nil, nil }
 	collectAgents = func(context.Context, string) []AgentStatus { return nil }
-	probeConversationsFn = func(context.Context, string, envValue, string, bool) *ProbeResult {
+	probeConversationsFn = func(context.Context, string, envValue, string, bool, string) *ProbeResult {
 		return &ProbeResult{StatusCode: 200, OK: true}
 	}
 	probeOTLPFn = func(context.Context, envValue) *AnalyticsProbe { return nil }
@@ -181,7 +184,7 @@ func TestRunHelpAndUsageNoEffects(t *testing.T) {
 				t.Fatal("collected report")
 				return false
 			}
-			probeConversationsFn = func(context.Context, string, envValue, string, bool) *ProbeResult {
+			probeConversationsFn = func(context.Context, string, envValue, string, bool, string) *ProbeResult {
 				t.Fatal("probed conversations")
 				return nil
 			}
@@ -320,6 +323,36 @@ func TestCollectConversations(t *testing.T) {
 		wantMsg    string
 	}{
 		{
+			name:       "OTel needs no generation API credentials",
+			osEnv:      map[string]string{"AGENTO11Y_PROTOCOL": "otel", "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES": "true", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"},
+			wantHealth: HealthOK,
+			wantMsg:    "no HTTP fallback",
+		},
+		{
+			name:       "OTel requires experimental opt-in",
+			osEnv:      map[string]string{"AGENTO11Y_PROTOCOL": "otel", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"},
+			wantHealth: HealthError,
+			wantMsg:    "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=true",
+		},
+		{
+			name:       "legacy experimental key does not opt in",
+			osEnv:      map[string]string{"SIGIL_PROTOCOL": "otel", "SIGIL_ENABLE_EXPERIMENTAL_FEATURES": "true", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"},
+			wantHealth: HealthError,
+			wantMsg:    "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=true",
+		},
+		{
+			name:       "OTel requires an endpoint",
+			osEnv:      map[string]string{"AGENTO11Y_PROTOCOL": "otel", "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES": "true"},
+			wantHealth: HealthError,
+			wantMsg:    "valid configured HTTP(S) OTLP base endpoint",
+		},
+		{
+			name:       "invalid protocol cannot use HTTP credentials",
+			osEnv:      map[string]string{"AGENTO11Y_PROTOCOL": "unsupported", "AGENTO11Y_ENDPOINT": "http://127.0.0.1:9000", "AGENTO11Y_AUTH_TENANT_ID": "1", "AGENTO11Y_AUTH_TOKEN": "token"},
+			wantHealth: HealthError,
+			wantMsg:    "unsupported AGENTO11Y_PROTOCOL",
+		},
+		{
 			name:       "all set",
 			osEnv:      map[string]string{"SIGIL_ENDPOINT": "https://x", "SIGIL_AUTH_TENANT_ID": "1", "SIGIL_AUTH_TOKEN": "glc_t"},
 			wantHealth: HealthOK,
@@ -331,10 +364,9 @@ func TestCollectConversations(t *testing.T) {
 			wantMsg:    "not configured",
 		},
 		{
-			name:       "missing token",
+			name:       "tenant-only credentials",
 			osEnv:      map[string]string{"SIGIL_ENDPOINT": "https://x", "SIGIL_AUTH_TENANT_ID": "1"},
-			wantHealth: HealthError,
-			wantMsg:    "AGENTO11Y_AUTH_TOKEN",
+			wantHealth: HealthOK,
 		},
 		{
 			name:       "preferred-only credentials",
@@ -448,9 +480,9 @@ func TestCollectConversations(t *testing.T) {
 		{
 			// The shape heuristic must not turn an error into a warning.
 			name:       "suspicious host does not downgrade a credentials error",
-			osEnv:      map[string]string{"AGENTO11Y_ENDPOINT": "https://mystack.grafana.net", "AGENTO11Y_AUTH_TENANT_ID": "1"},
+			osEnv:      map[string]string{"AGENTO11Y_ENDPOINT": "https://mystack.grafana.net", "AGENTO11Y_AUTH_TOKEN": "glc_t"},
 			wantHealth: HealthError,
-			wantMsg:    "incomplete credentials; missing AGENTO11Y_AUTH_TOKEN",
+			wantMsg:    "incomplete credentials; missing AGENTO11Y_AUTH_TENANT_ID",
 		},
 		{
 			name:       "malformed endpoint error survives the shape check",
@@ -510,6 +542,130 @@ func TestCollectConversationsConflictingTokens(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(sec.Messages, " "), "AGENTO11Y_AUTH_TOKEN") {
 		t.Fatalf("messages %v do not name the selected key", sec.Messages)
+	}
+}
+
+func TestTenantOnlyConversationsAreProbed(t *testing.T) {
+	prev := probeConversationsFn
+	t.Cleanup(func() { probeConversationsFn = prev })
+	called := false
+	probeConversationsFn = func(_ context.Context, endpoint string, tenant envValue, token string, _ bool, mode string) *ProbeResult {
+		called = true
+		if endpoint != "https://x" || tenant.Value != "1" || token != "" || mode != "tenant" {
+			t.Fatalf("probe credentials = (%q, %q, %q, %q)", endpoint, tenant.Value, token, mode)
+		}
+		return &ProbeResult{StatusCode: 200, OK: true}
+	}
+	sec := collectConversations(map[string]string{
+		"AGENTO11Y_ENDPOINT":       "https://x",
+		"AGENTO11Y_AUTH_TENANT_ID": "1",
+	}, nil)
+	if !sec.configured() || sec.Health != HealthOK {
+		t.Fatalf("tenant-only section = %+v", sec)
+	}
+	r := &Report{Conversations: sec}
+	runProbes(context.Background(), r, map[string]string{"AGENTO11Y_AUTH_TENANT_ID": "1"}, nil)
+	if !called || r.Conversations.Probe == nil || r.Conversations.Health != HealthOK {
+		t.Fatalf("tenant-only probe result = %+v; called = %v", r.Conversations, called)
+	}
+}
+
+func TestExplicitCodexAuthModeProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantMode string
+		agents         []AgentStatus
+		wantHealth     Health
+	}{
+		{name: "Codex only", wantMode: "bearer", agents: []AgentStatus{{Name: "codex", Install: InstallStateInstalled}}, wantHealth: HealthOK},
+		{name: "mixed agents", wantMode: "basic", agents: []AgentStatus{{Name: "codex", Install: InstallStateInstalled}, {Name: "cursor", Install: InstallStateInstalled}}, wantHealth: HealthWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := probeConversationsFn
+			t.Cleanup(func() { probeConversationsFn = prev })
+			probeConversationsFn = func(_ context.Context, _ string, _ envValue, _ string, _ bool, mode string) *ProbeResult {
+				if mode != tc.wantMode {
+					t.Errorf("probe mode = %q, want %q", mode, tc.wantMode)
+				}
+				return &ProbeResult{StatusCode: http.StatusAccepted, OK: true}
+			}
+			env := map[string]string{"AGENTO11Y_AUTH_TOKEN": "tok", "AGENTO11Y_AUTH_MODE": "bearer"}
+			r := &Report{Conversations: ConversationsSection{
+				Endpoint: envValue{Set: true, Value: "https://example.test"},
+				TenantID: envValue{Set: true, Value: "tenant"},
+				Token:    tokenValue{Set: true},
+				Health:   HealthOK,
+			}, Agents: tc.agents}
+			runProbes(context.Background(), r, env, nil)
+			if r.Conversations.Health != tc.wantHealth {
+				t.Fatalf("conversation health = %q, want %q", r.Conversations.Health, tc.wantHealth)
+			}
+		})
+	}
+}
+
+func TestCollectBasicAuthModeWithoutToken(t *testing.T) {
+	isolateEnv(t)
+	stubSeams(t)
+	t.Setenv("AGENTO11Y_AUTH_MODE", "basic")
+	writeConfig(t, "AGENTO11Y_ENDPOINT=https://x\nAGENTO11Y_AUTH_TENANT_ID=tenant\n")
+	r := Collect(context.Background(), Options{RequireCloud: true}, Params{OSEnv: SnapshotEnv()})
+	if r.Conversations.Health != HealthError || r.Conversations.Probe != nil {
+		t.Fatalf("conversations = %+v, want error without a probe", r.Conversations)
+	}
+	msg := strings.Join(r.Conversations.Messages, " ")
+	if !strings.Contains(msg, "AGENTO11Y_AUTH_MODE=basic") || !strings.Contains(msg, "AGENTO11Y_AUTH_TOKEN") {
+		t.Fatalf("messages = %v, want auth mode and missing token", r.Conversations.Messages)
+	}
+	if got := r.exitCodeFor(Options{RequireCloud: true}); got != 1 {
+		t.Fatalf("strict Cloud exit = %d, want 1", got)
+	}
+}
+
+func TestCollectTenantOnlyCredentialsByInstalledAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		agents     []AgentStatus
+		wantHealth Health
+		wantExit   int
+		wantAgent  string
+	}{
+		{name: "Codex only", agents: []AgentStatus{{Name: "codex", Install: InstallStateInstalled}}, wantHealth: HealthOK},
+		{name: "OpenCode only", agents: []AgentStatus{{Name: "opencode", Install: InstallStateInstalled}}, wantHealth: HealthOK},
+		{name: "OpenCode with skipped CLI probes", agents: []AgentStatus{
+			{Name: "opencode", Install: InstallStateInstalled},
+			{Name: "codex", Install: InstallStateUnknown, Health: HealthSkipped},
+			{Name: "copilot", Install: InstallStateUnknown, Health: HealthSkipped},
+		}, wantHealth: HealthOK},
+		{name: "no agents", wantHealth: HealthWarn, wantExit: 1},
+		{name: "agents not installed", agents: []AgentStatus{{Name: "cursor", Install: InstallStateNotInstalled}}, wantHealth: HealthWarn, wantExit: 1},
+		{name: "unknown agent", agents: []AgentStatus{{Name: "codex", Install: InstallStateInstalled}, {Name: "cursor", Install: InstallStateUnknown}}, wantHealth: HealthWarn, wantExit: 1},
+		{name: "Cursor installed", agents: []AgentStatus{{Name: "codex", Install: InstallStateInstalled}, {Name: "cursor", Install: InstallStateInstalled}}, wantHealth: HealthError, wantExit: 1, wantAgent: "cursor"},
+		{name: "Copilot installed", agents: []AgentStatus{{Name: "copilot", Install: InstallStateInstalled}}, wantHealth: HealthError, wantExit: 1, wantAgent: "copilot"},
+		{name: "Cursor not installed", agents: []AgentStatus{{Name: "codex", Install: InstallStateInstalled}, {Name: "cursor", Install: InstallStateNotInstalled}}, wantHealth: HealthOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateEnv(t)
+			stubSeams(t)
+			collectAgents = func(context.Context, string) []AgentStatus { return tc.agents }
+			probeOTLPFn = func(context.Context, envValue) *AnalyticsProbe {
+				return &AnalyticsProbe{Metrics: &ProbeResult{StatusCode: 200, OK: true}, Traces: &ProbeResult{StatusCode: 200, OK: true}}
+			}
+			r := Collect(context.Background(), Options{RequireCloud: true}, Params{OSEnv: map[string]string{
+				"AGENTO11Y_ENDPOINT":                    "https://x",
+				"AGENTO11Y_AUTH_TENANT_ID":              "tenant",
+				"AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example",
+				"OTEL_EXPORTER_OTLP_HEADERS":            "Authorization=Bearer test",
+			}})
+			if r.Conversations.Health != tc.wantHealth || r.Conversations.Probe == nil {
+				t.Fatalf("conversations = %+v, want health %q and probe", r.Conversations, tc.wantHealth)
+			}
+			if got := r.exitCodeFor(Options{RequireCloud: true}); got != tc.wantExit {
+				t.Fatalf("strict Cloud exit = %d, want %d", got, tc.wantExit)
+			}
+			if tc.wantAgent != "" && !strings.Contains(strings.Join(r.Conversations.Messages, " "), tc.wantAgent) {
+				t.Fatalf("messages %v do not name %s", r.Conversations.Messages, tc.wantAgent)
+			}
+		})
 	}
 }
 
@@ -940,7 +1096,7 @@ func TestRunProbes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			prevConv, prevOTLP := probeConversationsFn, probeOTLPFn
 			t.Cleanup(func() { probeConversationsFn, probeOTLPFn = prevConv, prevOTLP })
-			probeConversationsFn = func(context.Context, string, envValue, string, bool) *ProbeResult { return tc.conv }
+			probeConversationsFn = func(context.Context, string, envValue, string, bool, string) *ProbeResult { return tc.conv }
 			var gotOTLPTenant envValue
 			probeOTLPFn = func(_ context.Context, tenant envValue) *AnalyticsProbe {
 				gotOTLPTenant = tenant
@@ -1802,8 +1958,7 @@ func TestCollectConfig_AutoTags(t *testing.T) {
 		},
 		{
 			// Without USER_ID the value depends on which agent runs the session,
-			// so the row shows a placeholder rather than the account name doctor
-			// itself runs under.
+			// so the row shows a placeholder rather than one agent's outcome.
 			name: "the user value is left to the agent when USER_ID is unset",
 			osEnv: map[string]string{
 				"AGENTO11Y_AUTO_CODING_AGENT_TAGS":       "true",
@@ -1813,7 +1968,7 @@ func TestCollectConfig_AutoTags(t *testing.T) {
 			wantTags:        map[string]string{"user": agentUserPlaceholder},
 			wantSource:      sourceEnv,
 			wantNamesSource: sourceEnv,
-			wantMsg:         "the auto tag user depends on the coding agent",
+			wantMsg:         "the auto tag user depends on the coding agent: Claude Code, Codex, and Cursor attach the signed-in account when they have one, and other agents attach no user tag; set AGENTO11Y_USER_ID to tag every agent with the same value",
 		},
 		{
 			// An explicit tag supplies the value, so the agent never gets a say and
@@ -2479,5 +2634,27 @@ func TestRun(t *testing.T) {
 				tc.check(t, stdout.String())
 			}
 		})
+	}
+}
+
+func TestCollectNoneAuthModeWithoutToken(t *testing.T) {
+	isolateEnv(t)
+	stubSeams(t)
+	collectAgents = func(context.Context, string) []AgentStatus {
+		return []AgentStatus{{Name: "codex", Install: InstallStateInstalled}}
+	}
+	probeConversationsFn = func(_ context.Context, _ string, _ envValue, token string, _ bool, mode string) *ProbeResult {
+		if token != "" || mode != "none" {
+			t.Fatalf("probe auth = (%q, %q), want no token and none", token, mode)
+		}
+		return &ProbeResult{StatusCode: http.StatusAccepted, OK: true}
+	}
+	r := Collect(context.Background(), Options{}, Params{OSEnv: map[string]string{
+		"AGENTO11Y_ENDPOINT":       "https://x",
+		"AGENTO11Y_AUTH_TENANT_ID": "tenant",
+		"AGENTO11Y_AUTH_MODE":      "none",
+	}})
+	if r.Conversations.Health != HealthOK || r.Conversations.Probe == nil {
+		t.Fatalf("conversations = %+v, want healthy none auth", r.Conversations)
 	}
 }

@@ -102,6 +102,9 @@ func capturePrompt(p Payload, cfg config.Config, logger *log.Logger) {
 		logger.Print("userPromptSubmit: missing session_id or turn_id")
 		return
 	}
+	if strings.TrimSpace(p.Prompt) != "" {
+		setConversationTitle(p.SessionID, p.Prompt, logger)
+	}
 	if err := updateCommon(p, logger, func(f *fragment.Fragment) {
 		if cfg.ContentCapture != agento11y.ContentCaptureModeMetadataOnly {
 			f.Prompt = p.Prompt
@@ -205,9 +208,17 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 		logger.Printf("stop: update: %v", err)
 		return
 	}
-	envconfig.ApplyLocalAuthPlaceholders()
-	if !config.HasCredentials() {
-		logger.Print("stop: missing SIGIL_ENDPOINT/SIGIL_AUTH_TENANT_ID/SIGIL_AUTH_TOKEN; discarding fragment")
+	protocol, err := envconfig.ResolveGenerationTransport()
+	if err != nil {
+		logger.Printf("stop: generation transport: %v", err)
+		markPendingRetry(p.SessionID, p.TurnID, logger)
+		return
+	}
+	if protocol == agento11y.GenerationExportProtocolHTTP {
+		envconfig.ApplyLocalAuthPlaceholders()
+	}
+	if protocol == agento11y.GenerationExportProtocolHTTP && !config.HasCredentials() {
+		logger.Print("stop: missing AGENTO11Y_ENDPOINT/AGENTO11Y_AUTH_TENANT_ID; discarding fragment")
 		if err := fragment.Delete(p.SessionID, p.TurnID); err != nil {
 			logger.Printf("stop: delete fragment: %v", err)
 		}
@@ -225,16 +236,39 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 	providers := emit.SetupOTel(ctx, p.SessionID, logger)
 	if providers != nil {
 		defer func() {
-			if err := providers.Shutdown(ctx); err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			if err := providers.Shutdown(cleanupCtx); err != nil {
 				logger.Printf("otel: shutdown: %v", err)
 			}
 		}()
 	}
 	userID := userid.Resolve()
-	client := buildClient(cfg, frag.Cwd, userID, providers, logger)
-	defer func() { _ = client.Shutdown(ctx) }()
+	client, err := buildClient(cfg, frag.Cwd, userID, providers, logger)
+	if err != nil {
+		logger.Printf("stop: build client: %v", err)
+		markPendingRetry(p.SessionID, p.TurnID, logger)
+		return
+	}
+	clients := map[string]*agento11y.Client{frag.Cwd: client}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		for _, client := range clients {
+			_ = client.Shutdown(cleanupCtx)
+		}
+	}()
 
-	mapped := mapper.Map(mapper.Inputs{Fragment: frag, SubagentLink: subagentLink, TokenSnapshot: tokenSnapshot, ContentCapture: cfg.ContentCapture, AgentName: cfg.Agent(), SkipPromptRedaction: cfg.SkipPromptRedaction, UserID: userID})
+	mapped := mapper.Map(mapper.Inputs{
+		Fragment:            frag,
+		SubagentLink:        subagentLink,
+		ParentTitle:         parentTitleForLink(subagentLink, logger),
+		TokenSnapshot:       tokenSnapshot,
+		ContentCapture:      cfg.ContentCapture,
+		AgentName:           cfg.Agent(),
+		SkipPromptRedaction: cfg.SkipPromptRedaction,
+		UserID:              userID,
+	})
 	logger.Printf("stop: export id=%s conversation=%s agent=%s model=%s", mapped.Generation.ID, mapped.Generation.ConversationID, mapped.Generation.AgentName, mapped.Generation.Model.Name)
 	if err := emitGeneration(ctx, client, frag, mapped, cfg.ContentCapture, logger); err != nil {
 		logger.Printf("stop: emit: %v", err)
@@ -243,26 +277,36 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 	}
 
 	// Retry any prior turns flagged for retry on a previous Stop failure.
-	// We enqueue them before the current turn's Flush so all queued
-	// generations drain together. Their on-disk fragments are deleted only
-	// after Flush succeeds; if Flush fails the fragments stay on disk with
-	// their PendingRetry flag set, ready for the next Stop to try again.
-	sweptPaths := sweepPendingRetries(ctx, client, cfg, p.SessionID, p.TurnID, userID, logger)
+	// We enqueue them before flushing the clients. Their on-disk fragments
+	// are deleted only after their client's Flush succeeds; failed retries
+	// stay on disk with PendingRetry set, ready for the next Stop to try again.
+	sweptPaths := sweepPendingRetries(ctx, clients, providers, cfg, p.SessionID, p.TurnID, userID, logger)
 
-	if err := client.Flush(ctx); err != nil {
-		logger.Printf("stop: agento11y flush: %v", err)
-		markPendingRetry(p.SessionID, p.TurnID, logger)
-		return
-	}
-	for _, path := range sweptPaths {
-		if err := fragment.DeleteFile(path); err != nil {
-			logger.Printf("stop: retry delete %s: %v", path, err)
+	currentFlushed := false
+	for cwd, client := range clients {
+		if err := client.Flush(ctx); err != nil {
+			logger.Printf("stop: agento11y flush: %v", err)
+			if cwd == frag.Cwd {
+				markPendingRetry(p.SessionID, p.TurnID, logger)
+			}
+			continue
+		}
+		for _, path := range sweptPaths[cwd] {
+			if err := fragment.DeleteFile(path); err != nil {
+				logger.Printf("stop: retry delete %s: %v", path, err)
+			}
+		}
+		if cwd == frag.Cwd {
+			currentFlushed = true
 		}
 	}
 	if providers != nil {
 		if err := providers.ForceFlush(); err != nil {
 			logger.Printf("stop: otel flush: %v", err)
 		}
+	}
+	if !currentFlushed {
+		return
 	}
 	if err := fragment.Delete(p.SessionID, p.TurnID); err != nil {
 		logger.Printf("stop: delete fragment: %v", err)
@@ -289,8 +333,8 @@ func markPendingRetry(sessionID, turnID string, logger *log.Logger) {
 }
 
 // sweepPendingRetries enqueues every turn fragment for the session that is
-// flagged for retry and returns the paths it enqueued. The caller deletes
-// those paths only after client.Flush succeeds; failed retries keep their
+// flagged for retry and returns the paths it enqueued by working directory.
+// The caller deletes paths only after their client.Flush succeeds; failed retries keep their
 // PendingRetry flag on disk so a later Stop sweeps them again until the 24h
 // cleanup expires the file. The current turn (currentTurnID) is skipped
 // because the caller emits it inline.
@@ -300,10 +344,10 @@ func markPendingRetry(sessionID, turnID string, logger *log.Logger) {
 // transcript path and turn id, which is enough for both helpers. Without
 // this, retried subagent turns would silently re-export as plain `codex`
 // turns with empty token usage.
-func sweepPendingRetries(ctx context.Context, client *agento11y.Client, cfg config.Config, sessionID, currentTurnID, userID string, logger *log.Logger) []string {
+func sweepPendingRetries(ctx context.Context, clients map[string]*agento11y.Client, providers *otel.Providers, cfg config.Config, sessionID, currentTurnID, userID string, logger *log.Logger) map[string][]string {
 	currentPath := fragment.FragmentFilePath(sessionID, currentTurnID)
 	paths := fragment.ListTurnFiles(sessionID, logger)
-	enqueued := make([]string, 0, len(paths))
+	enqueued := make(map[string][]string)
 	for _, path := range paths {
 		if path == currentPath {
 			continue
@@ -311,6 +355,16 @@ func sweepPendingRetries(ctx context.Context, client *agento11y.Client, cfg conf
 		f := fragment.LoadFile(path, logger)
 		if f == nil || !f.PendingRetry {
 			continue
+		}
+		client := clients[f.Cwd]
+		if client == nil {
+			var err error
+			client, err = buildClient(cfg, f.Cwd, userID, providers, logger)
+			if err != nil {
+				logger.Printf("stop: retry build client: %v", err)
+				continue
+			}
+			clients[f.Cwd] = client
 		}
 		retryPayload := Payload{
 			SessionID:      f.SessionID,
@@ -322,6 +376,7 @@ func sweepPendingRetries(ctx context.Context, client *agento11y.Client, cfg conf
 		mapped := mapper.Map(mapper.Inputs{
 			Fragment:            f,
 			SubagentLink:        subagentLink,
+			ParentTitle:         parentTitleForLink(subagentLink, logger),
 			TokenSnapshot:       tokenSnapshot,
 			ContentCapture:      cfg.ContentCapture,
 			SkipPromptRedaction: cfg.SkipPromptRedaction,
@@ -336,7 +391,7 @@ func sweepPendingRetries(ctx context.Context, client *agento11y.Client, cfg conf
 			logger.Printf("stop: retry emit session=%s turn=%s: %v", f.SessionID, f.TurnID, err)
 			continue
 		}
-		enqueued = append(enqueued, path)
+		enqueued[f.Cwd] = append(enqueued[f.Cwd], path)
 	}
 	return enqueued
 }
@@ -441,6 +496,17 @@ func resolveSubagentLinkForStop(p Payload, frag *fragment.Fragment, logger *log.
 	return fragment.LoadSubagentLinkTolerant(p.SessionID, logger)
 }
 
+func parentTitleForLink(link *fragment.SubagentLink, logger *log.Logger) string {
+	if link == nil || link.ParentGenerationID == "" {
+		return ""
+	}
+	parent := fragment.LoadSessionTolerant(link.ParentSessionID, logger)
+	if parent == nil {
+		return ""
+	}
+	return parent.ConversationTitle
+}
+
 func updateCommon(p Payload, logger *log.Logger, mutate func(f *fragment.Fragment)) error {
 	return fragment.Update(p.SessionID, p.TurnID, logger, func(f *fragment.Fragment) bool {
 		applySessionDefaults(f, fragment.LoadSessionTolerant(p.SessionID, logger))
@@ -464,9 +530,25 @@ func updateCommon(p Payload, logger *log.Logger, mutate func(f *fragment.Fragmen
 	})
 }
 
+func setConversationTitle(sessionID, prompt string, logger *log.Logger) {
+	err := fragment.UpdateSession(sessionID, logger, func(s *fragment.Session) bool {
+		if s.ConversationTitle != "" {
+			return false
+		}
+		s.ConversationTitle = fragment.SessionTitle(prompt)
+		return s.ConversationTitle != ""
+	})
+	if err != nil {
+		logger.Printf("userPromptSubmit: save session title: %v", err)
+	}
+}
+
 func applySessionDefaults(f *fragment.Fragment, s *fragment.Session) {
 	if s == nil {
 		return
+	}
+	if f.ConversationTitle == "" {
+		f.ConversationTitle = s.ConversationTitle
 	}
 	if f.Cwd == "" {
 		f.Cwd = s.Cwd
@@ -482,14 +564,8 @@ func applySessionDefaults(f *fragment.Fragment, s *fragment.Session) {
 	}
 }
 
-// buildClient constructs the agento11y client with the shared HTTP/basic-auth
-// export defaults. Endpoint, tenant ID, and token come from the SDK's automatic
-// SIGIL_* env resolution, matching copilot and cursor. cwd is the turn's
-// working directory, which auto-tags resolve the repository and branch from.
-// userID is the identity Resolve already found (configured USER_ID or the
-// ChatGPT email in auth.json); auto-tags use it before falling back to the
-// OS account name.
-func buildClient(cfg config.Config, cwd, userID string, providers *otel.Providers, logger *log.Logger) *agento11y.Client {
+// buildClient configures export auth and tags for a Codex turn.
+func buildClient(cfg config.Config, cwd, userID string, providers *otel.Providers, logger *log.Logger) (*agento11y.Client, error) {
 	return emit.NewClient(emit.ClientOptions{
 		InstrumentationName: otelInstrumentationName,
 		ContentCapture:      cfg.ContentCapture,
@@ -497,7 +573,37 @@ func buildClient(cfg config.Config, cwd, userID string, providers *otel.Provider
 		Providers:           providers,
 		UserAgent:           useragent.For("codex"),
 		Tags:                autotag.FromEnv(autotag.Inputs{Cwd: cwd, UserID: userID}, logger),
+		Auth:                exportAuth(),
 	})
+}
+
+// exportAuth selects tenant auth when no token is configured.
+func exportAuth() agento11y.AuthConfig {
+	tenant := envconfig.Getenv("AUTH_TENANT_ID")
+	token := envconfig.Getenv("AUTH_TOKEN")
+	switch strings.ToLower(envconfig.Getenv("AUTH_MODE")) {
+	case "tenant":
+		return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeTenant, TenantID: tenant}
+	case "bearer":
+		return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeBearer, BearerToken: token}
+	case "none":
+		return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeNone}
+	}
+	if tenant != "" && token != "" {
+		return agento11y.AuthConfig{
+			Mode:          agento11y.ExportAuthModeBasic,
+			TenantID:      tenant,
+			BasicUser:     tenant,
+			BasicPassword: token,
+		}
+	}
+	if tenant != "" {
+		return agento11y.AuthConfig{
+			Mode:     agento11y.ExportAuthModeTenant,
+			TenantID: tenant,
+		}
+	}
+	return agento11y.AuthConfig{Mode: agento11y.ExportAuthModeNone}
 }
 
 func emitGeneration(ctx context.Context, client *agento11y.Client, frag *fragment.Fragment, mapped mapper.Mapped, mode agento11y.ContentCaptureMode, logger *log.Logger) error {

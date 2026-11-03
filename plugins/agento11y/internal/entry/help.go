@@ -47,6 +47,9 @@ func publicHelpPages() map[string]clihelp.Page {
 	add("skills get", "Print a bundled skill as raw Markdown. Alias for skills show.", "<name>")
 	add("claude eval", "Export Claude plugin eval results to Experiments.", "<command>")
 	add("claude eval import", "Export Claude plugin eval results. Use --dry-run to preview the redacted JSON without uploading.", "<results.json> [flags]")
+	add("harbor", "Run Harbor evaluations with live Agent Observability publishing.", "[run] -- <harbor run arguments>")
+	add("harbor run", "Run a Harbor job with the Agent Observability job plugin.", "-- <harbor run arguments>")
+	add("harbor export", "Export a completed Harbor job directory to Experiments.", "<job-directory> [flags]")
 	launcherNames := make([]string, 0, len(launchers))
 	for name := range launchers {
 		launcherNames = append(launcherNames, name)
@@ -55,7 +58,7 @@ func publicHelpPages() map[string]clihelp.Page {
 	for _, name := range launcherNames {
 		add(name, "Configure capture and launch "+name+". Arguments after -- belong to the host agent.", "[flags] [-- args...]")
 	}
-	for _, name := range []string{"claude", "copilot", "opencode", "pi"} {
+	for _, name := range []string{"claude", "copilot", "opencode", "pi", "kiro"} {
 		add(name+" install", "Install the "+name+" integration without launching it or prompting.", "[--json]")
 	}
 	for _, spec := range history.Specs() {
@@ -76,7 +79,7 @@ func publicHelpPages() map[string]clihelp.Page {
 	}
 	children("", "Setup", "login", "doctor", "agents")
 	children("", "Launchers", launcherNames...)
-	children("", "Commands", "cursor", "guards", "local", "history", "skills", "help")
+	children("", "Commands", "cursor", "guards", "harbor", "local", "history", "skills", "help")
 	children("guards", "Commands", "test")
 	children("agents", "Commands", "reconcile")
 	children("cursor", "Commands", "install", "uninstall")
@@ -84,10 +87,16 @@ func publicHelpPages() map[string]clihelp.Page {
 	children("history", "Commands", "import")
 	children("skills", "Commands", "list", "show", "get")
 	children("claude eval", "Commands", "import")
-	for _, name := range []string{"claude", "copilot", "opencode", "pi"} {
+	children("harbor", "Commands", "run", "export")
+	for _, name := range []string{"claude", "copilot", "opencode", "pi", "kiro"} {
 		children(name, "Commands", "install")
 	}
 	children("claude", "Experiments", "eval")
+	add("kiro uninstall", "Remove agento11y hooks from the current workspace.", "")
+	children("kiro", "Removal", "uninstall")
+	pageKiro := pages["kiro"]
+	pageKiro.Summary = "Experimental Kiro CLI 3 capture: prompts and tools only. Installs hooks in the current workspace. Arguments after -- belong to kiro-cli."
+	pages["kiro"] = pageKiro
 	page := pages["agents reconcile"]
 	targets := clihelp.Section{Title: "Installers"}
 	for _, spec := range registeredInstallers() {
@@ -154,7 +163,7 @@ func helpFlags(path string) *flag.FlagSet {
 		return historyHelpFlags()
 	case path == "claude eval import":
 		return claudeEvalHelpFlags()
-	case path == "claude install" || path == "copilot install" || path == "opencode install" || path == "pi install":
+	case path == "kiro install" || path == "claude install" || path == "copilot install" || path == "opencode install" || path == "pi install":
 		fs, _ := newJSONFlags(path)
 		return fs
 	default:
@@ -166,12 +175,35 @@ func helpFlags(path string) *flag.FlagSet {
 	return nil
 }
 
+// resolveCommandPath matches the longest prefix of args naming a public help
+// page, returning the path, tokens consumed, and whether anything matched.
+//
+// The only place argv is mapped to the help-page registry, which makes that
+// registry the command vocabulary. usagestats depends on it: a second inlined
+// copy of this loop would let an undefined token reach a recorded command.
+func resolveCommandPath(args []string) (path string, consumed int, ok bool) {
+	pages := publicHelpPages()
+	for i := 1; i <= len(args); i++ {
+		candidate := strings.Join(args[:i], " ")
+		if _, found := pages[candidate]; !found {
+			break
+		}
+		path, consumed = candidate, i
+	}
+	return path, consumed, consumed > 0
+}
+
 func usageError(stderr io.Writer, path, message string) {
 	page, ok := helpPage(path)
 	if !ok {
 		page, _ = helpPage("")
 	}
 	clihelp.UsageError(stderr, page, message)
+}
+
+// helpGroups are command groups that print their help when run without a subcommand.
+var helpGroups = map[string]bool{
+	"local": true, "history": true, "skills": true, "agents": true, "cursor": true, "claude eval": true, "harbor": true,
 }
 
 func routeHelp(args []string, stdout, stderr io.Writer) bool {
@@ -212,16 +244,7 @@ func routeHelp(args []string, stdout, stderr io.Writer) bool {
 		}
 		return true
 	}
-	pages := publicHelpPages()
-	path := ""
-	consumed := 0
-	for i := 1; i <= len(args); i++ {
-		candidate := strings.Join(args[:i], " ")
-		if _, ok := pages[candidate]; !ok {
-			break
-		}
-		path, consumed = candidate, i
-	}
+	path, consumed, _ := resolveCommandPath(args)
 	if consumed == 0 {
 		if _, internal := agents[args[0]]; internal {
 			return false
@@ -231,10 +254,12 @@ func routeHelp(args []string, stdout, stderr io.Writer) bool {
 		return true
 	}
 	rest := args[consumed:]
-	group := path == "local" || path == "history" || path == "skills" || path == "agents" || path == "cursor" || path == "claude eval"
-	if group && len(rest) == 0 {
+	if helpGroups[path] && len(rest) == 0 {
 		printHelp(path, stdout)
 		return true
+	}
+	if strings.HasPrefix(path+" ", "harbor ") {
+		return routeHarborHelp(path, rest, stdout)
 	}
 	if _, launcher := launchers[path]; launcher {
 		_, err := parseLauncherOptions(path, rest)
@@ -259,7 +284,7 @@ func routeHelp(args []string, stdout, stderr io.Writer) bool {
 	if err != nil {
 		return parsedHelp(path, err, stdout, stderr)
 	}
-	if group && fs.NArg() > 0 {
+	if helpGroups[path] && fs.NArg() > 0 {
 		usageError(stderr, path, fmt.Sprintf("unknown %s verb %q", path, fs.Arg(0)))
 		exit(2)
 		return true

@@ -229,6 +229,52 @@ test('an empty score list sends no request', async () => {
   }
 });
 
+test('score report roles serialize and an omitted role stays absent', async () => {
+  const { endpoint, seen, close } = await startServer(() => ({ status: 202, body: { accepted: 3 } }));
+  try {
+    const common = {
+      evaluatorId: 'judge',
+      evaluatorVersion: '1',
+      value: { number: 0.9 },
+      trialId: 'trial-1',
+    };
+    await newClient(endpoint).exportScores([
+      { ...common, scoreId: 'primary', scoreKey: 'answer_relevancy', reportRole: 'primary_verdict' },
+      { ...common, scoreId: 'diagnostic', scoreKey: 'groundedness', reportRole: 'diagnostic' },
+      { ...common, scoreId: 'legacy', scoreKey: 'final' },
+    ]);
+    const scores = JSON.parse(seen[0].body).scores;
+    assert.equal(scores[0].report_role, 'primary_verdict');
+    assert.equal(scores[1].report_role, 'diagnostic');
+    assert.equal('report_role' in scores[2], false);
+  } finally {
+    await close();
+  }
+});
+
+test('an invalid score report role is rejected before sending', async () => {
+  const { endpoint, seen, close } = await startServer(() => ({ status: 202, body: {} }));
+  try {
+    await assert.rejects(
+      newClient(endpoint).exportScores([
+        {
+          scoreId: 'invalid',
+          evaluatorId: 'judge',
+          evaluatorVersion: '1',
+          scoreKey: 'answer_relevancy',
+          value: { number: 0.9 },
+          trialId: 'trial-1',
+          reportRole: 'headline',
+        },
+      ]),
+      /report_role must be primary_verdict or diagnostic/,
+    );
+    assert.equal(seen.length, 0);
+  } finally {
+    await close();
+  }
+});
+
 test('a rejected score raises with the backend detail', async () => {
   const { endpoint, close } = await startServer(() => ({
     status: 200,
@@ -356,7 +402,7 @@ test('score explanations are redacted by default and left alone when disabled', 
     status: 200,
     body: { results: [{ score_id: 'score-1', accepted: true }] },
   }));
-  const secret = 'token is glc_abcdefghijklmnopqrstuvwxyz012345';
+  const secret = 'token is glc_abcdefghijklmnopqrstuvwxyz012345'; // trufflehog:ignore
   const score = {
     scoreId: 'score-1',
     evaluatorId: 'exact',
@@ -384,7 +430,7 @@ test('score metadata is redacted through a null-prototype object and a class ins
     status: 200,
     body: { results: [{ score_id: 'score-1', accepted: true }] },
   }));
-  const secret = 'glc_abcdefghijklmnopqrstuvwxyz012345';
+  const secret = 'glc_abcdefghijklmnopqrstuvwxyz012345'; // trufflehog:ignore
   class Detail {
     constructor(note) {
       this.note = note;

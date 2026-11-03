@@ -1111,8 +1111,8 @@ type pasteFilled struct {
 // their own, because a user who points login at their own collector must not
 // get a Grafana Cloud token written next to it.
 //
-// AGENTO11Y_PROTOCOL and AGENTO11Y_AUTH_MODE are dropped: the launcher
-// hardcodes HTTP and Basic (see internal/emit).
+// Pasting credentials must not change transport, experimental opt-in, or auth
+// mode. Those settings stay outside the login form.
 func applyPaste(v *formValues, fixed fixedValues, block string) pasteFilled {
 	env, _ := dotenv.ParseDotenv(strings.NewReader(normalizePastedBlock(block)))
 	var filled pasteFilled
@@ -1257,7 +1257,7 @@ func normalizePastedBlock(block string) string {
 // list has to be able to tell what leaves the machine.
 func autoTagOptions(selected []string) []huh.Option[string] {
 	labels := map[envconfig.AutoTag]string{
-		envconfig.AutoTagUser:   "user — configured user id, host agent account, or OS user",
+		envconfig.AutoTagUser:   "user — configured user id or host agent account",
 		envconfig.AutoTagRepo:   "repo — owner/name from the origin remote",
 		envconfig.AutoTagBranch: "branch — branch checked out in the session directory",
 	}

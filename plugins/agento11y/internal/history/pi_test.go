@@ -164,7 +164,7 @@ func TestPiRootsResolveFromTheAgentDir(t *testing.T) {
 	}
 
 	t.Setenv("PI_CODING_AGENT_DIR", "")
-	t.Setenv("HOME", "/home/tester")
+	setHomeDir(t, "/home/tester")
 	want := []string{filepath.Join("/home/tester", ".pi", "agent", "sessions")}
 	if got := imp.Roots(); !slices.Equal(got, want) {
 		t.Fatalf("Roots() = %v, want the home fallback %v", got, want)
@@ -469,7 +469,7 @@ func TestPiTurnsMapOneGenerationPerAssistantEntry(t *testing.T) {
 		t.Fatalf("Usage = %+v, want the mapPiUsage mapping", usage)
 	}
 	if usage.ReasoningTokens != 0 {
-		t.Fatalf("ReasoningTokens = %d, want 0: live does not forward reasoning", usage.ReasoningTokens)
+		t.Fatalf("ReasoningTokens = %d, want 0: the entry omits reasoning", usage.ReasoningTokens)
 	}
 	if got := first.Gen.Metadata["cost_usd"]; got != 0.006 {
 		t.Fatalf("metadata cost_usd = %v, want 0.006", got)
@@ -542,6 +542,36 @@ func TestPiTurnsMapOneGenerationPerAssistantEntry(t *testing.T) {
 	}
 	if first.Gen.Tools[0].Description != "" || len(first.Gen.Tools[0].InputSchema) != 0 {
 		t.Fatal("tool definitions must be name-only: descriptions and schemas are runtime-only")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+		want  string
+	}{
+		{name: "missing response model", want: "claude-opus-4-8"},
+		{name: "null response model", extra: map[string]any{"responseModel": nil}, want: "claude-opus-4-8"},
+		{name: "concrete response model", extra: map[string]any{"responseModel": "physical-response-model"}, want: "physical-response-model"},
+		{name: "empty response model", extra: map[string]any{"responseModel": ""}, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := writeFile(t, filepath.Join(root, "identity.jsonl"),
+				piHeader(t, sessionID, "/work/repo", "2026-06-09T15:37:10.848Z")+
+					piAssistantEntry(t, "a1", "", "2026-06-09T15:37:24.000Z", 1781019441000,
+						[]map[string]any{piTextBlock("answer")}, tc.extra))
+			imp := piImporterAt(root)
+			turns := collectTurns(t, imp, piPreview(t, imp, path))
+			if len(turns) != 1 {
+				t.Fatalf("got %d turns, want 1", len(turns))
+			}
+			if got := turns[0].Gen.ResponseModel; got != tc.want {
+				t.Fatalf("ResponseModel = %q, want %q", got, tc.want)
+			}
+			if got := turns[0].Gen.Model.Name; got != "claude-opus-4-8" {
+				t.Fatalf("Model.Name = %q, want request identity", got)
+			}
+		})
 	}
 }
 
@@ -965,7 +995,10 @@ func TestPiTurnsStopWhenTheConsumerStops(t *testing.T) {
 
 	imp := piImporterAt(root)
 	seen := 0
-	for range imp.Turns(context.Background(), piPreview(t, imp, path)) {
+	for _, err := range imp.Turns(context.Background(), piPreview(t, imp, path)) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		seen++
 		if seen == 3 {
 			break

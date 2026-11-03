@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -25,7 +26,6 @@ import (
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -41,6 +41,7 @@ import (
 func clearForwardEnv(t *testing.T) {
 	t.Helper()
 	envconfig.PinAliasEnvBlank(t)
+	t.Setenv("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES", "")
 	for _, suffix := range []string{"LOCAL_FORWARD", "GUARDS_ENABLED", "GUARDS_FAIL_OPEN", "GUARDS_TIMEOUT_MS"} {
 		require.Contains(t, envconfig.AliasSuffixes, suffix, "clearForwardEnv relies on PinAliasEnvBlank covering %s", suffix)
 	}
@@ -90,20 +91,24 @@ var traceContentKeys = []string{
 	"gen_ai.tool.description",
 	"gen_ai.tool.call.arguments",
 	"gen_ai.tool.call.result",
+	"gen_ai.skill.description",
+	"gen_ai.skill.source.uri",
+	"process.executable.path",
 }
 
 func TestForwardLoader_Resolve(t *testing.T) {
 	const cloud = "https://cloud.example.test/"
 	cases := []struct {
-		name             string
-		lines            map[string]string
-		wantEnabled      bool
-		wantStrip        bool
-		wantStatusMode   string
-		wantStatusReason bool
-		wantOTLP         bool
-		wantHookURL      string
-		wantHookReason   string // substring; "" means the reason must be empty
+		name               string
+		lines              map[string]string
+		wantEnabled        bool
+		wantStrip          bool
+		wantStatusMode     string
+		wantStatusReason   bool
+		wantOTLP           bool
+		wantHookURL        string
+		wantHookReason     string // substring; "" means the reason must be empty
+		wantConfigWarnings []string
 	}{
 		{
 			// Credentials the generation export cannot use, but a usable OTLP
@@ -126,6 +131,30 @@ func TestForwardLoader_Resolve(t *testing.T) {
 			lines:          map[string]string{"AGENTO11Y_ENDPOINT": cloud, "AGENTO11Y_AUTH_TENANT_ID": "t", "AGENTO11Y_AUTH_TOKEN": "k"},
 			wantEnabled:    false,
 			wantStatusMode: forwardModeOff,
+		},
+		{
+			name: "disabled_ignores_inactive_policy",
+			lines: map[string]string{
+				"AGENTO11Y_LOCAL_FORWARD": "false", "AGENTO11Y_ENDPOINT": cloud,
+				"AGENTO11Y_AUTH_TENANT_ID": "t", "AGENTO11Y_AUTH_TOKEN": "k",
+				"AGENTO11Y_CONTENT_CAPTURE_MODE": "typo", "AGENTO11Y_GUARDS_ENABLED": "typo",
+				"AGENTO11Y_GUARDS_FAIL_OPEN": "typo", "AGENTO11Y_GUARDS_TIMEOUT_MS": "typo",
+			},
+			wantStatusMode: forwardModeOff,
+		},
+		{
+			name: "enabled_warns_on_invalid_policy",
+			lines: map[string]string{
+				"AGENTO11Y_LOCAL_FORWARD": "true", "AGENTO11Y_ENDPOINT": cloud,
+				"AGENTO11Y_AUTH_TENANT_ID": "t", "AGENTO11Y_AUTH_TOKEN": "k",
+				"AGENTO11Y_CONTENT_CAPTURE_MODE": "typo", "AGENTO11Y_GUARDS_ENABLED": "typo",
+				"AGENTO11Y_GUARDS_FAIL_OPEN": "typo", "AGENTO11Y_GUARDS_TIMEOUT_MS": "typo",
+			},
+			wantEnabled:        true,
+			wantStrip:          true,
+			wantStatusMode:     forwardModeMetadataOnly,
+			wantHookReason:     guardsOffHookReason,
+			wantConfigWarnings: []string{"CONTENT_CAPTURE_MODE", "GUARDS_ENABLED", "GUARDS_FAIL_OPEN", "GUARDS_TIMEOUT_MS"},
 		},
 		{
 			name:           "enabled_defaults_to_metadata_only",
@@ -301,8 +330,15 @@ func TestForwardLoader_Resolve(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clearForwardEnv(t)
-			l := newForwardLoader(writeConfigEnvFile(t, tc.lines), nil)
+			var logs bytes.Buffer
+			l := newForwardLoader(writeConfigEnvFile(t, tc.lines), log.New(&logs, "", 0))
 			cfg := l.load()
+			if len(tc.wantConfigWarnings) == 0 {
+				assert.NotContains(t, logs.String(), "config:")
+			}
+			for _, warning := range tc.wantConfigWarnings {
+				assert.Contains(t, logs.String(), warning)
+			}
 			assert.Equal(t, tc.wantEnabled, cfg.enabled)
 			if tc.wantEnabled {
 				assert.Equal(t, tc.wantStrip, cfg.strip)
@@ -726,7 +762,8 @@ func TestForwardLoader_ForwardGenerations(t *testing.T) {
 				gotTenant = r.Header.Get(wire.TenantHeaderName)
 				b, _ := io.ReadAll(r.Body)
 				received <- b
-				w.WriteHeader(http.StatusOK)
+				w.Header().Set("Content-Type", wire.ContentTypeJSON)
+				_, _ = io.WriteString(w, `{"results":[{"generation_id":"gen-1","accepted":true}]}`)
 			}))
 			defer srv.Close()
 
@@ -735,9 +772,13 @@ func TestForwardLoader_ForwardGenerations(t *testing.T) {
 			cfg := fakeForwardConfig(t, srv.URL, tc.strip)
 
 			raw := generationRawJSON(t, contentRichGeneration(t))
-			l.enqueue(forwardLabelGenerations, func() { l.forwardGenerations(cfg, []json.RawMessage{raw}) })
+			l.dispatchGenerations(cfg, []json.RawMessage{raw})
 			l.wait()
+			status := l.destinationStatuses(cfg)[0]
+			require.Empty(t, status.Failures)
+			assert.EqualValues(t, 1, status.Legs[forwardLabelGenerations].Succeeded)
 
+			require.Len(t, received, 1)
 			body := <-received
 			assert.Equal(t, wire.GenerationExportHTTPPath, gotPath)
 			assert.Equal(t, cfg.genHeaders["Authorization"], gotAuth)
@@ -780,11 +821,11 @@ func TestForwardLoader_ForwardGenerationsSkipsWhenDisabled(t *testing.T) {
 	l := newForwardLoader(filepath.Join(t.TempDir(), "config.env"), nil)
 	l.client = srv.Client()
 	cfg := fakeForwardConfig(t, srv.URL, true)
-	cfg.enabled = false
+	cfg.forwarding = false
 
 	raw := generationRawJSON(t, contentRichGeneration(t))
-	l.forwardGenerations(cfg, []json.RawMessage{raw})
-	l.forwardOTLP(cfg, "traces", "application/x-protobuf", "", []byte("body"))
+	l.dispatchGenerations(cfg, []json.RawMessage{raw})
+	l.dispatchOTLP(cfg, "traces", wire.ContentTypeProto, "", []byte("body"), otlpForwardLabel("traces"))
 	l.wait()
 	assert.Empty(t, hits)
 }
@@ -819,7 +860,9 @@ func TestForwardLoader_ForwardOTLP(t *testing.T) {
 	metricsBody := []byte("\x00\x01\x02metrics-protobuf-bytes")
 	tracesBody, err := proto.Marshal(traceRequestWithContent())
 	require.NoError(t, err)
-	tracesJSON, err := protojson.Marshal(traceRequestWithContent())
+	tracesJSON, err := marshalTraceJSON(traceRequestWithContent())
+	require.NoError(t, err)
+	otlpJSON, err := os.ReadFile("testdata/otlp-tool-trace.json")
 	require.NoError(t, err)
 
 	cases := []struct {
@@ -836,6 +879,7 @@ func TestForwardLoader_ForwardOTLP(t *testing.T) {
 		wantPath        string
 		wantVerbatim    bool
 		wantContentType string
+		wantStatus      string
 	}{
 		{
 			name: "metrics_relayed_verbatim_even_when_stripping",
@@ -852,6 +896,11 @@ func TestForwardLoader_ForwardOTLP(t *testing.T) {
 			name:   "full_traces_relayed_verbatim",
 			signal: "traces", strip: false, contentType: "application/x-protobuf", body: tracesBody,
 			wantPath: "/v1/traces", wantVerbatim: true,
+		},
+		{
+			name:   "missing_content_type_defaults_to_protobuf",
+			signal: "traces", strip: false, body: tracesBody,
+			wantPath: "/v1/traces", wantVerbatim: true, wantContentType: wire.ContentTypeProto,
 		},
 		{
 			name:   "gzip_full_traces_keeps_encoding",
@@ -875,6 +924,21 @@ func TestForwardLoader_ForwardOTLP(t *testing.T) {
 			signal: "traces", strip: true, contentType: "application/json", body: tracesJSON,
 			wantPath: "/v1/traces", wantContentType: wire.ContentTypeJSON,
 		},
+		{
+			name:   "full_json_traces_preserve_hex_ids",
+			signal: "traces", strip: false, contentType: "application/json", body: otlpJSON,
+			wantPath: "/v1/traces", wantVerbatim: true,
+		},
+		{
+			name:   "reduced_json_traces_preserve_hex_ids",
+			signal: "traces", strip: true, contentType: "application/json", body: otlpJSON,
+			wantPath: "/v1/traces", wantContentType: wire.ContentTypeJSON, wantStatus: "sdk_error",
+		},
+		{
+			name:   "gzip_reduced_json_traces_preserve_hex_ids",
+			signal: "traces", strip: true, contentType: "application/json", gzip: true, body: otlpJSON,
+			wantPath: "/v1/traces", wantContentType: wire.ContentTypeJSON, wantStatus: "sdk_error",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -883,23 +947,133 @@ func TestForwardLoader_ForwardOTLP(t *testing.T) {
 			if tc.gzip {
 				body, encoding = gzipBytes(t, tc.body), "gzip"
 			}
-			l.enqueue(otlpForwardLabel(tc.signal), func() { l.forwardOTLP(cfg, tc.signal, tc.contentType, encoding, body) })
+			l.dispatchOTLP(cfg, tc.signal, tc.contentType, encoding, body, otlpForwardLabel(tc.signal))
 			l.wait()
+			status := l.destinationStatuses(cfg)[0]
+			require.Empty(t, status.Failures)
+			assert.NotZero(t, status.Legs[otlpForwardLabel(tc.signal)].Succeeded)
 
+			require.Len(t, received, 1)
 			c := <-received
 			assert.Equal(t, tc.wantPath, c.path)
 			if tc.wantVerbatim {
 				assert.Equal(t, body, c.body)
 				assert.Equal(t, encoding, c.contentEncoding)
-				assert.Equal(t, tc.contentType, c.contentType)
+				wantContentType := tc.wantContentType
+				if wantContentType == "" {
+					wantContentType = tc.contentType
+				}
+				assert.Equal(t, wantContentType, c.contentType)
 				return
 			}
 			// The stripped payload is re-marshaled uncompressed, so the gzip
 			// encoding must be dropped.
 			assert.Empty(t, c.contentEncoding)
 			assert.Equal(t, tc.wantContentType, c.contentType)
-			assertTraceStripped(t, c.body, c.contentType)
+			wantStatus := tc.wantStatus
+			if wantStatus == "" {
+				wantStatus = "invalid_request"
+			}
+			assertTraceStripped(t, c.body, c.contentType, wantStatus)
+			if bytes.Equal(tc.body, otlpJSON) {
+				assert.Contains(t, string(c.body), `"traceId":"01010101010101010101010101010101"`)
+				assert.Contains(t, string(c.body), `"spanId":"0202020202020202"`)
+				assert.Contains(t, string(c.body), `"parentSpanId":"0303030303030303"`)
+				assert.Contains(t, string(c.body), `"traceId":"abababababababababababababababab"`)
+				assert.Contains(t, string(c.body), `"spanId":"cdcdcdcdcdcdcdcd"`)
+			}
 		})
+	}
+}
+
+func TestForwardLoader_SkillAndProcessPrivacy(t *testing.T) {
+	for _, mode := range []string{"full", "full_with_metadata_spans", "metadata_only", "no_tool_content"} {
+		for _, contentType := range []string{wire.ContentTypeJSON, wire.ContentTypeProto} {
+			for _, compressed := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/gzip=%t", mode, contentType, compressed), func(t *testing.T) {
+					clearForwardEnv(t)
+					type capture struct {
+						body        []byte
+						contentType string
+						encoding    string
+					}
+					received := make(chan capture, 1)
+					cloud := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						body, _ := io.ReadAll(r.Body)
+						received <- capture{body, r.Header.Get("Content-Type"), r.Header.Get("Content-Encoding")}
+						w.WriteHeader(http.StatusOK)
+					}))
+					defer cloud.Close()
+					loader := newForwardLoader(writeConfigEnvFile(t, map[string]string{
+						"AGENTO11Y_LOCAL_FORWARD":               "true",
+						"AGENTO11Y_ENDPOINT":                    "https://cloud.example.test",
+						"AGENTO11Y_AUTH_TENANT_ID":              "t",
+						"AGENTO11Y_AUTH_TOKEN":                  "k",
+						"AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example.test",
+						"AGENTO11Y_CONTENT_CAPTURE_MODE":        mode,
+					}), nil)
+					loader.client = cloud.Client()
+					cfg := loader.load()
+					require.True(t, cfg.enabled)
+					assert.Equal(t, mode != "full", cfg.strip)
+					cfg.destinations[0].config.otlpEndpoint = cloud.URL
+
+					attributes := []*commonpb.KeyValue{
+						stringKV("gen_ai.tool.name", "run_skill_script"),
+						stringKV("gen_ai.skill.name", "review:changes"),
+						stringKV("gen_ai.tool.call.id", "skill-call"),
+						stringKV("agento11y.skill.name", "legacy"),
+						stringKV("gen_ai.skill.resource.name", "scripts/check.py"),
+						stringKV("process.executable.name", "python3"),
+						intKeyValue("process.exit.code", 0),
+					}
+					structuralCount := len(attributes)
+					for _, key := range traceContentKeys {
+						attributes = append(attributes, stringKV(key, "secret "+key))
+					}
+					request := traceRequestForSpans(&tracepb.Span{
+						Name:       "execute_tool run_skill_script review:changes",
+						Attributes: attributes,
+						Events:     []*tracepb.Span_Event{{Name: "tool-completed", Attributes: attributes}},
+					})
+					body := marshalTraceRequest(t, request, contentType)
+					encoding := ""
+					if compressed {
+						body, encoding = gzipBytes(t, body), "gzip"
+					}
+					loader.dispatchOTLP(cfg, "traces", contentType, encoding, body, otlpForwardLabel("traces"))
+					loader.wait()
+					status := loader.destinationStatuses(cfg)[0]
+					assert.Empty(t, status.Failures)
+					assert.EqualValues(t, 1, status.Legs[otlpForwardLabel("traces")].Succeeded)
+					require.Len(t, received, 1)
+					got := <-received
+					if mode == "full" {
+						assert.Equal(t, body, got.body)
+						assert.Equal(t, encoding, got.encoding)
+						return
+					}
+					assert.Empty(t, got.encoding)
+					assert.Equal(t, contentType, got.contentType)
+					forwarded, err := decodeTracePayload(got.body, got.contentType)
+					require.NoError(t, err)
+					span := forwarded.GetResourceSpans()[0].GetScopeSpans()[0].GetSpans()[0]
+					assert.Equal(t, "execute_tool run_skill_script review:changes", span.GetName())
+					require.Len(t, span.GetEvents(), 1)
+					assert.Equal(t, "tool-completed", span.GetEvents()[0].GetName())
+					for _, attrs := range [][]*commonpb.KeyValue{span.GetAttributes(), span.GetEvents()[0].GetAttributes()} {
+						require.Len(t, attrs, structuralCount)
+						for index, expected := range attributes[:structuralCount] {
+							assert.True(t, proto.Equal(expected, attrs[index]), "structural attribute %s", expected.GetKey())
+						}
+						for _, key := range traceContentKeys {
+							assert.NotContains(t, attributeKeys(attrs), key)
+						}
+					}
+					assert.NotContains(t, string(got.body), "secret")
+				})
+			}
+		}
 	}
 }
 
@@ -983,9 +1157,14 @@ func TestForwardLoader_InsecureOTLPEndpointStaysLocalGuarded(t *testing.T) {
 // last success.
 func TestForwardLoader_StatusReportsFailures(t *testing.T) {
 	var status int
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", wire.ContentTypeJSON)
 		w.WriteHeader(status)
-		_, _ = w.Write([]byte(`{"error":"unknown field parts.media.url"}`))
+		if status != http.StatusOK {
+			_, _ = io.WriteString(w, `{"error":"unknown field parts.media.url"}`)
+		} else if r.URL.Path == wire.GenerationExportHTTPPath {
+			_, _ = io.WriteString(w, `{"results":[{"generation_id":"gen-1","accepted":true}]}`)
+		}
 	}))
 	defer srv.Close()
 
@@ -1003,28 +1182,31 @@ func TestForwardLoader_StatusReportsFailures(t *testing.T) {
 
 	status = http.StatusBadRequest
 	raw := generationRawJSON(t, contentRichGeneration(t))
-	l.forwardGenerations(cfg, []json.RawMessage{raw})
+	l.dispatchGenerations(cfg, []json.RawMessage{raw})
+	l.wait()
 	failures := l.status().Failures
 	require.Len(t, failures, 1)
 	assert.Equal(t, forwardLabelGenerations, failures[0].Label)
-	// The response body is the only place the rejected field name appears.
-	assert.Contains(t, failures[0].Detail, "status 400")
-	assert.Contains(t, failures[0].Detail, "parts.media.url")
+	assert.Equal(t, "primary", failures[0].Destination)
+	assert.Equal(t, "telemetry HTTP status 400", failures[0].Detail)
+	assert.NotContains(t, failures[0].Detail, "parts.media.url")
 	assert.NotEmpty(t, failures[0].At)
 	failedLeg := l.status().Legs[forwardLabelGenerations]
 	assert.Equal(t, failures[0].At, failedLeg.LastFailureAt)
 	assert.Equal(t, failures[0].Detail, failedLeg.LastFailureDetail)
 	assert.Empty(t, failedLeg.LastSuccessAt)
+	failureAt, err := time.Parse(time.RFC3339Nano, failedLeg.LastFailureAt)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return time.Now().After(failureAt) }, time.Second, time.Millisecond)
 
 	// A success clears the ring but keeps the earlier failure in the leg record.
 	status = http.StatusOK
-	l.forwardGenerations(cfg, []json.RawMessage{raw})
+	l.dispatchGenerations(cfg, []json.RawMessage{raw})
+	l.wait()
 	recovered := l.status()
 	assert.Empty(t, recovered.Failures)
 	generationLeg := recovered.Legs[forwardLabelGenerations]
 	assert.NotEmpty(t, generationLeg.LastSuccessAt)
-	failureAt, err := time.Parse(time.RFC3339Nano, generationLeg.LastFailureAt)
-	require.NoError(t, err)
 	successAt, err := time.Parse(time.RFC3339Nano, generationLeg.LastSuccessAt)
 	require.NoError(t, err)
 	assert.True(t, successAt.After(failureAt), "sub-second recovery order must be preserved")
@@ -1034,50 +1216,66 @@ func TestForwardLoader_StatusReportsFailures(t *testing.T) {
 	// Only the leg that delivered is cleared. config.env cannot configure the
 	// OTLP leg at a 127.0.0.1 test server (otlpForwardTarget refuses a loopback
 	// endpoint as a relay loop), so point it at the same server by hand.
-	cfg.otlpEndpoint = srv.URL
+	cfg.destinations[0].config.otlpEndpoint = srv.URL
 	status = http.StatusBadRequest
-	l.forwardGenerations(cfg, []json.RawMessage{raw})
-	require.Len(t, l.status().Failures, 1)
-	generationBeforeMetrics := l.status().Legs[forwardLabelGenerations]
+	l.dispatchGenerations(cfg, []json.RawMessage{raw})
+	l.wait()
+	beforeMetrics := l.destinationStatuses(cfg)[0]
+	require.Len(t, beforeMetrics.Failures, 1)
+	generationBeforeMetrics := beforeMetrics.Legs[forwardLabelGenerations]
 
 	status = http.StatusOK
-	l.forwardOTLP(cfg, "metrics", wire.ContentTypeProto, "", []byte("metrics-payload"))
-	metricsDelivered := l.status()
+	l.dispatchOTLP(cfg, "metrics", wire.ContentTypeProto, "", []byte("metrics-payload"), otlpForwardLabel("metrics"))
+	l.wait()
+	metricsDelivered := l.destinationStatuses(cfg)[0]
 	failures = metricsDelivered.Failures
 	require.Len(t, failures, 1, "a metrics success must not clear a generations failure")
 	assert.Equal(t, forwardLabelGenerations, failures[0].Label)
 	assert.Equal(t, generationBeforeMetrics, metricsDelivered.Legs[forwardLabelGenerations])
 	assert.NotEmpty(t, metricsDelivered.Legs[otlpForwardLabel("metrics")].LastSuccessAt)
 
-	l.forwardGenerations(cfg, []json.RawMessage{raw})
-	assert.Empty(t, l.status().Failures)
+	l.dispatchGenerations(cfg, []json.RawMessage{raw})
+	l.wait()
+	assert.Empty(t, l.destinationStatuses(cfg)[0].Failures)
 }
 
-// TestForwardLoader_FailureRingIsPerLeg covers the ring's capacity: the hook
-// leg records once per tool call, so a global cap would let a chatty leg evict
-// the one entry another leg had, which is the only report that leg gets.
+// A chatty leg must not evict the only failure reported by another leg.
 func TestForwardLoader_FailureRingIsPerLeg(t *testing.T) {
+	var status = http.StatusBadRequest
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
 	clearForwardEnv(t)
 	l := newForwardLoader(writeConfigEnvFile(t, nil), nil)
+	l.client = srv.Client()
+	cfg := fakeForwardConfig(t, srv.URL, false)
 
-	l.recordFailuref(forwardLabelGenerations, "generation export rejected")
-	l.recordFailuref(otlpForwardLabel("traces"), "traces rejected")
+	l.dispatchGenerations(cfg, []json.RawMessage{generationRawJSON(t, contentRichGeneration(t))})
+	l.wait()
+	l.dispatchOTLP(cfg, "traces", wire.ContentTypeProto, "", []byte("traces"), otlpForwardLabel("traces"))
+	l.wait()
 	for i := range maxRecordedForwardFailures * 2 {
+		status = http.StatusBadRequest + i
+		l.dispatchOTLP(cfg, "metrics", wire.ContentTypeProto, "", []byte("metrics"), otlpForwardLabel("metrics"))
+		l.wait()
 		l.recordFailuref(forwardLabelHooks, "hook call %d failed", i)
 	}
 
+	failures := l.destinationStatuses(cfg)[0].Failures
 	byLabel := map[string]int{}
-	for _, f := range l.status().Failures {
+	for _, f := range append(failures, l.recentFailures()...) {
 		byLabel[f.Label]++
 	}
 	assert.Equal(t, map[string]int{
-		forwardLabelGenerations:    1,
-		otlpForwardLabel("traces"): 1,
-		forwardLabelHooks:          maxRecordedForwardFailures,
+		forwardLabelGenerations:     1,
+		otlpForwardLabel("traces"):  1,
+		otlpForwardLabel("metrics"): maxRecordedForwardFailures,
+		forwardLabelHooks:           maxRecordedForwardFailures,
 	}, byLabel)
 
-	// Within a leg the cap keeps the most recent attempts.
-	assert.Contains(t, l.status().Failures[0].Detail, "hook call 9 failed")
+	assert.Equal(t, "telemetry HTTP status 409", failures[0].Detail)
+	assert.Contains(t, l.recentFailures()[0].Detail, "hook call 9 failed")
 }
 
 // TestForwardLoader_StatusReportsUnreadableConfig covers the fail-closed
@@ -1095,25 +1293,20 @@ func TestForwardLoader_StatusReportsUnreadableConfig(t *testing.T) {
 	// and the open fails. Both must refuse to forward, since the daemon's
 	// process environment still holds the boot-time LOCAL_FORWARD=true.
 	t.Run("stat fails", func(t *testing.T) {
-		parent := filepath.Join(t.TempDir(), "not-a-dir")
-		require.NoError(t, os.WriteFile(parent, []byte("x"), 0o600))
-		assertForwardRefusedAsUnreadable(t, filepath.Join(parent, "config.env"))
+		assertForwardRefusedAsUnreadable(t, unstatablePath(t))
 	})
 
 	t.Run("open fails", func(t *testing.T) {
-		if os.Geteuid() == 0 {
-			t.Skip("root ignores file permissions")
-		}
 		path := filepath.Join(t.TempDir(), "config.env")
 		require.NoError(t, os.WriteFile(path, []byte(envconfig.PreferredKey("LOCAL_FORWARD")+"=false\n"), 0o600))
-		require.NoError(t, os.Chmod(path, 0o000))
+		restoreReads := makeUnreadable(t, path)
 
 		l := assertForwardRefusedAsUnreadable(t, path)
 
-		// Chmod changes neither size nor mtime, so the refusal must not be
-		// cached against them: the file's own "off" has to win once it can be
-		// read.
-		require.NoError(t, os.Chmod(path, 0o600))
+		// Restoring reads changes neither size nor mtime, so the refusal must
+		// not be cached against them: the file's own "off" has to win once it
+		// can be read.
+		restoreReads()
 		st := l.status()
 		assert.False(t, st.Enabled)
 		assert.Empty(t, st.Reason)
@@ -1171,8 +1364,14 @@ func TestStripTraceContent_RemovesContentKeepsStructure(t *testing.T) {
 				stringKV(key, "secret"),
 				stringKV("gen_ai.tool.name", "do_thing"),
 			}}
-			stripTraceContent(traceRequestForSpans(span))
+			event := &tracepb.Span_Event{Name: "structural-event", Attributes: []*commonpb.KeyValue{
+				stringKV(key, "secret"),
+				stringKV("gen_ai.tool.name", "do_thing"),
+			}}
+			span.Events = []*tracepb.Span_Event{event}
+			require.NoError(t, stripTraceContent(traceRequestForSpans(span)))
 			assert.Equal(t, []string{"gen_ai.tool.name"}, attributeKeys(span.GetAttributes()))
+			assert.Equal(t, []string{"gen_ai.tool.name"}, attributeKeys(event.GetAttributes()))
 		})
 	}
 
@@ -1182,7 +1381,7 @@ func TestStripTraceContent_RemovesContentKeepsStructure(t *testing.T) {
 			stringKV("gen_ai.tool.call.result", "secret result"),
 			stringKV("gen_ai.tool.name", "do_thing"),
 		}}
-		stripTraceContent(traceRequestForSpans(&tracepb.Span{Events: []*tracepb.Span_Event{event}}))
+		require.NoError(t, stripTraceContent(traceRequestForSpans(&tracepb.Span{Events: []*tracepb.Span_Event{event}})))
 		assert.Equal(t, []string{"gen_ai.tool.name"}, attributeKeys(event.GetAttributes()))
 	})
 
@@ -1295,7 +1494,7 @@ func TestStripTraceContent_RemovesContentKeepsStructure(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			stripTraceContent(traceRequestForSpans(tc.span))
+			require.NoError(t, stripTraceContent(traceRequestForSpans(tc.span)))
 			assert.Equal(t, tc.wantAttrs, attributeKeys(tc.span.GetAttributes()))
 			assert.Equal(t, tc.wantEvents, eventNames(tc.span.GetEvents()))
 			assert.Equal(t, tc.wantStatus, tc.span.GetStatus().GetMessage())
@@ -1306,14 +1505,10 @@ func TestStripTraceContent_RemovesContentKeepsStructure(t *testing.T) {
 // assertTraceStripped decodes an uncompressed OTLP trace export and asserts the
 // content attributes, exception event, and raw error status message were
 // removed while structural attributes and events survive.
-func assertTraceStripped(t *testing.T, body []byte, contentType string) {
+func assertTraceStripped(t *testing.T, body []byte, contentType, wantStatus string) {
 	t.Helper()
-	var got coltracepb.ExportTraceServiceRequest
-	if strings.Contains(contentType, "json") {
-		require.NoError(t, protojson.Unmarshal(body, &got))
-	} else {
-		require.NoError(t, proto.Unmarshal(body, &got))
-	}
+	got, err := decodeTracePayload(body, contentType)
+	require.NoError(t, err)
 	span := got.GetResourceSpans()[0].GetScopeSpans()[0].GetSpans()[0]
 	keys := attributeKeys(span.GetAttributes())
 	for _, blocked := range traceContentKeys {
@@ -1328,7 +1523,7 @@ func assertTraceStripped(t *testing.T, body []byte, contentType string) {
 
 	// The status message carries the same raw provider error the exception
 	// event did, so it is replaced by the classified category.
-	assert.Equal(t, "invalid_request", span.GetStatus().GetMessage())
+	assert.Equal(t, wantStatus, span.GetStatus().GetMessage())
 	assert.Equal(t, tracepb.Status_STATUS_CODE_ERROR, span.GetStatus().GetCode())
 }
 
@@ -1340,7 +1535,9 @@ func fakeForwardConfig(t *testing.T, cloudURL string, strip bool) forwardConfig 
 	require.NoError(t, err)
 	auth, ok := otel.BasicAuthHeaderValue("tenant-x", "token-y")
 	require.True(t, ok)
-	return forwardConfig{
+	cfg := forwardConfig{
+		forwarding:   true,
+		snapshot:     1,
 		enabled:      true,
 		strip:        strip,
 		genURL:       genURL,
@@ -1348,6 +1545,8 @@ func fakeForwardConfig(t *testing.T, cloudURL string, strip bool) forwardConfig 
 		otlpEndpoint: cloudURL,
 		otlpHeaders:  map[string]string{"Authorization": auth},
 	}
+	cfg.destinations = []forwardDestination{{name: "primary", config: cfg}}
+	return cfg
 }
 
 // contentRichGeneration builds a generation with every content-bearing field

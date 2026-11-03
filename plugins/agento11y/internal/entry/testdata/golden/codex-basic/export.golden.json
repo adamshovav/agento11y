@@ -30,6 +30,7 @@
           }
         ],
         "metadata": {
+          "agento11y.conversation.title": "summarize go files",
           "agento11y.sdk.content_capture_mode": "full",
           "agento11y.sdk.name": "sdk-go",
           "agento11y.user.id": "test-user",
@@ -78,6 +79,7 @@
         ],
         "usage": {
           "cache_read_input_tokens": "30",
+          "input_semantics": "TOKEN_INPUT_SEMANTICS_INCLUSIVE",
           "input_tokens": "120",
           "output_tokens": "40",
           "reasoning_tokens": "5",

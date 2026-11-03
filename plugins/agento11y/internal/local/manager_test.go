@@ -1,11 +1,11 @@
-//go:build !windows
-
 package local
 
 import (
 	"bufio"
 	"context"
-	"errors"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -13,17 +13,121 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFetchForwardPostureValidation(t *testing.T) {
+	const status = `{"enabled":true,"mode":"metadata_only","generations":true,"otlp":false,"hooks":false}`
+	wrap := func(status string) string { return `{"forwardStatus":` + status + `}` }
+	cases := []struct{ name, body string }{
+		{"missing status", `{}`},
+		{"null status", wrap(`null`)},
+		{"array status", wrap(`[]`)},
+		{"string status", wrap(`"off"`)},
+		{"malformed JSON", `{"forwardStatus":`},
+		{"trailing JSON", wrap(status) + `{}`},
+		{"trailing text", wrap(status) + `secret`},
+		{"unknown mode", wrap(strings.Replace(status, `metadata_only`, `unknown`, 1))},
+		{"enabled off mode", wrap(strings.Replace(status, `metadata_only`, `off`, 1))},
+		{"disabled full mode", wrap(`{"enabled":false,"mode":"full","generations":false,"otlp":false,"hooks":false}`)},
+		{"boolean as string", wrap(strings.Replace(status, `"enabled":true`, `"enabled":"true"`, 1))},
+		{"destinations object", wrap(strings.TrimSuffix(status, `}`) + `,"destinations":{}}`)},
+		{"destinations null", wrap(strings.TrimSuffix(status, `}`) + `,"destinations":null}`)},
+		{"incomplete destination", wrap(strings.TrimSuffix(status, `}`) + `,"destinations":[{"name":"extra"}]}`)},
+		{"legs array", wrap(strings.TrimSuffix(status, `}`) + `,"legs":[]}`)},
+		{"null leg", wrap(strings.TrimSuffix(status, `}`) + `,"legs":{"traces":null}}`)},
+		{"bad counter", wrap(strings.TrimSuffix(status, `}`) + `,"legs":{"traces":{"attempted":"1"}}}`)},
+		{"incomplete counters", wrap(strings.TrimSuffix(status, `}`) + `,"legs":{"traces":{"attempted":1}}}`)},
+		{"failures object", wrap(strings.TrimSuffix(status, `}`) + `,"failures":{}}`)},
+		{"incomplete failure", wrap(strings.TrimSuffix(status, `}`) + `,"failures":[{}]}`)},
+	}
+	for _, key := range []string{"enabled", "mode", "generations", "otlp", "hooks"} {
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal([]byte(status), &fields))
+		delete(fields, key)
+		data, err := json.Marshal(fields)
+		require.NoError(t, err)
+		cases = append(cases, struct{ name, body string }{"missing " + key, wrap(string(data))})
+		fields[key] = json.RawMessage(`null`)
+		data, err = json.Marshal(fields)
+		require.NoError(t, err)
+		cases = append(cases, struct{ name, body string }{"null " + key, wrap(string(data))})
+	}
+	const destination = `{"name":"archive","endpoint":"","otlpEndpoint":"https://archive.example","httpGenerations":false,"otlp":true,"revision":1}`
+	for _, key := range []string{"name", "endpoint", "otlpEndpoint", "httpGenerations", "otlp", "revision"} {
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal([]byte(destination), &fields))
+		delete(fields, key)
+		data, err := json.Marshal(fields)
+		require.NoError(t, err)
+		cases = append(cases, struct{ name, body string }{"destination missing " + key, wrap(strings.TrimSuffix(status, `}`) + `,"destinations":[` + string(data) + `]}`)})
+	}
+	for _, malformed := range []struct{ name, destination string }{
+		{"null destination", `null`},
+		{"bad revision", strings.Replace(destination, `"revision":1`, `"revision":"1"`, 1)},
+		{"bad endpoint", strings.Replace(destination, `"endpoint":""`, `"endpoint":12`, 1)},
+		{"bad destination legs", strings.TrimSuffix(destination, `}`) + `,"legs":{"traces":[]}}`},
+		{"destination missing counters", strings.TrimSuffix(destination, `}`) + `,"legs":{"traces":{"lastSuccessAt":"success"}}}`},
+		{"bad destination failures", strings.TrimSuffix(destination, `}`) + `,"failures":[null]}`},
+	} {
+		cases = append(cases, struct{ name, body string }{malformed.name, wrap(strings.TrimSuffix(status, `}`) + `,"destinations":[` + malformed.destination + `]}`)})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/api/v1/config", r.URL.Path)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer ts.Close()
+			posture, err := FetchForwardPosture(context.Background(), ts.URL)
+			require.Error(t, err)
+			assert.Equal(t, ForwardPosture{}, posture, "invalid posture must be unknown, not off")
+			assert.NotContains(t, err.Error(), "secret")
+		})
+	}
+}
+
+func TestFetchForwardPostureSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name, status string
+		count        int
+	}{
+		{"legacy off", `{"enabled":false,"mode":"off","generations":false,"otlp":false,"hooks":false}`, 0},
+		{"legacy enabled", `{"enabled":true,"mode":"full","generations":true,"otlp":true,"hooks":true,"legs":{"traces":{"lastSuccessAt":"2026-01-01T00:00:00Z"}}}`, 1},
+		{"extra only", `{"enabled":true,"mode":"metadata_only","generations":true,"otlp":true,"hooks":false,"destinations":[{"name":"archive","endpoint":"","otlpEndpoint":"https://archive.example/otlp","httpGenerations":false,"otlp":true,"revision":7,"legs":{"traces":{"attempted":4,"succeeded":1,"failed":2,"dropped":1,"lastSuccessAt":"success","lastFailureAt":"failure","lastFailureDetail":"timeout"}},"failures":[{"at":"failure","label":"traces","detail":"timeout","destination":"archive"}]}],"forwardingPath":"/config/forwarding.toml","forwardingError":"invalid extra config","failures":[{"at":"failure","label":"traces","detail":"timeout","destination":"archive"}]}`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"forwardStatus":%s,"localGuards":{"rules":2}} `, tc.status)
+			}))
+			defer ts.Close()
+			posture, err := FetchForwardPosture(context.Background(), ts.URL)
+			require.NoError(t, err)
+			assert.Equal(t, tc.count, posture.DestinationCount)
+			assert.Equal(t, 2, posture.LocalRules)
+			if tc.name == "extra only" {
+				require.Len(t, posture.Destinations, 1)
+				assert.False(t, posture.Hooks)
+				assert.Empty(t, posture.Legs, "top-level legs describe primary, not extras")
+				assert.Equal(t, uint64(7), posture.Destinations[0].Revision)
+				assert.Equal(t, uint64(4), posture.Destinations[0].Legs["traces"].Attempted)
+				assert.Equal(t, "timeout", posture.Destinations[0].Legs["traces"].LastFailureDetail)
+				assert.Equal(t, "archive", posture.Failures[0].Destination)
+				assert.Equal(t, "/config/forwarding.toml", posture.ForwardingPath)
+				assert.NotEmpty(t, posture.ForwardingError)
+			}
+		})
+	}
+}
 
 func TestStop_RemovesStatusWhenProcessGone(t *testing.T) {
 	dir := t.TempDir()
@@ -92,99 +196,45 @@ func TestSaveStatus_ConcurrentReadersSeeWholeFile(t *testing.T) {
 	assert.Zero(t, partial, "LoadStatus returned a status that was never written")
 }
 
-// TestServe_StampsStoreAfterPublishingStatus covers the order the daemon
-// starts things in: the status file the spawning process waits 5 seconds
-// for appears while the modification-time pass is still reading the store,
-// and the store repairs itself once the pass gets through it.
-//
-// A named pipe among the conversation files holds the pass: opening one
-// for reading returns only once this test opens the write end, so the pass
-// cannot reach the marker until the test lets it.
-func TestServe_StampsStoreAfterPublishingStatus(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "local")
-	storage, err := NewStorage(dir)
-	require.NoError(t, err)
-	activity := time.Now().Add(-90 * 24 * time.Hour).Truncate(time.Second)
-	seedConversation(t, storage, "conv-A", activity)
-	blocker := filepath.Join(dir, ConversationsDir, "conv-blocker.jsonl")
-	require.NoError(t, syscall.Mkfifo(blocker, 0o600))
+const (
+	daemonHelperEnv = "AGENTO11Y_TEST_LOCAL_DAEMON_HELPER"
+	daemonHelperDir = "AGENTO11Y_TEST_LOCAL_DAEMON_DIR"
+	idleHelperEnv   = "AGENTO11Y_TEST_IDLE_HELPER"
+)
 
-	// The pass reports what it stamped and what it could not, and this test
-	// can only fail by the pass not finishing, so keep its log.
-	logger := testLogger(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	served := make(chan error, 1)
-	go func() { served <- Serve(ctx, dir, 0, logger) }()
-	t.Cleanup(func() {
-		cancel()
-		require.NoError(t, <-served)
-	})
-	// Serve waits for the pass on the way out, so a failed assertion below
-	// must not leave it parked on the pipe. Opening the write end without
-	// blocking fails with ENXIO when the pass is not reading, which is the
-	// case where nothing needs freeing.
-	t.Cleanup(func() {
-		if w, err := os.OpenFile(blocker, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
-			_ = w.Close()
-		}
-	})
-
-	// IsRunning is what the spawning process polls: the status file plus an
-	// endpoint that answers.
-	require.Eventually(t, func() bool {
-		s, err := IsRunning(dir)
-		return err == nil && s != nil
-	}, 5*time.Second, 20*time.Millisecond, "daemon published its status and serves")
-
-	meta, err := readStoreMeta(dir)
-	require.NoError(t, err)
-	require.False(t, meta.MtimeStamped, "the daemon serves while the pass is still reading")
-
-	// Let the pass through the pipe: an empty file carries no activity, so
-	// it is scanned and left alone.
-	w, err := os.OpenFile(blocker, os.O_WRONLY, 0)
-	require.NoError(t, err)
-	require.NoError(t, w.Close())
-
-	require.Eventually(t, func() bool {
-		meta, err := readStoreMeta(dir)
-		return err == nil && meta.MtimeStamped
-	}, 5*time.Second, 20*time.Millisecond, "store marked as stamped")
-
-	info, err := os.Stat(filepath.Join(dir, ConversationsDir, "conv-A.jsonl"))
-	require.NoError(t, err)
-	assert.WithinDuration(t, activity, info.ModTime(), stampTolerance)
+func TestLocalDaemonHelperProcess(t *testing.T) {
+	if os.Getenv(daemonHelperEnv) != "1" {
+		return
+	}
+	if err := Serve(context.Background(), os.Getenv(daemonHelperDir), 0, nil); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func TestStop_EndpointDeadButProcessAlive(t *testing.T) {
-	if _, err := exec.LookPath("sleep"); err != nil {
-		t.Skip("sleep command unavailable")
+func TestIdleHelperProcess(t *testing.T) {
+	if os.Getenv(idleHelperEnv) != "1" {
+		return
 	}
+	time.Sleep(time.Minute)
+}
+
+func TestLocalDaemonLifecycle(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		cmdline      string
-		cmdlineError error
-		liveEndpoint bool
-		wantStop     bool
-		wantAlive    bool
-		wantErr      string
-		wantStatus   bool
+		name           string
+		inFlightExport bool
 	}{
-		{name: "signals daemon-looking process", cmdline: "/usr/local/bin/sigil local serve", wantStop: true},
-		{name: "signals agento11y daemon", cmdline: "/usr/local/bin/agento11y local serve", wantStop: true},
-		{name: "signals agento11y.exe daemon", cmdline: "/usr/local/bin/agento11y.exe local serve", wantStop: true},
-		{name: "signals daemon-looking process with spaces in path", cmdline: "/tmp/Sigil Dev/sigil local serve", wantStop: true},
-		{name: "signals go run dev daemon", cmdline: "/Users/x/Library/Caches/go-build/ab/cd-d/main local serve", wantStop: true},
-		{name: "does not signal unrelated live pid", cmdline: "sleep 60", wantAlive: true},
-		{name: "does not signal main without local serve suffix", cmdline: "/tmp/main serve", wantAlive: true},
-		{name: "does not signal non-sigil binary with local serve suffix", cmdline: "/tmp/python local serve", wantAlive: true},
-		{name: "does not signal unrelated live pid with healthy endpoint", cmdline: "sleep 60", liveEndpoint: true, wantAlive: true},
-		{name: "keeps status when pid identity cannot be checked", cmdlineError: errors.New("ps failed"), wantAlive: true, wantErr: "identify recorded daemon", wantStatus: true},
+		{name: "idle"},
+		{name: "drains in-flight export", inFlightExport: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			cmd := exec.Command("sleep", "60")
+			helper := copyTestExecutable(t)
+			cmd := exec.Command(helper, "-test.run=^TestLocalDaemonHelperProcess$", "local", "serve")
+			cmd.Env = append(os.Environ(), daemonHelperEnv+"=1", daemonHelperDir+"="+dir)
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
 			require.NoError(t, cmd.Start())
+			trustDaemonHelperProcess(t, cmd.Process.Pid)
 			done := make(chan error, 1)
 			go func() { done <- cmd.Wait() }()
 			waited := false
@@ -193,49 +243,107 @@ func TestStop_EndpointDeadButProcessAlive(t *testing.T) {
 					return
 				}
 				_ = cmd.Process.Kill()
-				<-done
+				_ = <-done
 			})
 
-			withProcessCommandLine(t, func(pid int) (string, error) {
-				require.Equal(t, cmd.Process.Pid, pid)
-				return tc.cmdline, tc.cmdlineError
-			})
+			var first *Status
+			require.Eventually(t, func() bool {
+				var err error
+				first, err = IsRunning(dir)
+				return err == nil && first != nil
+			}, 5*time.Second, 20*time.Millisecond, "helper daemon published a healthy endpoint")
+			require.Equal(t, cmd.Process.Pid, first.PID)
 
-			endpoint := "http://127.0.0.1:1"
-			if tc.liveEndpoint {
-				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-					w.WriteHeader(http.StatusOK)
-				}))
-				t.Cleanup(ts.Close)
-				endpoint = ts.URL
-			}
-			require.NoError(t, SaveStatus(dir, Status{PID: cmd.Process.Pid, Port: 1, Endpoint: endpoint}))
-			stopped, err := Stop(dir)
-			if tc.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tc.wantErr)
-			} else {
+			reused, err := EnsureRunning(context.Background(), dir, nil)
+			require.NoError(t, err)
+			require.Equal(t, first, reused)
+
+			const body = `{"generations":[{"id":"gen-drain","conversation_id":"conv-drain"}]}`
+			var upload net.Conn
+			var reader *bufio.Reader
+			if tc.inFlightExport {
+				host := strings.TrimPrefix(first.Endpoint, "http://")
+				upload, err = net.DialTimeout("tcp", host, time.Second)
 				require.NoError(t, err)
+				defer upload.Close()
+				require.NoError(t, upload.SetDeadline(time.Now().Add(10*time.Second)))
+				_, err = fmt.Fprintf(upload, "POST /api/v1/generations:export HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nExpect: 100-continue\r\n\r\n", host, len(body))
+				require.NoError(t, err)
+				reader = bufio.NewReader(upload)
+				resp, err := http.ReadResponse(reader, nil)
+				require.NoError(t, err)
+				require.NoError(t, resp.Body.Close())
+				// A 100 response means the handler is waiting for the export body.
+				require.Equal(t, http.StatusContinue, resp.StatusCode)
 			}
-			assert.Equal(t, tc.wantStop, stopped)
-			if tc.wantAlive {
-				assert.True(t, pidAlive(cmd.Process.Pid))
-			} else {
+
+			stopDone := make(chan struct{})
+			var stopped bool
+			var stopErr error
+			started := time.Now()
+			go func() {
+				defer close(stopDone)
+				stopped, stopErr = Stop(dir)
+			}()
+			t.Cleanup(func() { <-stopDone })
+			if tc.inFlightExport {
 				select {
-				case <-done:
-					waited = true
-				case <-time.After(time.Second):
-					t.Fatal("daemon process still running after Stop returned")
+				case <-stopDone:
+					t.Fatal("Stop returned before the in-flight export finished")
+				case <-time.After(2 * time.Second):
 				}
+				_, err = io.WriteString(upload, body)
+				require.NoError(t, err)
+				resp, err := http.ReadResponse(reader, nil)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+				var result generationsResponse
+				decodeJSON(t, resp.Body, &result)
+				require.Len(t, result.Results, 1)
+				require.True(t, result.Results[0].Accepted)
+				lines := readLines(t, filepath.Join(dir, ConversationsDir, "conv-drain.jsonl"))
+				require.Len(t, lines, 1)
+				require.Contains(t, lines[0], `"id":"gen-drain"`)
 			}
+			<-stopDone
+			require.NoError(t, stopErr)
+			require.True(t, stopped)
+			require.Less(t, time.Since(started), stopTimeout)
+			select {
+			case err := <-done:
+				waited = true
+				require.NoError(t, err)
+			case <-time.After(3 * time.Second):
+				t.Fatal("helper daemon process did not exit")
+			}
+			require.False(t, pidAlive(first.PID))
 			_, err = os.Stat(filepath.Join(dir, StatusFile))
-			if tc.wantStatus {
-				assert.NoError(t, err, "status file should remain when daemon identity cannot be checked")
-			} else {
-				assert.True(t, os.IsNotExist(err), "status file should be removed")
-			}
+			require.ErrorIs(t, err, os.ErrNotExist)
 		})
 	}
+}
+
+func copyTestExecutable(t *testing.T) string {
+	t.Helper()
+	sourcePath, err := os.Executable()
+	require.NoError(t, err)
+	source, err := os.Open(sourcePath)
+	require.NoError(t, err)
+	defer func() { _ = source.Close() }()
+
+	name := "agento11y"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	destinationPath := filepath.Join(t.TempDir(), name)
+	destination, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
+	require.NoError(t, err)
+	_, copyErr := io.Copy(destination, source)
+	closeErr := destination.Close()
+	require.NoError(t, copyErr)
+	require.NoError(t, closeErr)
+	return destinationPath
 }
 
 // TestListenLocal covers both halves of the port-fallback contract:
@@ -291,19 +399,6 @@ func TestListenLocal(t *testing.T) {
 	}
 }
 
-// TestEnsureRunning_ConcurrentCallersSpawnOnce drives several
-// EnsureRunning goroutines at the same empty state dir. A healthy
-// daemon is simulated by an httptest server so endpointAlive returns
-// true after the first SaveStatus; the flock-guarded recheck inside
-// EnsureRunning ensures only the first caller spawns the daemon and
-// the rest converge on the saved status.
-func withProcessCommandLine(t *testing.T, fn func(int) (string, error)) {
-	t.Helper()
-	prev := processCommandLineFn
-	t.Cleanup(func() { processCommandLineFn = prev })
-	processCommandLineFn = fn
-}
-
 // looksLikeTestBinary is what stops startDaemon from re-executing a test binary
 // as the daemon, which would fork the suite into more daemons.
 func TestLooksLikeTestBinary(t *testing.T) {
@@ -326,6 +421,11 @@ func TestLooksLikeTestBinary(t *testing.T) {
 	}
 }
 
+// TestEnsureRunning_ConcurrentCallersSpawnOnce drives several
+// EnsureRunning goroutines at the same empty state dir. A healthy
+// daemon is simulated by an httptest server so endpointAlive returns
+// true after the first SaveStatus; the file lock makes the callers converge
+// on the status that the first caller writes.
 func TestEnsureRunning_ConcurrentCallersSpawnOnce(t *testing.T) {
 	dir := t.TempDir()
 
@@ -341,7 +441,7 @@ func TestEnsureRunning_ConcurrentCallersSpawnOnce(t *testing.T) {
 	restore := SetStartDaemonForTesting(func(_ context.Context, dir string, _ *log.Logger) (*Status, error) {
 		spawns.Add(1)
 		// Yield a moment so the next goroutine has time to wait on the
-		// flock; without this, the first caller may finish before the
+		// file lock; without this, the first caller may finish before the
 		// others even contend.
 		time.Sleep(20 * time.Millisecond)
 		s := Status{
@@ -367,89 +467,6 @@ func TestEnsureRunning_ConcurrentCallersSpawnOnce(t *testing.T) {
 	wg.Wait()
 
 	if got := spawns.Load(); got != 1 {
-		t.Errorf("spawns = %d, want 1 (flock should serialise EnsureRunning)", got)
+		t.Errorf("spawns = %d, want 1 (file lock should serialise EnsureRunning)", got)
 	}
-}
-
-// testLogger routes a daemon's diagnostics into the test's output, so a
-// failing test reports what the daemon was doing. Call it from the test
-// goroutine: it registers the cleanup that stops the writer, and t.Log
-// panics once the test and its cleanups are done.
-func testLogger(t *testing.T) *log.Logger {
-	w := &testLogWriter{t: t}
-	t.Cleanup(w.stop)
-	return log.New(w, "", 0)
-}
-
-type testLogWriter struct {
-	t *testing.T
-
-	mu      sync.Mutex
-	stopped bool
-}
-
-func (w *testLogWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.stopped {
-		w.t.Log(strings.TrimRight(string(p), "\n"))
-	}
-	return len(p), nil
-}
-
-// stop drops later lines. A goroutine the test did not join can still hold
-// the logger, and writing from one after the test ends takes the whole run
-// down.
-func (w *testLogWriter) stop() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.stopped = true
-}
-
-// TestStop_WaitsPastTheDrain stops a process that takes four seconds to honor
-// SIGTERM, the way the daemon does when a slow request is in flight and it
-// drains for drainTimeout first. Stop has to outlast that drain: before the
-// wait exceeded it, this reported "did not exit within 3s" and exited 1 for a
-// daemon that exited a moment later.
-func TestStop_WaitsPastTheDrain(t *testing.T) {
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("sh command unavailable")
-	}
-	dir := t.TempDir()
-	// The shell prints "ready" once the trap is armed; signaling it before
-	// that would hit the default action and end the process at once.
-	cmd := exec.Command("sh", "-c", `trap 'sleep 4; exit 0' TERM; echo ready; while :; do sleep 0.1; done`)
-	stdout, err := cmd.StdoutPipe()
-	require.NoError(t, err)
-	require.NoError(t, cmd.Start())
-	ready, err := bufio.NewReader(stdout).ReadString('\n')
-	require.NoError(t, err)
-	require.Equal(t, "ready\n", ready)
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	waited := false
-	t.Cleanup(func() {
-		if waited {
-			return
-		}
-		_ = cmd.Process.Kill()
-		<-done
-	})
-	withProcessCommandLine(t, func(pid int) (string, error) {
-		require.Equal(t, cmd.Process.Pid, pid)
-		return "/usr/local/bin/agento11y local serve", nil
-	})
-	require.NoError(t, SaveStatus(dir, Status{PID: cmd.Process.Pid, Port: 1, Endpoint: "http://127.0.0.1:1"}))
-
-	stopped, err := Stop(dir)
-	require.NoError(t, err, "a daemon still draining after SIGTERM is within the stop wait")
-	assert.True(t, stopped)
-	select {
-	case <-done:
-		waited = true
-	case <-time.After(time.Second):
-		t.Fatal("process still running after Stop returned")
-	}
-	_, err = os.Stat(filepath.Join(dir, StatusFile))
-	assert.True(t, os.IsNotExist(err), "status file should be removed once the daemon exits")
 }

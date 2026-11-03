@@ -27,6 +27,7 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/dotenv"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/guardeval"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/localhealth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -37,6 +38,125 @@ func newLocalRequest(method, target string, body io.Reader) *http.Request {
 	req := httptest.NewRequest(method, target, body)
 	req.Host = "127.0.0.1:8765"
 	return req
+}
+
+func TestServer_OTLPGenerationHealthCapability(t *testing.T) {
+	s, _ := newTestServer(t)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, newLocalRequest(http.MethodGet, "/healthz", nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+	var health struct {
+		Status       string   `json:"status"`
+		Capabilities []string `json:"capabilities"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &health))
+	assert.Equal(t, "ok", health.Status)
+	assert.Contains(t, health.Capabilities, localhealth.OTelGenerationCapability)
+}
+
+func TestServer_OTLPBodyLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		size       int
+		gzip       bool
+		status     int
+	}{
+		{name: "traces exact limit", path: otlpTracesPath, size: maxOTLPTraceBodyBytes, status: http.StatusOK},
+		{name: "traces wire over limit", path: otlpTracesPath, size: maxOTLPTraceBodyBytes + 1, status: http.StatusRequestEntityTooLarge},
+		{name: "traces expanded exact limit", path: otlpTracesPath, size: maxOTLPTraceBodyBytes, gzip: true, status: http.StatusOK},
+		{name: "traces expanded over limit", path: otlpTracesPath, size: maxOTLPTraceBodyBytes + 1, gzip: true, status: http.StatusRequestEntityTooLarge},
+		{name: "metrics exact limit", path: otlpMetricsPath, size: maxOTLPBodyBytes, status: http.StatusOK},
+		{name: "metrics wire over limit", path: otlpMetricsPath, size: maxOTLPBodyBytes + 1, status: http.StatusRequestEntityTooLarge},
+		{name: "metrics expanded exact limit", path: otlpMetricsPath, size: maxOTLPBodyBytes, gzip: true, status: http.StatusOK},
+		{name: "metrics expanded over limit", path: otlpMetricsPath, size: maxOTLPBodyBytes + 1, gzip: true, status: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestServer(t)
+			body := bytes.Repeat([]byte(" "), tc.size)
+			copy(body, "{}")
+			if tc.gzip {
+				body = gzipBytes(t, body)
+			}
+			req := newLocalRequest(http.MethodPost, tc.path, bytes.NewReader(body))
+			req.Header.Set("Content-Type", wire.ContentTypeJSON)
+			if tc.gzip {
+				req.Header.Set("Content-Encoding", "gzip")
+			}
+			rr := httptest.NewRecorder()
+			s.ServeHTTP(rr, req)
+			require.Equal(t, tc.status, rr.Code, rr.Body.String())
+		})
+	}
+}
+
+func TestServer_GenerationsExport_ValidatesCompleteBatch(t *testing.T) {
+	for _, tc := range []struct {
+		name, last string
+		status     int
+	}{
+		{name: "bad conversation", last: `{"id":"bad","conversation_id":"../escape"}`, status: http.StatusBadRequest},
+		// The request fits below 64 MiB but HTML escaping in the final JSONL
+		// record expands every '<' sixfold. No earlier conversation may write.
+		{name: "escaped record", last: `{"id":"large","conversation_id":"conv-b","extra":"` + strings.Repeat("<", maxJSONLRecordBytes/6) + `"}`, status: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, storage, _ := newTestServerStorage(t)
+			opener := &countingOpener{}
+			storage.openAppend = opener.open
+			body := `{"generations":[{"id":"first","conversation_id":"conv-a"},` + tc.last + `]}`
+			require.Less(t, len(body), maxGenerationBodyBytes)
+			resp := post(t, s, "/api/v1/generations:export", wire.ContentTypeJSON, body)
+			defer resp.Body.Close()
+			require.Equal(t, tc.status, resp.StatusCode)
+			opens, _ := opener.counts()
+			assert.Zero(t, opens)
+			assertConversationDirEmpty(t, storage)
+		})
+	}
+}
+
+func TestJSONLRecordEncodedSizeLimit(t *testing.T) {
+	// A string record adds two quotes and one newline.
+	for _, tc := range []struct {
+		name     string
+		length   int
+		tooLarge bool
+	}{
+		{name: "one byte below", length: maxJSONLRecordBytes - 4},
+		{name: "equal", length: maxJSONLRecordBytes - 3, tooLarge: true},
+		{name: "above", length: maxJSONLRecordBytes - 2, tooLarge: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := encodeJSONLRecord(strings.Repeat("x", tc.length))
+			if tc.tooLarge {
+				require.ErrorIs(t, err, errJSONLRecordTooLarge)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, encoded, maxJSONLRecordBytes-1)
+			storage := newStorage(t)
+			path := storage.Path("boundary.jsonl")
+			require.NoError(t, os.WriteFile(path, encoded, 0o600))
+			visited := 0
+			skipped, err := scanJSONL(path, func(line []byte) (int, bool) {
+				return len(line), json.Valid(line)
+			}, func(n int) { visited++; assert.Equal(t, len(encoded)-1, n) })
+			require.NoError(t, err)
+			assert.Zero(t, skipped)
+			assert.Equal(t, 1, visited)
+		})
+	}
+}
+
+func TestAppendJSONLValidatesBatchBeforeOpen(t *testing.T) {
+	storage := newStorage(t)
+	opener := &countingOpener{}
+	storage.openAppend = opener.open
+	written, err := appendJSONL(storage, "bad.jsonl", []json.RawMessage{json.RawMessage(`{"valid":true}`), json.RawMessage(`{`)}, nil)
+	require.Error(t, err)
+	assert.Zero(t, written)
+	opens, _ := opener.counts()
+	assert.Zero(t, opens)
 }
 
 func TestServer_GenerationsExport_RecordsAndAccepts(t *testing.T) {
@@ -134,16 +254,7 @@ func TestServer_GenerationsExport_RejectsMissingAndUnsafeConversationID(t *testi
 	]}`
 	resp := post(t, s, "/api/v1/generations:export", "application/json", body)
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var out generationsResponse
-	decodeJSON(t, resp.Body, &out)
-	require.Len(t, out.Results, 2)
-	for _, r := range out.Results {
-		assert.False(t, r.Accepted)
-		assert.NotEmpty(t, r.Error)
-	}
-
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	assertConversationDirEmpty(t, &Storage{dir: dir})
 }
 
@@ -595,17 +706,17 @@ func TestServer_SkillsToolsMetricsAndSessionDrilldown(t *testing.T) {
 	writeToolGeneration(t, storage, "conv-lower", "g1", "/repo", lower.Add(10*time.Minute), "call-lower", "bash", false)
 	writeToolGeneration(t, storage, "conv-new", "g1", "/repo", upper, "call-2", "Bash", false)
 	_, err := storage.appendToolSpans([]toolSpanRecord{
-		analyticsSpan("conv-match", "trace-1", "span-1", "call-1", "Bash", lower.Add(time.Second), 2*time.Second, false),
+		skillSpan("conv-match", "span-1", "call-1", "Bash", "org:Review", lower.Add(time.Second), 2*time.Second, false),
 	})
 	require.NoError(t, err)
 
-	t.Run("tools-only exact response", func(t *testing.T) {
+	t.Run("combined exact response", func(t *testing.T) {
 		req := newLocalRequest(http.MethodGet,
 			"/api/v1/metrics/skills-tools?since=2026-08-21T10:00:00Z&before=2026-08-21T11:00:00Z&workspace=%2Frepo&interval=300", nil)
 		rr := httptest.NewRecorder()
 		srv.ServeHTTP(rr, req)
 		require.Equal(t, http.StatusOK, rr.Code)
-		assert.NotContains(t, rr.Body.String(), `"skills"`)
+		assert.Contains(t, rr.Body.String(), `"skills"`)
 		var got SkillsToolsMetricsResponse
 		decodeJSON(t, io.NopCloser(rr.Body), &got)
 		assert.Equal(t, ToolAnalyticsTotals{Calls: 2, Failures: 1, Tools: 1, Sessions: 2, DurationSamples: 1}, got.Tools.Totals)
@@ -614,6 +725,25 @@ func TestServer_SkillsToolsMetricsAndSessionDrilldown(t *testing.T) {
 		require.Len(t, got.Tools.Rows, 1)
 		assert.Equal(t, "Bash", got.Tools.Rows[0].Name)
 		assert.Equal(t, 2, got.Tools.Rows[0].Calls)
+		assert.Equal(t, SkillAnalyticsTotals{Calls: 1, Failures: 1, Skills: 1, Sessions: 1, DurationSamples: 1}, got.Skills.Totals)
+		assert.Equal(t, ToolAnalyticsCoverage{GenerationCalls: 1, ProjectedSpans: 1, MatchedCalls: 1}, got.Skills.Coverage)
+		assert.Equal(t, int64(300), got.Skills.IntervalSeconds)
+		require.Len(t, got.Skills.Rows, 1)
+		assert.Equal(t, "org:Review", got.Skills.Rows[0].Name)
+	})
+
+	t.Run("empty scope retains skills capability and workspace facets", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, newLocalRequest(http.MethodGet, "/api/v1/metrics/skills-tools?workspace=%2Fmissing", nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+		var got map[string]map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+		for _, section := range []string{"tools", "skills"} {
+			for _, field := range []string{"rows", "buckets"} {
+				assert.JSONEq(t, "[]", string(got[section][field]))
+			}
+		}
+		assert.JSONEq(t, `[{"path":"/repo","calls":1,"sessions":1}]`, string(got["skills"]["workspaces"]))
 	})
 
 	t.Run("folded row deep link reaches both spellings", func(t *testing.T) {
@@ -642,18 +772,259 @@ func TestServer_SkillsToolsMetricsAndSessionDrilldown(t *testing.T) {
 		assert.Empty(t, got.Conversations)
 	})
 
+	t.Run("exact skill drilldown confirms the requested value on both endpoints", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, query string
+			skill       *string
+			want        []string
+		}{
+			{name: "exact", query: "skill=org%3AReview", skill: new("org:Review"), want: []string{"conv-match"}},
+			{name: "trimmed match raw echo", query: "skill=%20org%3AReview%09", skill: new(" org:Review\t"), want: []string{"conv-match"}},
+			{name: "blank", query: "skill=", skill: new("")},
+			{name: "whitespace", query: "skill=%20%09", skill: new(" \t")},
+			{name: "case distinct", query: "skill=org%3Areview", skill: new("org:review")},
+			{name: "namespace distinct", query: "skill=Review", skill: new("Review")},
+			{name: "workspace before limit", query: "skill=org%3AReview&workspace=%2Fother", skill: new("org:Review")},
+			{name: "tool without skill omits echo", query: "tool=Bash", want: []string{"conv-lower"}},
+			{name: "unfiltered omits echo", want: []string{"conv-lower"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				for _, endpoint := range []string{"/api/v1/conversations", "/api/v1/metrics/conversations"} {
+					rr := httptest.NewRecorder()
+					srv.ServeHTTP(rr, newLocalRequest(http.MethodGet, endpoint+"?limit=1&since=2026-08-21T10:00:00Z&before=2026-08-21T11:00:00Z&"+tc.query, nil))
+					require.Equal(t, http.StatusOK, rr.Code)
+					var got struct {
+						Conversations []ConversationSummary `json:"conversations"`
+						AppliedSkill  *string               `json:"applied_skill"`
+					}
+					require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+					assert.Equal(t, tc.want, summaryIDs(got.Conversations), endpoint)
+					assert.Equal(t, tc.skill, got.AppliedSkill, endpoint)
+					var payload map[string]json.RawMessage
+					require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &payload))
+					_, echoed := payload["applied_skill"]
+					assert.Equal(t, tc.skill != nil, echoed, "echo must be omitted without skill")
+					if len(tc.want) == 0 {
+						assert.JSONEq(t, "[]", string(payload["conversations"]))
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("skill presence enables exact selection without other parameters", func(t *testing.T) {
+		for _, endpoint := range []string{"/api/v1/conversations", "/api/v1/metrics/conversations"} {
+			rr := httptest.NewRecorder()
+			srv.ServeHTTP(rr, newLocalRequest(http.MethodGet, endpoint+"?skill=org%3AReview&limit=1", nil))
+			require.Equal(t, http.StatusOK, rr.Code)
+			var got struct {
+				Conversations []ConversationSummary `json:"conversations"`
+			}
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+			assert.Equal(t, []string{"conv-match"}, summaryIDs(got.Conversations))
+		}
+	})
+
+	t.Run("tool and skill conflict by presence even when blank", func(t *testing.T) {
+		for _, endpoint := range []string{"/api/v1/conversations", "/api/v1/metrics/conversations"} {
+			for _, query := range []string{"tool=Bash&skill=org%3AReview", "tool=&skill=", "tool=Bash&skill=", "tool=&skill=org%3AReview", "tool&skill"} {
+				rr := httptest.NewRecorder()
+				srv.ServeHTTP(rr, newLocalRequest(http.MethodGet, endpoint+"?"+query, nil))
+				assert.Equal(t, http.StatusBadRequest, rr.Code, endpoint+"?"+query)
+			}
+		}
+	})
+
 	t.Run("invalid exact parameters are rejected", func(t *testing.T) {
 		for _, path := range []string{
 			"/api/v1/metrics/skills-tools?interval=0",
+			"/api/v1/metrics/skills-tools?interval=-1",
+			"/api/v1/metrics/skills-tools?interval=bad",
+			"/api/v1/metrics/skills-tools?since=",
+			"/api/v1/metrics/skills-tools?since=tomorrow",
 			"/api/v1/metrics/skills-tools?before=tomorrow",
 			"/api/v1/conversations?tool=Bash&since=",
 			"/api/v1/conversations?tool=Bash&before=tomorrow",
+			"/api/v1/conversations?skill=org%3AReview&since=",
+			"/api/v1/conversations?skill=org%3AReview&before=tomorrow",
+			"/api/v1/metrics/conversations?skill=org%3AReview&since=tomorrow",
+			"/api/v1/metrics/conversations?skill=org%3AReview&before=tomorrow",
 		} {
 			rr := httptest.NewRecorder()
 			srv.ServeHTTP(rr, newLocalRequest(http.MethodGet, path, nil))
 			assert.Equal(t, http.StatusBadRequest, rr.Code, path)
 		}
 	})
+}
+
+func TestServer_ConversationSkillDrilldownPeriodAndLimit(t *testing.T) {
+	srv, storage, _ := newTestServerStorage(t)
+	lower := mustParse(t, "2026-08-21T10:00:00Z")
+	var spans []toolSpanRecord
+	const sessions = 205
+	for i := range sessions {
+		id := "conv-" + strconv.Itoa(i)
+		at := lower.Add(time.Duration(i) * time.Second)
+		writeGen(t, storage, id, "g1", agento11y.Generation{
+			StartedAt: at, Tags: map[string]string{"cwd": "/repo"},
+			Usage: agento11y.TokenUsage{InputTokens: 7},
+		}, at.Format(time.RFC3339Nano))
+		spans = append(spans, skillSpan(id, "span-"+id, "call", "Read", "org:Review", at, time.Second, false))
+	}
+	// The generation file predates the requested range. Only its reconciled
+	// skill call is in range, so the session contributes no in-period usage.
+	writeToolGeneration(t, storage, "old", "g1", "/repo", lower.Add(-time.Hour), "call", "Read", false)
+	spans = append(spans,
+		skillSpan("old", "span-old", "call", "Read", "org:Review", lower, time.Second, false),
+		skillSpan("standalone", "span-only", "call", "Read", "org:Review", lower, time.Second, false),
+	)
+	_, err := storage.appendToolSpans(spans)
+	require.NoError(t, err)
+	writeToolGeneration(t, storage, "new-unmarked", "g1", "/repo", lower.Add(30*time.Minute), "call", "Read", false)
+	for _, endpoint := range []string{"/api/v1/conversations", "/api/v1/metrics/conversations"} {
+		for _, limit := range []string{"", "&limit=1000"} {
+			rr := httptest.NewRecorder()
+			srv.ServeHTTP(rr, newLocalRequest(http.MethodGet, endpoint+"?skill=org%3AReview&workspace=%2Frepo&since=2026-08-21T10:00:00Z&before=2026-08-21T11:00:00Z"+limit, nil))
+			require.Equal(t, http.StatusOK, rr.Code)
+			var got struct {
+				Conversations        []ConversationSummary        `json:"conversations"`
+				MatchedConversations int                          `json:"matched_conversations"`
+				Aggregate            ConversationMetricsAggregate `json:"aggregate"`
+				AppliedSkill         *string                      `json:"applied_skill"`
+			}
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+			assert.Equal(t, new("org:Review"), got.AppliedSkill)
+			wantRows := conversationListLimit
+			if limit != "" {
+				wantRows = sessions + 1
+			}
+			require.Len(t, got.Conversations, wantRows)
+			assert.NotContains(t, summaryIDs(got.Conversations), "standalone")
+			assert.NotContains(t, summaryIDs(got.Conversations), "new-unmarked")
+			if endpoint == "/api/v1/metrics/conversations" {
+				assert.Equal(t, sessions+1, got.MatchedConversations)
+				assert.Equal(t, sessions, got.Aggregate.Calls)
+				assert.Equal(t, int64(sessions*7), got.Aggregate.TokenBuckets.FreshInput)
+				for _, row := range got.Conversations {
+					if row.ID == "old" {
+						assert.Zero(t, row.Calls)
+						assert.Equal(t, TokenBuckets{}, row.TokenBuckets)
+						assert.Equal(t, lower, row.LastActivity)
+					}
+				}
+			}
+			if limit != "" {
+				assert.Contains(t, summaryIDs(got.Conversations), "old")
+			}
+		}
+	}
+}
+
+func TestServer_SkillsToolsMetricsEmptyAndReadErrors(t *testing.T) {
+	for _, directory := range []string{"", ConversationsDir, ToolSpansDir} {
+		t.Run("broken="+directory, func(t *testing.T) {
+			srv, storage, _ := newTestServerStorage(t)
+			if directory != "" {
+				path := filepath.Join(storage.Dir(), directory)
+				require.NoError(t, os.RemoveAll(path))
+				require.NoError(t, os.WriteFile(path, nil, 0o600))
+			}
+			rr := httptest.NewRecorder()
+			srv.ServeHTTP(rr, newLocalRequest(http.MethodGet, "/api/v1/metrics/skills-tools", nil))
+			if directory != "" {
+				assert.Equal(t, http.StatusInternalServerError, rr.Code)
+				assert.Contains(t, rr.Body.String(), "skills-tools metrics:")
+				return
+			}
+			require.Equal(t, http.StatusOK, rr.Code)
+			var got map[string]map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+			for _, section := range []string{"tools", "skills"} {
+				for _, field := range []string{"rows", "buckets", "workspaces"} {
+					assert.JSONEq(t, "[]", string(got[section][field]))
+				}
+			}
+		})
+	}
+}
+
+func TestServe_ShutdownEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- Serve(ctx, dir, 0, nil) }()
+	stopped := false
+	t.Cleanup(func() {
+		if stopped {
+			return
+		}
+		cancel()
+		select {
+		case err := <-served:
+			require.NoError(t, err)
+		case <-time.After(3 * time.Second):
+			t.Error("Serve did not return during cleanup")
+		}
+	})
+
+	var status *Status
+	require.Eventually(t, func() bool {
+		var err error
+		status, err = IsRunning(dir)
+		return err == nil && status != nil
+	}, 5*time.Second, 20*time.Millisecond, "daemon published a healthy endpoint")
+
+	req, err := http.NewRequest(http.MethodPost, status.Endpoint+"/api/v1/shutdown", strings.NewReader("{}"))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	select {
+	case err := <-served:
+		require.NoError(t, err)
+		stopped = true
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return after shutdown request")
+	}
+	_, err = os.Stat(filepath.Join(dir, StatusFile))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestServer_Shutdown(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		fetchSite    string
+		wantStatus   int
+		wantShutdown bool
+	}{
+		{name: "loopback request accepted", wantStatus: http.StatusAccepted, wantShutdown: true},
+		{name: "cross-site request refused", fetchSite: "cross-site", wantStatus: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestServer(t)
+			shutdown := make(chan struct{}, 1)
+			s.SetShutdown(func() { shutdown <- struct{}{} })
+			req := newLocalRequest(http.MethodPost, "/api/v1/shutdown", strings.NewReader("{}"))
+			req.Header.Set("Content-Type", "application/json")
+			if tc.fetchSite != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.fetchSite)
+			}
+			rr := httptest.NewRecorder()
+
+			s.ServeHTTP(rr, req)
+
+			require.Equal(t, tc.wantStatus, rr.Code)
+			select {
+			case <-shutdown:
+				require.True(t, tc.wantShutdown, "shutdown called for refused request")
+			case <-time.After(100 * time.Millisecond):
+				require.False(t, tc.wantShutdown, "shutdown was not called")
+			}
+		})
+	}
 }
 
 func assertFixedSecurityHeaders(t *testing.T, header http.Header) {
@@ -707,7 +1078,7 @@ func TestServer_Routing(t *testing.T) {
 		{name: "PATCH text type refused", method: http.MethodPatch, path: "/api/v1/config", contentType: "text/plain", body: `{"theme":"light"}`, want: http.StatusUnsupportedMediaType},
 		{name: "PATCH absent type refused", method: http.MethodPatch, path: "/api/v1/config", body: `{"theme":"light"}`, want: http.StatusUnsupportedMediaType},
 		{name: "charset parameter accepted", method: http.MethodPost, path: "/api/v1/hooks:evaluate", contentType: "application/json; charset=utf-8", body: `{"phase":"postflight"}`, want: http.StatusOK, wantContentType: "application/json", wantBodyHas: `"action":"allow"`},
-		{name: "protobuf accepted on OTLP", method: http.MethodPost, path: otlpTracesPath, contentType: wire.ContentTypeProto, body: "protobuf", want: http.StatusOK},
+		{name: "protobuf accepted on OTLP", method: http.MethodPost, path: otlpTracesPath, contentType: wire.ContentTypeProto, body: "", want: http.StatusOK},
 		{name: "protobuf refused outside OTLP", method: http.MethodPost, path: "/api/v1/generations:export", contentType: wire.ContentTypeProto, body: "protobuf", want: http.StatusUnsupportedMediaType},
 		{name: "GET is not gated", method: http.MethodGet, path: "/api/v1/conversations", want: http.StatusOK, wantContentType: "application/json", wantBodyHas: `"conversations":[]`},
 	}
@@ -1405,7 +1776,7 @@ func TestServer_Config_RoundTrip(t *testing.T) {
 	assert.True(t, got.Settings.AutoUpdate)
 	assert.Equal(t, guardsOff, got.Settings.Guards)
 	assert.False(t, got.Settings.LocalForward)
-	assert.Equal(t, forwardStatus{Mode: forwardModeOff}, got.ForwardStatus)
+	assert.Equal(t, forwardStatus{Mode: forwardModeOff, Destinations: []forwardDestinationStatus{}, ForwardingPath: filepath.Join(filepath.Dir(srv.configPath), forwardingFile)}, got.ForwardStatus)
 	assert.Empty(t, got.ForwardStatus.Reason, "forwarding off by default is not a paused state")
 
 	// Save a non-default configuration.
@@ -1440,11 +1811,13 @@ func TestServer_Config_RoundTrip(t *testing.T) {
 	// endpoint was configured, so that leg reports why it stays off. Guards
 	// were saved on, so the hook leg is live as well.
 	assert.Equal(t, forwardStatus{
-		Enabled:     true,
-		Mode:        forwardModeMetadataOnly,
-		Generations: true,
-		Hooks:       true,
-		OTLPReason:  "no OTLP endpoint configured, so traces and metrics are not forwarded",
+		Destinations:   []forwardDestinationStatus{{ForwardDestinationInfo: ForwardDestinationInfo{Name: "primary", Endpoint: "https://cloud.example.test/api/v1/generations:export", HTTPGenerations: true}, Revision: 1}},
+		ForwardingPath: filepath.Join(filepath.Dir(srv.configPath), forwardingFile),
+		Enabled:        true,
+		Mode:           forwardModeMetadataOnly,
+		Generations:    true,
+		Hooks:          true,
+		OTLPReason:     "no OTLP endpoint configured, so traces and metrics are not forwarded",
 	}, saved.ForwardStatus)
 
 	// Preview and on-disk file agree, sorted with the managed header.
@@ -1950,7 +2323,7 @@ func TestServer_Forwarding_RelaysOTLP(t *testing.T) {
 
 	c := <-received
 	assert.Equal(t, "/v1/traces", c.path)
-	assertTraceStripped(t, c.body, wire.ContentTypeProto)
+	assertTraceStripped(t, c.body, wire.ContentTypeProto, "invalid_request")
 }
 
 // hookCloud is a fake Cloud hook endpoint: it records what the daemon relayed
@@ -3136,30 +3509,54 @@ func TestServer_HookEvaluate_RelayKeepsBytesWhenNothingMatched(t *testing.T) {
 // marker, Cloud auth, and the budget derived from the calling agent's own
 // deadline.
 func TestServer_HookEvaluate_RelayShape(t *testing.T) {
-	cloud := newHookCloud(t)
-	cloud.respond = `{"action":"allow"}`
-	s, _ := newForwardingTestServer(t, cloud.srv, hookEnv(cloud.srv.URL, nil))
+	for _, tc := range []struct {
+		name   string
+		extras bool
+	}{
+		{name: "primary_only"},
+		{name: "with_extra", extras: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud := newHookCloud(t)
+			cloud.respond = `{"action":"allow"}`
+			s, _ := newForwardingTestServer(t, cloud.srv, hookEnv(cloud.srv.URL, nil))
+			t.Cleanup(s.Close)
+			var extra *destinationSink
+			if tc.extras {
+				extra = newDestinationSink(t, "")
+				writeDestinationSidecar(t, s.configPath, extra)
+				require.Len(t, s.forward.load().destinations, 2)
+			} else {
+				require.Len(t, s.forward.load().destinations, 1)
+			}
 
-	// A preflight request carrying a field this daemon's SDK version does not
-	// know about. Relaying the bytes is what keeps that field intact.
-	body := `{"phase":"preflight","context":{"agent_name":"pi"},"future_field":{"trace_id":"t1"}}`
-	status, out := postHook(t, s, body, map[string]string{legacyHookTimeoutHeader: "5000"})
-	require.Equal(t, http.StatusOK, status)
-	assert.Equal(t, agento11y.HookActionAllow, out.Action)
+			// A preflight request carrying a field this daemon's SDK version does not
+			// know about. Relaying the bytes is what keeps that field intact.
+			body := `{"phase":"preflight","context":{"agent_name":"pi"},"future_field":{"trace_id":"t1"}}`
+			status, out := postHook(t, s, body, map[string]string{legacyHookTimeoutHeader: "5000"})
+			require.Equal(t, http.StatusOK, status)
+			assert.Equal(t, agento11y.HookActionAllow, out.Action)
 
-	require.Equal(t, 1, cloud.count())
-	_, sent, headers := cloud.lastCall()
-	assert.Equal(t, body, sent)
-	assert.NotEmpty(t, headers.Get(ForwardMarkerHeader))
-	assert.Equal(t, "t", headers.Get(wire.TenantHeaderName))
-	assert.True(t, strings.HasPrefix(headers.Get("Authorization"), "Basic "))
-	// The branded spelling carries the remaining budget after local
-	// evaluation, which is at most the agent header minus the margin.
-	ms, err := strconv.Atoi(headers.Get(hookTimeoutHeader))
-	require.NoError(t, err)
-	assert.Positive(t, ms)
-	assert.LessOrEqual(t, ms, 4750)
-	assert.Greater(t, ms, 1000, "local evaluation of an empty ruleset must leave Cloud a usable window")
+			s.forward.wait()
+			require.Equal(t, 1, cloud.count())
+			path, sent, headers := cloud.lastCall()
+			assert.Equal(t, "/api/v1/hooks:evaluate", path)
+			assert.Equal(t, body, sent)
+			assert.Equal(t, "1", headers.Get(ForwardMarkerHeader))
+			assert.Equal(t, "t", headers.Get(wire.TenantHeaderName))
+			assert.True(t, strings.HasPrefix(headers.Get("Authorization"), "Basic "))
+			// The branded spelling carries the remaining budget after local
+			// evaluation, which is at most the agent header minus the margin.
+			ms, err := strconv.Atoi(headers.Get(hookTimeoutHeader))
+			require.NoError(t, err)
+			assert.Positive(t, ms)
+			assert.LessOrEqual(t, ms, 4750)
+			assert.Greater(t, ms, 1000, "local evaluation of an empty ruleset must leave Cloud a usable window")
+			if extra != nil {
+				assert.Empty(t, extra.calls, "extra destinations are telemetry-only, never guard recipients")
+			}
+		})
+	}
 }
 
 // TestServer_HookEvaluate_DoesNotChainRelayedRequest covers the loop guard: a
@@ -3455,7 +3852,11 @@ func TestServer_Forwarding_ToggleOffStopsForwarding(t *testing.T) {
 	var saved configResponse
 	decodeJSON(t, resp.Body, &saved)
 	assert.False(t, saved.Settings.LocalForward)
-	assert.Equal(t, forwardStatus{Mode: forwardModeOff}, saved.ForwardStatus)
+	assert.False(t, saved.ForwardStatus.Enabled)
+	assert.Equal(t, forwardModeOff, saved.ForwardStatus.Mode)
+	require.Len(t, saved.ForwardStatus.Destinations, 1)
+	assert.Equal(t, "primary", saved.ForwardStatus.Destinations[0].Name)
+	assert.Equal(t, filepath.Join(filepath.Dir(s.configPath), forwardingFile), saved.ForwardStatus.ForwardingPath)
 
 	onDisk, err := os.ReadFile(s.configPath)
 	require.NoError(t, err)
@@ -3486,8 +3887,11 @@ func TestServer_Forwarding_DoesNotRelayForwardedPayload(t *testing.T) {
 	})
 
 	for _, path := range []string{"/api/v1/generations:export", "/otlp/v1/traces"} {
-		req := newLocalRequest(http.MethodPost, path,
-			strings.NewReader(`{"generations":[{"id":"gen-1","conversation_id":"conv-A","model":{"name":"m"}}]}`))
+		body := `{"generations":[{"id":"gen-1","conversation_id":"conv-A","model":{"name":"m"}}]}`
+		if path == otlpTracesPath {
+			body = `{"resourceSpans":[]}`
+		}
+		req := newLocalRequest(http.MethodPost, path, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set(ForwardMarkerHeader, "1")
 		rr := httptest.NewRecorder()
@@ -3837,6 +4241,12 @@ func TestServer_Guards_FilePackDeniesEnvAcrossTools(t *testing.T) {
 		{"run_terminal_cmd", `{"command":"cat .env"}`},
 		{"execute_command", `{"command":"cat .env"}`},
 		{"run_command", `{"command":"cat .env"}`},
+		{"Grep", `{"pattern":"API_KEY","path":".env"}`},
+		{"grep", `{"pattern":"API_KEY","path":"/repo/.env.local"}`},
+		{"grep_search", `{"query":"API_KEY","include_pattern":".env"}`},
+		{"Grep", `{"pattern":"API_KEY","glob":".env*"}`},
+		{"Grep", `{"pattern":"API_KEY","glob":"*.env"}`},
+		{"grep_search", `{"query":"API_KEY","include_pattern":"**/.env*"}`},
 	}
 	for _, tc := range denied {
 		status, out := postHook(t, s, hookToolJSON(tc.tool, tc.input), nil)
@@ -3850,6 +4260,9 @@ func TestServer_Guards_FilePackDeniesEnvAcrossTools(t *testing.T) {
 		{"Write", `{"path":"src/environment.ts"}`},
 		{"Bash", `{"command":"ls"}`},
 		{"Read", `{"file_path":"config.env"}`},
+		{"Grep", `{"pattern":"TODO","path":"src"}`},
+		{"Grep", `{"pattern":"API_KEY","glob":".envrc"}`},
+		{"Glob", `{"pattern":"**/.env*"}`},
 	}
 	for _, tc := range allowed {
 		status, out := postHook(t, s, hookToolJSON(tc.tool, tc.input), nil)

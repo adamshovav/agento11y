@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.20.0] - 2026-10-29
+
+### Features
+
+- **sdk**: add skill identity to tool execution metrics (#979)
+- **sdk**: trace skill loads, resource reads, and commands (#920)
+
+### Bug Fixes
+
+- **security/unknown/go**: update module golang.org/x/net to v0.62.0 [security] (#958)
+- **security/unknown/go-frameworks/google-adk**: update module golang.org/x/net to v0.62.0 [security] (#954)
+- **security/unknown/go-providers/anthropic**: update module golang.org/x/net to v0.62.0 [security] (#955)
+- **security/unknown/go-providers/openai**: update module golang.org/x/net to v0.62.0 [security] (#957)
+- **security/unknown/go-providers/gemini**: update module golang.org/x/net to v0.62.0 [security] (#956)
+- **security/unknown/go-providers/anthropic**: update go toolchain directive to v1.26.10 [security] (#909)
+- **security/unknown/go**: update go toolchain directive to v1.26.10 [security] (#912)
+- **security/unknown/go-providers/gemini**: update go toolchain directive to v1.26.10 [security] (#910)
+- **security/unknown/go-frameworks/google-adk**: update go toolchain directive to v1.26.10 [security] (#908)
+- **security/unknown/go-providers/openai**: update go toolchain directive to v1.26.10 [security] (#911)
+
+## [0.19.0] - 2026-10-15
+
+### Features
+
+- **experiments**: add report roles and importer foundations (#815)
+
+### Bug Fixes
+
+- **otelgenai**: correct GenAI telemetry and conformance (#723)
+- **security**: resolve medium+ CVEs in Go and Python dependencies (#862)
+- **security/unknown/go**: update module google.golang.org/grpc to v1.83.2 [security] (#731)
+- **security/unknown/go-frameworks/google-adk**: update module google.golang.org/grpc to v1.83.2 [security] (#727)
+- **security/unknown/go-providers/anthropic**: update module google.golang.org/grpc to v1.83.2 [security] (#728)
+- **security/unknown/go-providers/gemini**: update module google.golang.org/grpc to v1.83.2 [security] (#729)
+- **security/unknown/go-providers/openai**: update module google.golang.org/grpc to v1.83.2 [security] (#730)
+- **security**: resolve 75 CVEs across the npm, Python and Go dependency trees (#718)
+- **security/high/go**: update module google.golang.org/grpc to v1.83.1 [security] (#709)
+- **security/high/go-frameworks/google-adk**: update module google.golang.org/grpc to v1.83.1 [security] (#705)
+- **security/high/go-providers/anthropic**: update module google.golang.org/grpc to v1.83.1 [security] (#706)
+- **security/high/go-providers/gemini**: update module google.golang.org/grpc to v1.83.1 [security] (#707)
+- **security/high/go-providers/openai**: update module google.golang.org/grpc to v1.83.1 [security] (#708)
+- **otelgenai**: emit gen_ai.request.top_k as integer (#680)
+
 ## [0.18.0] - 2026-08-25
 
 ### Features

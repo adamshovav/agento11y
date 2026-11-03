@@ -3,6 +3,8 @@ package hook
 import (
 	"context"
 	"log"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -11,30 +13,39 @@ import (
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/cursor/config"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/cursor/fragment"
 	"github.com/grafana/agento11y/plugins/agento11y/internal/agents/cursor/mapper"
+	"github.com/grafana/agento11y/plugins/agento11y/internal/envconfig"
 )
 
 // SessionEnd sweeps any stranded fragments left by crashed or aborted turns,
 // emits each with `stopReason="aborted"` (or the pendingStop status saved by
-// handleStop on flush failure), then removes the conversation directory.
+// handleStop on flush failure), then removes the conversation's fragments.
+// The session file stays, because Cursor ends the session when the window or
+// the chat closes and can reopen that chat later without another sessionStart.
 //
-// On any emission failure the conversation directory is preserved so a later
-// sweep can retry rather than silently dropping the data.
+// On any emission failure the fragments are preserved so a later sweep can
+// retry rather than silently dropping the data.
 func SessionEnd(p Payload, cfg config.Config, logger *log.Logger) {
 	if p.ConversationID == "" {
 		logger.Print("sessionEnd: missing conversation_id")
 		return
 	}
 
-	ids := fragment.ListFragmentIDs(p.ConversationID, logger)
-
-	if len(ids) == 0 {
-		removeAndLog(p.ConversationID, logger)
+	protocol, err := envconfig.ResolveGenerationTransport()
+	if err != nil {
+		logger.Printf("sessionEnd: generation transport conv=%s (preserving conversation for retry): %v", p.ConversationID, err)
 		return
 	}
 
-	if !config.HasCredentials() {
-		logger.Print("sessionEnd: missing credentials — wiping conversation dir without emission")
-		removeAndLog(p.ConversationID, logger)
+	ids := fragment.ListFragmentIDs(p.ConversationID, logger)
+
+	if len(ids) == 0 {
+		finishConversation(p.ConversationID, logger)
+		return
+	}
+
+	if protocol == agento11y.GenerationExportProtocolHTTP && !config.HasCredentials() {
+		logger.Print("sessionEnd: missing credentials — dropping fragments without emission")
+		finishConversation(p.ConversationID, logger)
 		return
 	}
 
@@ -42,15 +53,59 @@ func SessionEnd(p Payload, cfg config.Config, logger *log.Logger) {
 	defer cancel()
 
 	providers := setupOTelIfConfigured(ctx, p.ConversationID, logger)
-	defer func() { _ = providers.Shutdown(ctx) }()
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_ = providers.Shutdown(cleanupCtx)
+	}()
 
 	session := fragment.LoadSession(p.ConversationID, logger)
-	client := buildClient(p, session, cfg, providers, logger)
+	client, err := buildClient(p, session, cfg, providers, logger)
+	if err != nil {
+		logger.Printf("sessionEnd: build client conv=%s (preserving conversation for retry): %v", p.ConversationID, err)
+		return
+	}
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_ = client.Shutdown(cleanupCtx)
+	}()
+
+	// A fragment whose metrics an earlier hook delivered goes through a client
+	// without metrics, so a retried turn is counted once.
+	var quiet *agento11y.Client
+	defer func() {
+		if quiet == nil {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_ = quiet.Shutdown(cleanupCtx)
+	}()
+	recorded := map[string]recordedFragment{}
+	clientFor := func(generationID string, frag *fragment.Fragment) (*agento11y.Client, func(), error) {
+		if !frag.MetricsRecorded {
+			return client, func() { recorded[generationID] = recordedFragment{frag: frag, at: time.Now()} }, nil
+		}
+		if quiet == nil {
+			var err error
+			if quiet, err = buildClientWithoutMetrics(p, session, cfg, providers, logger); err != nil {
+				return nil, nil, err
+			}
+		}
+		return quiet, func() {}, nil
+	}
 
 	allEmitted := true
+	var emittedIDs []string
 	for _, gid := range ids {
-		if !emitOneStranded(ctx, client, session, p.ConversationID, gid, cfg, logger) {
+		emitted, ok := emitOneStranded(ctx, clientFor, session, p.ConversationID, gid, cfg, logger)
+		if !ok {
 			allEmitted = false
+		}
+		if emitted {
+			emittedIDs = append(emittedIDs, gid)
 		}
 	}
 
@@ -59,33 +114,46 @@ func SessionEnd(p Payload, cfg config.Config, logger *log.Logger) {
 		flushOK = false
 		logger.Printf("sessionEnd: flush: %v", err)
 	}
-	_ = client.Shutdown(ctx)
+	if quiet != nil {
+		if err := quiet.Flush(ctx); err != nil {
+			flushOK = false
+			logger.Printf("sessionEnd: flush: %v", err)
+		}
+	}
+	if flushOK {
+		for _, gid := range emittedIDs {
+			if err := fragment.Delete(p.ConversationID, gid); err != nil {
+				logger.Printf("sessionEnd: delete gen=%s: %v", gid, err)
+				allEmitted = false
+				continue
+			}
+			delete(recorded, gid)
+		}
+	}
+	// What is left was recorded but stays on disk for the next sessionEnd.
+	rememberDeliveredMetrics(providers, slices.Collect(maps.Values(recorded)), logger)
 
 	if err := providers.ForceFlush(); err != nil {
 		logger.Printf("sessionEnd: otel flush: %v", err)
 	}
 
 	if allEmitted && flushOK {
-		removeAndLog(p.ConversationID, logger)
+		finishConversation(p.ConversationID, logger)
 	} else {
 		logger.Printf("sessionEnd: preserving conv=%s for retry (emitted=%v flushed=%v)",
 			p.ConversationID, allEmitted, flushOK)
 	}
 }
 
-// emitOneStranded loads, maps, and emits one stranded fragment and deletes
-// it on success. Returns true when the fragment reached the export path
-// successfully (or was unreadable and quarantined out of the way), false
-// when emission failed and the conversation dir should be preserved for
-// retry.
+// Emitted fragments must remain on disk until the caller confirms the batch.
 func emitOneStranded(
 	ctx context.Context,
-	client *agento11y.Client,
+	clientFor func(generationID string, frag *fragment.Fragment) (client *agento11y.Client, recorded func(), err error),
 	session *fragment.Session,
 	conversationID, generationID string,
 	cfg config.Config,
 	logger *log.Logger,
-) bool {
+) (emitted, ok bool) {
 	frag := fragment.LoadTolerant(conversationID, generationID, logger)
 	if frag == nil {
 		// Tolerant loader already logged the failure. Quarantine the
@@ -96,9 +164,9 @@ func emitOneStranded(
 		} else {
 			logger.Printf("sessionEnd: quarantined unreadable gen=%s", generationID)
 		}
-		// Treat as emitted so the dir cleanup proceeds — the corrupt file
+		// Treat as successfully processed so the dir cleanup proceeds — the corrupt file
 		// has been moved out of the sweep path.
-		return true
+		return false, true
 	}
 
 	// Thought-only leftovers come from older afterAgentThought handlers that
@@ -111,7 +179,7 @@ func emitOneStranded(
 		} else {
 			logger.Printf("sessionEnd: dropped thought-only gen=%s", generationID)
 		}
-		return true
+		return false, true
 	}
 
 	// Prefer the status that handleStop saw if it preserved the fragment on
@@ -135,18 +203,21 @@ func emitOneStranded(
 		Now:                 time.Now(),
 	})
 
-	if err := emitGeneration(ctx, client, frag, mapped, logger); err != nil {
-		logger.Printf("sessionEnd: emit gen=%s: %v", generationID, err)
-		return false
+	client, recorded, err := clientFor(generationID, frag)
+	if err != nil {
+		logger.Printf("sessionEnd: build client gen=%s: %v", generationID, err)
+		return false, false
+	}
+	// The recorder records metrics when it ends, even when it then fails.
+	emitErr := emitGeneration(ctx, client, frag, mapped, logger)
+	recorded()
+	if emitErr != nil {
+		logger.Printf("sessionEnd: emit gen=%s: %v", generationID, emitErr)
+		return false, false
 	}
 
-	// Delete on per-fragment success so a later sweep doesn't re-emit it as
-	// a duplicate if a sibling generation later fails.
-	if err := fragment.Delete(conversationID, generationID); err != nil {
-		logger.Printf("sessionEnd: delete gen=%s: %v", generationID, err)
-	}
-	logger.Printf("sessionEnd: swept gen=%s stopReason=%s", generationID, mapped.StopStatus)
-	return true
+	logger.Printf("sessionEnd: recorded gen=%s stopReason=%s", generationID, mapped.StopStatus)
+	return true, true
 }
 
 // isThoughtOnlyFragment reports leftovers from the old afterAgentThought
@@ -177,10 +248,14 @@ func isThoughtOnlyFragment(frag *fragment.Fragment) bool {
 	return true
 }
 
-func removeAndLog(conversationID string, logger *log.Logger) {
-	if err := fragment.RemoveConversationDir(conversationID); err != nil {
+// finishConversation removes the conversation's fragments, keeping its session
+// for a reopened chat, and prunes the conversations nobody has used for
+// fragment.IdleConversationAge.
+func finishConversation(conversationID string, logger *log.Logger) {
+	if err := fragment.RemoveFragments(conversationID); err != nil {
 		logger.Printf("sessionEnd: cleanup conv=%s: %v", conversationID, err)
-		return
+	} else {
+		logger.Printf("sessionEnd: cleaned conv=%s", conversationID)
 	}
-	logger.Printf("sessionEnd: cleaned conv=%s", conversationID)
+	fragment.PruneIdleConversations(time.Now().Add(-fragment.IdleConversationAge), conversationID, logger)
 }

@@ -2,7 +2,7 @@
 name: setup-coding-agent
 description: >-
   Set up Grafana Agent observability for a coding agent (Claude Code, Codex,
-  Copilot CLI, Cursor, OpenCode, pi, or Vibe) with the agento11y binary:
+  Copilot CLI, Cursor, OpenCode, pi, Vibe, or experimental Kiro CLI) with the agento11y binary:
   install it, save credentials, wire the agent, verify a session reaches
   Grafana Cloud, and diagnose a broken pipeline. Use when the user says "set
   up agento11y", "monitor my coding agent", "agento11y doctor says something
@@ -39,11 +39,8 @@ at all.
    different job ("Path B"). If the user wants their own app or agent
    instrumented, stop and hand off to the `agento11y-instrument` skill, which
    ships with the `gcx` CLI (`gcx agent skills install agento11y-instrument`).
-5. **Do not enable full content capture or guards without asking.** The default,
-   `metadata_only`, excludes prompts, responses, and tool I/O from generation
-   exports. `full` sends that content to Grafana Cloud. Guards send the content
-   they evaluate to `AGENTO11Y_ENDPOINT` regardless of capture mode. Local
-   mode is separate: it always captures full content in the local store.
+5. **Ask before enabling full capture or guards, or adding recipients.** Default `metadata_only` generation exports exclude prompts, responses, and tool I/O; `full` sends them to every enabled recipient, not just `primary`.
+   Guards send evaluated content only to `AGENTO11Y_ENDPOINT` regardless of capture mode. Local mode always stores full content locally.
 
 ## Step 1: Read the current state
 
@@ -102,7 +99,7 @@ Upgrade with `brew upgrade grafana/grafana/agento11y`.
 
 **mise:** `mise use -g aqua:grafana/agento11y@latest` (requires [mise shell activation](https://mise.jdx.dev/cli/activate.html) so `agento11y` is on `PATH`).
 
-**Go install (any platform with Go 1.25.7+):**
+**Go install (any platform with Go 1.26.9+):**
 
 ```sh
 go install github.com/grafana/agento11y/plugins/agento11y/cmd/agento11y@latest
@@ -126,20 +123,14 @@ against `sigil`.
 
 ## Step 3: Choose a destination
 
-A first `agento11y login` asks where sessions go: **Local only**, or **Grafana
-Cloud**. **Local only** needs no Cloud credentials and never forwards sessions.
-**Grafana Cloud** continues to the credential flow. Its interactive preferences
-on macOS and Linux include **Local web UI**. It starts on **Yes** by default and
-remembers an earlier answer. **Yes** keeps a full local copy and forwards a Cloud
-copy. **No** sends directly
-to Cloud. Windows has no local receiver, so it shows neither local choice.
+A first `agento11y login` asks where sessions go: **Local only** needs no Cloud credentials and never forwards; **Grafana Cloud** continues to credentials. Its **Local web UI** preference defaults to **Yes** and remembers an earlier answer: **Yes** keeps a full local copy and forwards a Cloud copy; **No** sends directly to Cloud.
 
 ### The paste flow
 
 Tell the user to run `agento11y login` in their own terminal, then wait. You
 cannot drive it yourself: it needs a terminal, and the block it asks for holds a
 live token that must not pass through this conversation. The destination question
-appears only on macOS and Linux when no destination or credentials are saved. A
+appears only when no destination or credentials are saved. A
 saved Cloud connection starts at step 2.
 
 1. **Where should sessions go?**: a two-option list. **Local only** saves local
@@ -160,11 +151,8 @@ saved Cloud connection starts at step 2.
    fills the endpoint, instance ID, token, and OTLP settings. Login then asks
    only for what the block did not carry. Pasting is optional: Enter on the empty
    box types the values field by field instead.
-6. **Preferences**: local web UI, content capture mode, session tags, guards and
-   their timeout, and automatic tags. **Local web UI** starts on Yes by default
-   and remembers an earlier answer. The web UI always stores full content locally.
-   Cloud receives full content in Full mode and metadata in other modes. Enter keeps
-   each answer. Read Rule 5 before enabling full capture or guards. Read **Automatic tags** before enabling automatic tags.
+6. **Preferences**: local web UI, content capture mode, session tags, guards and their timeout, and automatic tags. Enter keeps each answer. The web UI always stores full content locally; forwarding sends full content in Full mode and metadata otherwise.
+   Read Rule 5 before enabling full capture or guards, and **Automatic tags** before enabling automatic tags.
 
 The copied block has concrete values in this shape:
 
@@ -178,21 +166,13 @@ OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-<region>.grafana.net/otlp
 OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic <base64-value>'
 ```
 
-A stack with no OTLP gateway has neither `OTEL_*` line, so conversations work
-but analytics does not. Login rejects placeholders in values it takes from the
-block; a flag can replace a block slot. It ignores pasted protocol and auth-mode
-values because the launcher hardcodes HTTP and Basic. Existing config keys stay.
+Without OTLP, default HTTP conversations work but Cloud analytics does not. Local recording and analytics need no Tempo or Cloud credentials. Login rejects placeholders; flags can replace pasted values. Login ignores pasted protocol and auth-mode values. Configure experimental OTel through the environment or `config.env`, as described in the Reference. Existing config keys stay.
 
-For both pipelines, the token needs `sigil:write`, `metrics:write`, and
-`traces:write`. One token covers them. A generated policy can carry extra scopes;
-the integrations use only these three.
+For default HTTP capture and analytics, one token needs `sigil:write`, `metrics:write`, and `traces:write`. Generated policies can include extra scopes; the HTTP integrations use only these three.
 
 ### The flags
 
-`--endpoint`, `--tenant`, and a token together skip the destination and value
-prompts, so this form works over SSH, in a devcontainer, and from a script. A
-failed credential check can still prompt on an interactive terminal. Use this
-form for values the user has already given you.
+`--endpoint`, `--tenant`, and a token together skip destination and value prompts, including over SSH, in a devcontainer, or a script. A failed credential check can still prompt on an interactive terminal. Use only values the user has already given you.
 
 ```sh
 printf %s "$TOKEN" | agento11y login \
@@ -202,16 +182,9 @@ printf %s "$TOKEN" | agento11y login \
   --otlp-endpoint https://otlp-gateway-prod-<region>.grafana.net/otlp
 ```
 
-Before writing the file, login sends one request to the endpoint with the
-credentials and reports what came back. If that check fails, what happens next
-depends on the terminal. Interactively, login asks whether to save anyway. In a
-script the question is never asked, because a piped stdin is not a terminal:
-login writes nothing and exits 1. Pass `--yes` to save the values regardless, or
-`--no-verify` to skip the check. The preferences have no flags.
+Before writing, login sends one credential-check request and reports the result. On failure it asks whether to save interactively; with nonterminal stdin it writes nothing and exits 1. Pass `--yes` to save regardless or `--no-verify` to skip the check. Preferences have no flags.
 
-Login writes to the resolved config path described above. An install that still
-has only the old `sigil/config.env` under the same config root keeps using that
-file. You can write it by hand instead:
+Login writes the resolved config path, retaining `sigil/config.env` under the same config root if only that legacy file exists. You can write it by hand instead:
 
 ```dotenv
 AGENTO11Y_ENDPOINT=https://agento11y-prod-<region>.grafana.net
@@ -220,10 +193,7 @@ AGENTO11Y_AUTH_TOKEN=glc_...
 AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-<region>.grafana.net/otlp
 ```
 
-A hand-written file needs no OTLP auth header. When
-`OTEL_EXPORTER_OTLP_HEADERS` has no `Authorization` entry, the launcher builds
-Basic authorization from the tenant ID and the first available OTLP or ingest
-token.
+A hand-written file needs no OTLP auth header: absent `Authorization` in `OTEL_EXPORTER_OTLP_HEADERS`, the launcher builds Basic authorization from the tenant ID and the first available OTLP or ingest token.
 
 ## Step 4: Wire the coding agent
 
@@ -239,14 +209,14 @@ rules in the Reference.
 | Claude Code | `agento11y claude` | shared Go binary, plugin `agento11y-claude-code` |
 | Codex | `agento11y codex` | shared Go binary, plugin `agento11y-codex` |
 | Copilot CLI | `agento11y copilot` | hooks shared with Copilot Chat in VS Code |
-| OpenCode | `agento11y opencode` | installs `@grafana/agento11y-opencode` |
+| OpenCode | `agento11y opencode` | installs `@grafana/agento11y-opencode`; OpenCode 1.3.13 to 1.x or 2.0.22 to 2.x, other releases are refused; OpenCode 2 sessions get `--standalone` so a private server inherits launcher settings |
 | pi | `agento11y pi` | installs `@grafana/agento11y-pi` |
 | Vibe | `agento11y vibe` | shared Go binary via `hooks.toml` |
+| Kiro CLI 3 (experimental) | `agento11y kiro -- chat` | current workspace hooks; prompts/tools only, no assistant text, model usage, cost, or guards |
 
 After the first `agento11y codex` launch, open `/hooks` inside Codex and trust
 the agento11y hooks. Codex does not export turns until the user completes this
 manual step, and doctor cannot detect whether they did.
-
 Vibe hooks are experimental. The launcher enables them in the child process, so
 launch Vibe through `agento11y vibe` for capture.
 
@@ -281,24 +251,17 @@ only if they ask; silently shadowing their agent command is surprising.
    user trusted the hooks from `/hooks`. Read launcher stderr for lines starting
    with `agento11y:`.
 
-Confirm both pipelines. Conversations and analytics fail independently. If
-conversations arrive while **Analytics** stays empty, check the OTLP pipeline.
+For local capture, run `agento11y local open`. Check **Sessions** and **Analytics > Overview**. Optionally check **Analytics > Skills** after a recognized skill-load attempt in Claude Code, Pi, or OpenCode. For Cloud, confirm conversations and analytics separately. With default HTTP capture, conversations can arrive while Cloud **Analytics** stays empty. Check OTLP when that happens.
 
 ## Troubleshooting
 
-`agento11y doctor` is the first command for every problem. It is read-only. When
-the required settings exist, it sends one conversations probe plus separate
-metrics and traces probes, then reports their HTTP statuses. Some non-success
-responses are warnings rather than errors, so read each probe message as well as
-the section status.
+Run `agento11y doctor` first. It is read-only. It validates the required generation settings before probing the selected generation transport and reporting the HTTP status. With an OTLP endpoint configured, it sends separate metrics and traces probes and reports their HTTP statuses. With OTel selected, it checks opt-in and the trace route. A successful OTLP probe verifies transport and authentication, not generation ingestion. Read each probe message; some non-success responses are warnings.
 
 ### The two pipelines
 
-They are independent and fail independently.
+Default HTTP capture uses separate pipelines. Experimental OTel generations share the trace route.
 
-- **Conversations** (the chat transcripts) export over `AGENTO11Y_ENDPOINT`,
-  `AGENTO11Y_AUTH_TENANT_ID`, and `AGENTO11Y_AUTH_TOKEN`. The token needs the
-  `sigil:write` scope.
+- **Conversations** use `AGENTO11Y_ENDPOINT`, `AGENTO11Y_AUTH_TENANT_ID`, and `AGENTO11Y_AUTH_TOKEN` by default (`sigil:write`). With experimental OTel selected, Go producers use the configured OTLP trace route.
 - **Analytics** (the metrics and traces) export over
   `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT`, or the vendor-neutral
   `OTEL_EXPORTER_OTLP_ENDPOINT`. The token needs `metrics:write` and
@@ -311,25 +274,13 @@ both signals when an endpoint is set.
 
 ### Reading the report row by row
 
-- **endpoint** and **tenant id**: the resolved value plus the variable it came
-  from. `not set` means neither spelling was found. Doctor names the winning
-  spelling because both `AGENTO11Y_*` and the older `SIGIL_*` are accepted.
-- **auth token**: `set` plus a short prefix. The value is never printed.
-- **probe**: the HTTP status and URL. Analytics has separate **metrics probe**
-  and **traces probe** rows. `no response` includes DNS, connection, timeout, TLS,
-  and blocked-network failures.
-- **file**: the config path and whether it exists.
-- **content capture**: the effective mode and where it came from. An invalid
-  value falls back to `metadata_only` and the section message names the variable
-  to fix.
-- **guards**: `disabled`, or `enabled` with timeout and Cloud fail-open/closed.
-  **local rules** names `guards.toml`; **local guard checks** reports Cloud relay.
-- **Coding agents**: one row per agent. `not found on PATH` means doctor cannot
-  find that CLI. `on PATH, plugin not installed` describes current state; the
-  integration may never have been installed, may have been removed, or may be
-  installed for another scope. `install state unknown` means the read-only probe
-  could not determine the state. Cursor has no install probe. Its human row says
-  `detected <version>` when Cursor is on PATH; only JSON reports it as unknown.
+- `endpoint` and `tenant id`: the resolved value and its source variable. `not set` means neither spelling was found. Doctor names the winning `AGENTO11Y_*` or `SIGIL_*` spelling.
+- `auth token`: `set` and a short prefix. The value is never printed.
+- `probe`: the HTTP status and URL. Analytics has separate **metrics probe** and **traces probe** rows. `no response` includes DNS, connection, timeout, TLS, and blocked-network failures.
+- `file`: the config path and whether it exists.
+- `content capture`: the effective mode and its source. Invalid values fall back to `metadata_only`; the section message names the variable to fix.
+- `guards`: `disabled`, or `enabled` with timeout and Cloud fail-open/closed. **local rules** names `guards.toml`; **local guard checks** reports Cloud relay.
+- Coding agents: one row per agent. `not found on PATH` means doctor cannot find that CLI. `on PATH, plugin not installed` can mean never installed, removed, or installed for another scope. `install state unknown` means the read-only probe could not determine the state. Cursor has no install probe: the human row says `detected <version>` when present; only JSON reports unknown. Installation state does not confirm that the user trusted Codex hooks.
 
 ### Status codes
 
@@ -372,10 +323,12 @@ All hosts read the resolved config path. The default is `~/.config/agento11y/con
 
 | Key | Meaning |
 | --- | --- |
-| `AGENTO11Y_ENDPOINT` | Conversations API URL |
+| `AGENTO11Y_ENDPOINT` | Conversations API URL; Cloud history destination identity even with OTel |
 | `AGENTO11Y_AUTH_TENANT_ID` | Instance ID |
 | `AGENTO11Y_AUTH_TOKEN` | Access-policy token |
-| `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint for metrics and traces |
+| `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint for metrics, traces, and opt-in OTel generations |
+| `AGENTO11Y_PROTOCOL` | Generation transport: `http` (default) or experimental `otel` |
+| `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES` | `true` enables the OTel experiment; no legacy alias |
 | `AGENTO11Y_STACK_URL` | The stack login asks about; builds links only, never ingest |
 | `AGENTO11Y_CONTENT_CAPTURE_MODE` | Which content fields ship (see below) |
 | `AGENTO11Y_TAGS` | `key=value,key=value` attached to every generation |
@@ -388,13 +341,26 @@ All hosts read the resolved config path. The default is `~/.config/agento11y/con
 | `AGENTO11Y_THEME` | Local viewer theme: `dark`, `light`, or `system`; defaults to `dark` |
 | `AGENTO11Y_AUTO_UPDATE` | A false value opts out of host-plugin refresh |
 | `AGENTO11Y_DEBUG` | A true value writes the debug log |
+| `AGENTO11Y_ANONYMOUS_USAGE_STATS` | `disabled` stops reporting usage statistics about the CLI itself; `log` prints them instead of sending |
 
-All branded keys except `AGENTO11Y_STACK_URL` have an older `SIGIL_*` spelling.
-**Local only** writes `AGENTO11Y_LOCAL` and `SIGIL_LOCAL` as true, and both
-`LOCAL_FORWARD` spellings as false. **Local web UI = Yes** writes all four local
-keys as true. **Local web UI = No** writes all four as false. An explicit
-`agento11y login` still runs Cloud setup. Doctor reports provenance only for
-settings in its report.
+Branded keys have older `SIGIL_*` spellings except `AGENTO11Y_STACK_URL` and `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES`. `SIGIL_PROTOCOL` remains supported.
+**Local only** writes `AGENTO11Y_LOCAL` and `SIGIL_LOCAL` as true, and both `LOCAL_FORWARD` spellings as false. **Local web UI = Yes** writes all four as true; **No** writes all four as false.
+An explicit `agento11y login` still runs Cloud setup. Doctor reports provenance only for settings in its report.
+
+### Experimental OTel generation export
+
+HTTP remains the default. To export generations as OpenTelemetry (OTel) spans, set these values in the environment or `~/.config/agento11y/config.env`:
+
+```dotenv
+AGENTO11Y_PROTOCOL=otel
+AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=true
+```
+
+Configure `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) and OTLP authentication. Use an endpoint that supports Agent Observability generation ingestion.
+
+OTel export supports Claude Code, Codex, Copilot, Cursor, Vibe, and Kiro. Local mode, history imports, and Claude plugin eval imports also support OTel. Pi and OpenCode live plugins still use HTTP.
+
+Guards, scores, and experiment APIs still need HTTP credentials.
 
 ### Tagging sessions
 
@@ -419,7 +385,7 @@ it enables all three names.
 
 | Name | Tag key | Resolved from |
 | --- | --- | --- |
-| `user` | `user` | `AGENTO11Y_USER_ID`, then the signed-in Claude Code, Codex, or Cursor identity when available, then the OS account name |
+| `user` | `user` | `AGENTO11Y_USER_ID`, then Claude's selected config-directory account file, Codex's `auth.json` email, or Cursor's saved session email before current hook email. Without either, no `user` tag is attached |
 | `repo` | `repo` | Full namespace from the checkout's `origin` remote, or the checkout directory name |
 | `branch` | `git.branch` | Checked-out branch, or a short commit SHA on detached HEAD |
 
@@ -428,33 +394,70 @@ already in `AGENTO11Y_TAGS` wins, an unresolved value leaves its key off, and an
 unsupported name is logged and skipped. In Prometheus these arrive as
 `agento11y_tag_user`, `agento11y_tag_repo`, and `agento11y_tag_git_branch`.
 
-Warn the user before enabling this. For Claude Code, Codex, and Cursor, `user` can be a
-work email address retained as a Prometheus label. Each value combination creates
-a time series, and branch names are unbounded. Start with `user,repo`. Doctor
-shows repo and branch but cannot read a host's signed-in identity; set
-`AGENTO11Y_USER_ID` when the user value must be known before launch.
+Warn the user before enabling this. For Claude Code, Codex, and Cursor, `user` can be a work email address retained as a Prometheus label.
+Each value combination creates a time series, and branch names are unbounded. Start with `user,repo`.
+Doctor shows repo and branch but cannot read a host's signed-in identity; set `AGENTO11Y_USER_ID` when the user value must be known before launch.
+
+Other hosts have no account-email lookup. Discovery makes no provider requests, refreshes no credentials, and runs no host account commands. See [local account identity sources](https://github.com/grafana/agento11y/blob/main/docs/concepts/tags-and-metadata.md#local-account-identity-sources). Those hosts get a `user` tag only from `AGENTO11Y_USER_ID`, so an automatic `user` tag is the session's user ID cut to its first 128 characters. Explicit tags never set identity. Account identity stays active when automatic tags are off. Use the same `AGENTO11Y_USER_ID` across plugins for consistent identity; arbitrary IDs, pseudonyms, and legacy `SIGIL_*` aliases remain supported.
 
 ### Content capture
 
-For coding agents, use only these modes:
+`AGENTO11Y_CONTENT_CAPTURE_MODE` accepts `full`, `no_tool_content`, `metadata_only`, and `full_with_metadata_spans`. The default is `metadata_only`: model, tokens, timing, IDs, and cost when available, without message content or tool I/O. `default` aliases `metadata_only`; unknown values fall back with a warning.
 
-| Mode | What ships in generation exports |
-| --- | --- |
-| `metadata_only` | Model, tokens, timing, IDs, tool names, and cost when available. Prompts, responses, and tool I/O are omitted. |
-| `full` | Conversation content, including tool arguments and results. Host APIs can omit or truncate fields they do not expose in full. |
+For HTTP, `full` includes conversation content and tool arguments/results; `metadata_only` retains tool names and reduced structure.
 
-Set the mode with `AGENTO11Y_CONTENT_CAPTURE_MODE`. It defaults to
-`metadata_only`. Unknown values fall back to `metadata_only` with a warning.
-Every plugin redacts known secret formats from captured content, but capture mode
-chooses which fields ship, not whether the shipped fields are clean. Treat
-`full` as opt-in on shared machines.
+For direct OTel export, the SDK upgrades `full_with_metadata_spans` to `full`, so generation spans contain content. OTel `metadata_only` drops whole message and tool-definition documents, unlike HTTP's structure-preserving reduction. Separate tool spans remain available.
+
+Capture modes choose which fields ship. By default, every plugin redacts known secret formats from captured content, but redaction does not guarantee that shipped content is safe. Ask before enabling `full`, especially on shared machines. Hosts can omit or truncate fields.
+
+Live skill-load recognition covers native tools in [Claude Code](https://github.com/grafana/agento11y/tree/main/plugins/claude-code#3-verify) and [OpenCode](https://github.com/grafana/agento11y/tree/main/plugins/opencode#3-verify), and catalog-matched instruction reads in [Pi](https://github.com/grafana/agento11y/tree/main/plugins/pi#3-verify).
+Recognized attempts mark existing tool spans with `gen_ai.skill.name`, including failures, without proving successful loading or explaining later actions.
+Validated names remain in reduced modes; secret-like names are omitted. Recognition adds no descriptions, paths, or URIs and changes no payload policy.
+Recognized attempts also add `gen_ai.skill.name` and `agento11y.tool.execution.kind="load_skill"` to the existing `gen_ai.client.operation.duration` histogram, including failures. Names remain under metric retention even in reduced modes; use stable, nonsensitive names.
+Recognition excludes other hosts, imported history, direct `/skill` prompt insertion, resource reads, scripts, and attribution of later activity.
+Claude Code and OpenCode retain requested identifiers, not resolved directory basenames; Pi retains catalog names. Only surrounding whitespace is trimmed.
+Cloud skill trace visibility requires retained tool and generation spans in Tempo plus deployed Sigil consumer support. Local recording and analytics do not require Tempo.
 
 ### Local mode
 
 `agento11y <agent> --local`, **Local only**, or **Local web UI = Yes** routes launcher runs and agento11y hooks through the local daemon. The daemon stores full generation content in its JSONL store. It forwards full content only when `AGENTO11Y_CONTENT_CAPTURE_MODE=full`; every other selected mode becomes `metadata_only` for Cloud.
 **Local only** does not forward. **Local web UI = No** sends directly to Cloud without a local copy. `--no-local` uses Cloud once without changing either saved alias family. The launcher prints the viewer URL. Manage the daemon with `agento11y local start|open|status|stop|restart`.
-Local mode runs on macOS and Linux only. A launcher starts the receiver in the same invocation; a saved choice from Cursor install applies to the next hook.
+Local mode is available on every supported platform. A launcher starts the receiver in the same invocation; a saved choice from Cursor install applies to the next hook.
 With `AGENTO11Y_GUARDS_ENABLED=true`, evaluate `guards.toml` next to `config.env`. `reject = true` blocks on match; `shell_command` is for shell policies. Fail-open is Cloud-only. For pack selection, configuration, and testing, follow `agento11y skills show setup-local-guards`.
+
+Local **Analytics > Skills** counts all retained calls marked with a skill name, including loads, resource reads, commands, and failures. Case and namespace remain distinct. **Tools** and **Skills** overlap; never add their counts together.
+Duration coverage and p50/p95 describe tool calls, not skill effectiveness or cost. Skill row and chart links open **Sessions** filtered by the exact identifier, workspace, and time bounds. Summary tiles show matching sessions' in-period generation usage; session rows show lifetime totals. The token chart covers all generation usage in that range and workspace, not skill-attributed usage. Imports do not reconstruct missing skill metadata. See [Local skill analytics](https://github.com/grafana/agento11y/tree/main/plugins/agento11y#local-skill-analytics) for timing and retention limits.
+
+#### Forward to extra destinations
+
+The local daemon can forward each live payload to the existing connection from `config.env`, named `primary`, and up to three extra destinations (four total). `primary` is reserved, even when disabled. This applies only to daemon forwarding; direct export and `--no-local` are unchanged.
+
+Put `forwarding.toml` beside the **resolved** `config.env`: normally `~/.config/agento11y/forwarding.toml`, or `$XDG_CONFIG_HOME/agento11y/forwarding.toml` with a custom config root. If only the legacy `sigil/config.env` exists, put it in that directory instead. Extra destinations are configured only in this file, not through environment variables, login flags, or the viewer.
+
+These are two extra records, not a replacement for `primary`. Replace example URLs and credentials with values from each destination's setup page:
+
+```toml
+destinations = [
+  { name = "staging", endpoint = "https://agento11y.staging.example", tenant_id = "<staging-instance-id>", token = "<staging-token>", otlp_endpoint = "https://otlp.staging.example/otlp" },
+  { name = "development", endpoint = "https://agento11y.development.example", tenant_id = "<development-instance-id>", token = "<development-token>", otlp_endpoint = "https://otlp.development.example/otlp" },
+]
+```
+
+Keep the file private like `config.env`: mode `0600`, with a `0700` parent directory (or equivalent user-only permissions). At the default path, run `chmod 0700 ~/.config/agento11y` and `chmod 0600 ~/.config/agento11y/forwarding.toml`.
+
+Each record needs a unique nonempty `name` and at least one of `endpoint` or `otlp_endpoint`. HTTP generation export needs that record's `tenant_id` and `token`, except for recognized plain-HTTP loopback endpoints. `otlp_token` is optional. `otlp_headers` is an optional **string** of comma-separated `name=value` pairs, not a TOML table (for example, `otlp_headers = "Authorization=Basic <base64-value>,X-Team=observability"`). An explicit `Authorization` header wins; otherwise OTLP uses Basic authorization from that destination's `tenant_id` and `otlp_token`, falling back to its `token`. Extras inherit no endpoints, credentials, or headers from `primary` or the ambient environment.
+
+Endpoints must be explicit HTTP(S) URLs without userinfo, query, or fragment. Recognized plain-HTTP loopback OTLP endpoints are still refused. More than three extras, unknown fields, duplicate names, or duplicate signal routes (the same effective URL and complete effective header set, including a primary route) invalidate the extras and produce diagnostics. Malformed or unreadable `forwarding.toml` disables **all extras only**, not the primary; no last-known-good extras remain active. An unreadable `config.env` disables all forwarding. File edits reload on the next ingest or status read, without a daemon restart.
+
+`AGENTO11Y_LOCAL_FORWARD=false` (legacy `SIGIL_LOCAL_FORWARD`) stops all new forwarding work, including guard relay. The switch and capture mode are global: only exact `AGENTO11Y_CONTENT_CAPTURE_MODE=full` forwards full content to every recipient; all other modes use the existing `metadata_only` reduction.
+
+Incoming HTTP generations go only to each recipient's Sigil HTTP `endpoint`; incoming OTLP traces and metrics go only to its `otlp_endpoint`. Configure both endpoints to receive both generation transports. The daemon does not re-record through an SDK or convert HTTP generations to OTLP, or OTLP generations to HTTP. Guards relay to `primary` only. Local history imports carry a no-forward marker that excludes **every** recipient.
+
+Forwarding is best effort: one attempt per payload per destination, with a 10-second timeout, no retry, replay, or backfill. Each destination admits at most 8 in-flight requests and 128 MiB of input plus prepared output. The daemon has 2 shared preparation slots and allows at most 32 requests and 512 MiB across all destinations. Requests still running after a destination changes or is removed count toward the request and byte limits. Saturation drops affected copies without waiting; destinations are admitted independently. Status tracks attempted, succeeded, failed, and dropped requests per destination and signal. In-memory work can be lost on shutdown. A local acknowledgement confirms local acceptance, **not remote delivery**. Additional recipients increase network traffic, ingest costs, and memory use.
+
+The viewer's **Settings > Cloud** controls forwarding and lists recipients before enabling full capture. Run `agento11y doctor` for destination status, counters, diagnostics, and the file path; edit extra destinations in `forwarding.toml`. Login does not list extra recipients. Full capture selected in login still applies to all recipients. Ask before enabling full capture or adding recipients. **Disconnect** turns global forwarding off and clears managed primary connection fields, but leaves extra destinations and their credentials saved. Unmanaged or inherited primary environment settings may remain too; re-enabling forwarding can reactivate saved extras and any remaining primary routes.
+
+#### Test local guards offline
 
 For an offline dry run, use `agento11y guards test 'rm -rf ~/.ssh'`. It does not execute input, check Cloud rules, contact endpoints, start a daemon, or write files. It tests saved policy even when host guard requests are disabled, without predicting host enforcement. Disabled rules and absent packs stay unchanged.
 - Flags precede one quoted command: `agento11y guards test [--json] [--rules path] [--tool name] [--agent name] [--stdin] [--] <command>`. Use `--` before a command starting with a dash. Alternatively, `printf '%s\n' 'echo first' 'echo second' | agento11y guards test --stdin` reads one command through EOF, preserving newlines. Blank commands and empty tool names are errors.
@@ -466,7 +469,8 @@ For an offline dry run, use `agento11y guards test 'rm -rf ~/.ssh'`. It does not
 ### History import
 
 Until an import runs, the viewer and Grafana Cloud hold only sessions captured after installation.
-`agento11y history import` backfills sessions `claude-code`, `codex`, `cursor`, `opencode`, or `pi` already wrote to disk.
+`agento11y history import` backfills sessions `claude-code`, `codex`, `cursor`, `opencode`, or `pi` already wrote to disk. OpenCode supports v1 and released v2 databases. See [History import](https://github.com/grafana/agento11y/tree/main/plugins/agento11y#history-import) for limitations.
+An import sends generations and backdated trace spans but no metrics, so dashboards built on the `gen_ai.client.*` metrics leave imported history out.
 
 ```sh
 agento11y history import claude-code --dry-run   # plan only; no setup or export
@@ -474,24 +478,20 @@ agento11y history import claude-code --local     # import into the local store
 agento11y history import claude-code --no-local  # import into Grafana Cloud
 ```
 
-The import resolves the destination in this order: `--no-local`, `--local`, a true
-`AGENTO11Y_LOCAL`/`SIGIL_LOCAL` value from the shell or `config.env`, then saved Cloud credentials.
-With none set, an interactive run asks where sessions go. `--no-local` or any valid LOCAL value
-skips that question; missing Cloud credentials still starts Cloud setup. That setup does not offer
-**Local web UI** because locally forwarded imports never relay to Cloud. A noninteractive run never
-asks. It imports only with both `--all` and `--yes`; otherwise it prints a dry-run plan and exits 0.
+The import resolves the destination in this order: `--no-local`, `--local`, a true `AGENTO11Y_LOCAL`/`SIGIL_LOCAL` from shell or `config.env`, then saved Cloud credentials. With none set, an interactive run asks where sessions go; `--no-local` or any valid LOCAL value skips that question. Missing Cloud credentials still starts Cloud setup, without **Local web UI**, because local imports never forward to any recipient.
+A noninteractive run never asks: only `--all --yes` imports; otherwise it prints a dry-run plan and exits 0.
 
-Without `--since`, an import selects sessions active during the last 90 days. Each imported turn goes into a per-agent ledger that omits the destination.
-To send the same turns to another destination, add `--force` to the second import. If saved local mode would keep that import local, add `--no-local` too.
+Without `--since`, an import selects sessions active during the last 90 days. Each imported turn is recorded in a ledger per agent and destination, so an import into another destination sends the same turns without `--force`. If saved local mode would keep that import local, add `--no-local`.
+Turns imported before that ledger count as already sent to every destination. Pass `--force` for them only after the user confirms they never reached that destination, with a `--since` that reaches back to the first import (a timestamp is safest); into Grafana Cloud, run it once, right after upgrading and before any other Cloud import, because `--force` re-sends every selected turn and Cloud stores and counts a repeat of a turn it received more than about a day earlier.
 A cancelled or failed run resumes from turns not marked exported.
 
 ### Auto-update
 
-Claude, Codex, and OpenCode refresh after a binary version change and, after
+Claude, Codex, and OpenCode 1 refresh after a binary version change and, after
 the first post-install refresh, at most once a day. A relaunch inside that period
 does not pick up a plugin fix. `AGENTO11Y_AUTO_UPDATE=0|false|no|off` opts out.
 Copilot and Vibe reconcile hooks on each launch. Pi leaves upgrades to pi's
-installer.
+installer. OpenCode 2 is never refreshed; run `opencode plugin update @grafana/agento11y-opencode`.
 
 ## Further reading
 
